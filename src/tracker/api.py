@@ -458,9 +458,72 @@ def create_app(settings: Settings) -> FastAPI:
     def auth_dep(request: Request) -> None:
         return _require_auth(request, settings)
 
-    def _require_localhost(request: Request) -> None:
+    def _parse_linux_default_gateway_ip(route_text: str) -> str:
+        """
+        Parse `/proc/net/route` and return the default gateway IP, or "".
+        """
+        raw = (route_text or "").splitlines()
+        if not raw:
+            return ""
+        # Columns: Iface Destination Gateway Flags ...
+        # Destination 00000000 indicates default route.
+        for ln in raw[1:]:
+            parts = ln.split()
+            if len(parts) < 4:
+                continue
+            dest_hex = parts[1]
+            gw_hex = parts[2]
+            flags_hex = parts[3]
+            if dest_hex != "00000000":
+                continue
+            try:
+                flags = int(flags_hex, 16)
+            except Exception:
+                continue
+            if (flags & 0x1) != 0x1:
+                continue
+            try:
+                gw = int(gw_hex, 16)
+            except Exception:
+                continue
+            if gw <= 0:
+                continue
+            # Gateway is little-endian.
+            b0 = (gw) & 0xFF
+            b1 = (gw >> 8) & 0xFF
+            b2 = (gw >> 16) & 0xFF
+            b3 = (gw >> 24) & 0xFF
+            return f"{b0}.{b1}.{b2}.{b3}"
+        return ""
+
+    _trusted_local_client_hosts: set[str] = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+    def _refresh_trusted_hosts_once() -> None:
+        """
+        Best-effort support for Docker bridge mode.
+
+        When the API runs inside a container with bridge networking, requests originating
+        from the host's loopback may appear as the container's default gateway
+        (e.g. 172.17.0.1). Treat that as local for admin writes/tests.
+        """
+        try:
+            p = Path("/proc/net/route")
+            if not p.exists():
+                return
+            gw = _parse_linux_default_gateway_ip(p.read_text(encoding="utf-8", errors="ignore"))
+            if gw:
+                _trusted_local_client_hosts.add(gw)
+        except Exception:
+            return
+
+    _refresh_trusted_hosts_once()
+
+    def _is_trusted_local_request(request: Request) -> bool:
         host = (request.client.host if request.client else "").strip()
-        if host in {"127.0.0.1", "::1", "localhost", "testclient"}:
+        return host in _trusted_local_client_hosts
+
+    def _require_localhost(request: Request) -> None:
+        if _is_trusted_local_request(request):
             return
         if settings.admin_allow_remote_env_update:
             return
@@ -1927,8 +1990,7 @@ def create_app(settings: Settings) -> FastAPI:
                 "llm_price_in": float(settings.llm_price_input_per_million_usd or 0.0),
                 "llm_price_out": float(settings.llm_price_output_per_million_usd or 0.0),
                 "env_write_allowed": bool(
-                    (request.client.host if request.client else "").strip() in {"127.0.0.1", "::1", "localhost", "testclient"}
-                    or getattr(eff_settings, "admin_allow_remote_env_update", False)
+                    _is_trusted_local_request(request) or getattr(eff_settings, "admin_allow_remote_env_update", False)
                 ),
                 # A small, user-facing subset of Settings for the config UI.
                 "settings_snapshot": {
