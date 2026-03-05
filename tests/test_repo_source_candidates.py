@@ -43,3 +43,25 @@ def test_repo_list_source_candidates(db_session):
     assert t.name == "T"
     assert cand.url == "https://example.com/feed"
 
+
+def test_repo_add_source_candidate_prefers_discovered_www_host(db_session):
+    repo = Repo(db_session)
+    topic = repo.add_topic(name="T", query="x")
+
+    c1, created1 = repo.add_source_candidate(
+        topic_id=topic.id,
+        source_type="rss",
+        url="https://aneasystone.com/feed/rss/category/llm",
+        discovered_from_url="https://www.aneasystone.com/category/llm/",
+    )
+    assert created1 is True
+    assert c1.url == "https://www.aneasystone.com/feed/rss/category/llm"
+
+    c2, created2 = repo.add_source_candidate(
+        topic_id=topic.id,
+        source_type="rss",
+        url="https://aneasystone.com/feed/rss/category/llm",
+        discovered_from_url="https://www.aneasystone.com/category/llm/",
+    )
+    assert created2 is False
+    assert c2.id == c1.id

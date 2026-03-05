@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import Select, and_, case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -1269,7 +1270,25 @@ class Repo:
         title: str = "",
         discovered_from_url: str = "",
     ) -> tuple[SourceCandidate, bool]:
-        u = canonicalize_url(url)
+        # For source candidates, keep the host intact (do NOT strip "www."):
+        # some sites are `www`-only and the apex domain does not resolve.
+        u_keep = canonicalize_url(url, strip_www=False)
+        u = u_keep
+        # If the candidate was discovered from a `www.` page but the feed URL uses the apex,
+        # prefer the discovered host for reachability.
+        try:
+            if discovered_from_url:
+                src = urlsplit((discovered_from_url or "").strip())
+                dst = urlsplit(u_keep)
+                src_host = (src.hostname or "").strip().lower()
+                dst_host = (dst.hostname or "").strip().lower()
+                if src_host.startswith("www.") and dst_host and dst_host == src_host[4:]:
+                    u = urlunsplit((dst.scheme, src.netloc, dst.path, dst.query, dst.fragment))
+        except Exception:
+            u = u_keep
+
+        # A secondary key that strips `www.` for ignore matching + de-dupe migration.
+        u_strip = canonicalize_url(u, strip_www=True)
         is_globally_ignored = False
         try:
             raw_ignore = (self.get_app_config("source_candidate_ignore_urls") or "").strip()
@@ -1280,14 +1299,34 @@ class Repo:
                     if not s or s.startswith("#"):
                         continue
                     try:
-                        ignored.add(canonicalize_url(s))
+                        ignored.add(canonicalize_url(s, strip_www=True))
+                        ignored.add(canonicalize_url(s, strip_www=False))
                     except Exception:
                         ignored.add(s)
-                is_globally_ignored = u in ignored
+                is_globally_ignored = (u in ignored) or (u_strip in ignored)
         except Exception:
             is_globally_ignored = False
 
         existing = self.get_source_candidate(topic_id=topic_id, source_type=source_type, url=u)
+        # Migration: if an older candidate exists under the `www`-stripped key, upgrade it in-place.
+        if not existing and u_strip and u_strip != u:
+            try:
+                old = self.get_source_candidate(topic_id=topic_id, source_type=source_type, url=u_strip)
+            except Exception:
+                old = None
+            if old is not None:
+                try:
+                    # Ensure we don't violate the unique constraint.
+                    conflict = self.get_source_candidate(topic_id=topic_id, source_type=source_type, url=u)
+                    if conflict is None or int(getattr(conflict, "id", 0) or 0) == int(getattr(old, "id", 0) or 0):
+                        old.url = u
+                        self.session.commit()
+                        existing = old
+                except Exception:
+                    try:
+                        self.session.rollback()
+                    except Exception:
+                        pass
         if existing:
             existing.last_seen_at = dt.datetime.utcnow()
             existing.seen_count += 1

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
@@ -10,6 +11,7 @@ from tracker.connectors.html_list import build_html_list_url
 from tracker.connectors.hn_algolia import build_hn_search_url
 from tracker.connectors.searxng import build_searxng_search_url
 from tracker.models import Source, SourceCandidate, Topic, TopicPolicy, TopicSource
+from tracker.normalize import canonicalize_url
 from tracker.repo import Repo
 from tracker.search_query import normalize_search_query, set_query_param
 
@@ -445,7 +447,19 @@ def accept_source_candidate(*, session: Session, candidate_id: int, enabled: boo
     if not topic:
         raise ValueError("candidate topic not found")
 
-    source = repo.add_source(type=cand.source_type, url=cand.url)
+    effective_url = str(cand.url or "").strip()
+    try:
+        if cand.discovered_from_url:
+            src = urlsplit(str(cand.discovered_from_url or "").strip())
+            dst = urlsplit(effective_url)
+            src_host = (src.hostname or "").strip().lower()
+            dst_host = (dst.hostname or "").strip().lower()
+            if src_host.startswith("www.") and dst_host and dst_host == src_host[4:]:
+                effective_url = urlunsplit((dst.scheme, src.netloc, dst.path, dst.query, dst.fragment))
+    except Exception:
+        pass
+
+    source = repo.add_source(type=cand.source_type, url=effective_url)
     if source.enabled != enabled:
         source.enabled = enabled
         session.commit()
@@ -480,6 +494,11 @@ def accept_source_candidate(*, session: Session, candidate_id: int, enabled: boo
         pass
 
     cand.status = "accepted"
+    if effective_url and effective_url != str(cand.url or "").strip():
+        try:
+            cand.url = canonicalize_url(effective_url, strip_www=False)
+        except Exception:
+            pass
     session.commit()
 
     # Dedupe UX: if the same candidate URL exists for other topics, accept them too.

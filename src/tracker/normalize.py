@@ -23,7 +23,7 @@ _TRACKING_KEYS = {
 }
 
 
-def canonicalize_url(url: str) -> str:
+def canonicalize_url(url: str, *, strip_www: bool = True) -> str:
     raw = (url or "").strip()
     if not raw:
         return ""
@@ -36,7 +36,7 @@ def canonicalize_url(url: str) -> str:
         scheme = "https"
 
     host = (parts.hostname or "").lower()
-    if host.startswith("www."):
+    if strip_www and host.startswith("www."):
         host = host[4:]
 
     port = parts.port
