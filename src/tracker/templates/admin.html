@@ -819,6 +819,20 @@ TRACKER_EMAIL_TO=...{% endif %}
           </div>
 
           <div class="card wide">
+            <div class="row" style="align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap">
+              <h2 style="margin:0">{{ t("Model Prices") }} <span class="badge">OpenRouter</span></h2>
+              <div class="actions">
+                <button type="button" onclick="trackerLoadOpenRouterPrices(true)">{{ t("Refresh") }}</button>
+              </div>
+            </div>
+            <div class="muted" style="margin-top:8px">
+              {{ t("Fetched from OpenRouter models API; cached for a few hours to avoid rate limits.") }}
+            </div>
+            <div class="muted" id="openrouterPricesStatus" style="margin-top:10px">{{ t("Loading…") }}</div>
+            <div id="openrouterPricesTable" style="margin-top:10px"></div>
+          </div>
+
+          <div class="card wide">
             <h2>{{ t("Recent Events (24h)") }}</h2>
             {% if recent_events|length == 0 %}
               <div class="muted" style="margin-top:8px">{{ t("No recent digest/alert events.") }}</div>
@@ -881,6 +895,59 @@ TRACKER_EMAIL_TO=...{% endif %}
         {% endif %}
 
         {% if section in ['push', 'all'] %}
+          <div class="card wide">
+            {% set admin_config_url = ("/admin?token=" ~ token ~ "&section=config") if token else "/admin?section=config" %}
+            {% set admin_config_push = admin_config_url ~ "#cfg-push" %}
+            {% set admin_config_llm = admin_config_url ~ "#cfg-llm" %}
+
+            <h2>{{ t("Push Hub") }}</h2>
+            <div class="muted">
+              {{ t("Use Config Center to view and edit settings (shows effective values + autosave).") }}
+            </div>
+            <div class="actions" style="margin-top:10px; flex-wrap:wrap">
+              <a class="btn-primary" href="{{ admin_config_push }}">{{ t("Open Config Center (Push)") }}</a>
+              <a class="btn-ghost" href="{{ admin_config_llm }}">{{ t("Open Config Center (LLM)") }}</a>
+              <a class="btn-ghost" href="/setup/wizard{{ token_qs }}">{{ t("Setup Wizard") }}</a>
+            </div>
+
+            <div class="card" style="margin-top:12px">
+              <h3>{{ t("Telegram") }}</h3>
+              <div class="muted">
+                {{ t("Connect a Telegram chat by clicking a /start link, then press Check Connection.") }}
+              </div>
+
+              <div class="muted" style="margin-top:10px">{{ t("Bot token") }} ({{ t("required") }})</div>
+              <div class="row" style="margin-top:6px; gap:10px; align-items:flex-end; flex-wrap:wrap">
+                <div style="flex: 1 1 320px; min-width:260px">
+                  <input id="f_telegram_token" type="password" placeholder="123456:ABC..." />
+                  <div class="muted" style="margin-top:6px"><code>TRACKER_TELEGRAM_BOT_TOKEN</code></div>
+                </div>
+                <div class="actions" style="flex-wrap:wrap">
+                  <button type="button" class="btn-ok" onclick="trackerTelegramSaveTokenAndConnect()">{{ t("Save + Connect") }}</button>
+                  <button type="button" onclick="trackerTelegramTestBotToken()">{{ t("Test Telegram token") }}</button>
+                </div>
+              </div>
+              <div class="muted" id="telegramTokenStatus" style="margin-top:6px"></div>
+
+              <div class="muted" style="margin-top:10px">{{ t("Bot username") }} ({{ t("optional") }})</div>
+              <div class="row" style="margin-top:6px; gap:10px; align-items:flex-end; flex-wrap:wrap">
+                <div style="flex: 1 1 320px; min-width:260px">
+                  <input id="f_telegram_username" placeholder="OpenInfoMateBot" />
+                  <div class="muted" style="margin-top:6px"><code>TRACKER_TELEGRAM_BOT_USERNAME</code></div>
+                </div>
+                <div class="actions" style="flex-wrap:wrap">
+                  <button type="button" onclick="trackerTelegramGenerateLink()">{{ t("Generate Connect Link") }}</button>
+                  <button type="button" onclick="trackerTelegramPoll()">{{ t("Check Connection") }}</button>
+                  <button type="button" onclick="trackerTelegramDisconnect()">{{ t("Disconnect") }}</button>
+                </div>
+              </div>
+              <div class="row" style="margin-top:8px; gap: 10px; align-items:center">
+                <div style="flex: 1 1 260px"><input id="telegramLink" readonly placeholder="https://t.me/OpenInfoMateBot?start=..." /></div>
+              </div>
+              <div class="muted" id="telegramStatus" style="margin-top:6px"></div>
+            </div>
+          </div>
+
           <div class="card wide">
             <h2>{{ t("Telegram Feedback") }}</h2>
             <div class="muted">
@@ -1608,6 +1675,21 @@ TRACKER_EMAIL_TO=...{% endif %}
 	      <button type="button" class="btn-danger" onclick="trackerCloseDialog('dlgAiSetupPlanReady'); try { trackerAiSetupApply(true); } catch (e) {}">{{ t("Apply now") }}</button>
 	    </div>
 	  </dialog>
+
+	  <dialog id="dlgAiSetupUnappliedLeave" class="modal">
+	    <div class="modal-head">
+	      <div class="modal-title">{{ t("Unapplied AI Setup plan") }}</div>
+	      <button type="button" class="btn-ghost" onclick="trackerCloseDialog('dlgAiSetupUnappliedLeave')">{{ t("Stay on page") }}</button>
+	    </div>
+	    <div class="modal-body">
+	      <div class="muted">{{ t("You have a generated AI Setup plan that hasn't been applied yet.") }}</div>
+	      <div class="muted" style="margin-top:8px">{{ t("Apply now to write changes, or leave and discard this plan preview.") }}</div>
+	    </div>
+	    <div class="modal-foot">
+	      <button type="button" onclick="trackerAiSetupLeaveWithoutApply()">{{ t("Leave (discard)") }}</button>
+	      <button type="button" class="btn-danger" onclick="trackerAiSetupApplyThenLeave()">{{ t("Apply") }}</button>
+	    </div>
+	  </dialog>
 	{% endblock %}
 
 {% block scripts %}
@@ -1635,6 +1717,80 @@ TRACKER_EMAIL_TO=...{% endif %}
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json();
       });
+    }
+
+    function _trackerFmtUsdPerM(v) {
+      try {
+        if (v === null || v === undefined) return 'n/a';
+        const n = Number(v);
+        if (!isFinite(n)) return 'n/a';
+        if (n === 0) return '$0/1M';
+        if (n < 0.01) return '$' + n.toFixed(4) + '/1M';
+        return '$' + n.toFixed(2) + '/1M';
+      } catch (e) {
+        return 'n/a';
+      }
+    }
+
+    async function trackerLoadOpenRouterPrices(forceRefresh) {
+      const statusEl = document.getElementById('openrouterPricesStatus');
+      const tableEl = document.getElementById('openrouterPricesTable');
+      if (!statusEl || !tableEl) return;
+      try {
+        statusEl.textContent = '{{ t("Loading…") }}';
+        tableEl.innerHTML = '';
+        const refresh = forceRefresh ? '&refresh=1' : '';
+        const data = await _trackerFetchJson('/admin/openrouter/prices?x=1' + refresh);
+        if (!data || data.ok !== true) {
+          const msg = data && data.error ? String(data.error) : 'error';
+          statusEl.textContent = msg;
+          return;
+        }
+        const fetchedAt = String(data.fetched_at || '');
+        const cached = !!data.cached;
+        const stale = !!data.stale;
+        const warn = data.warning ? String(data.warning) : '';
+        statusEl.textContent =
+          (cached ? '{{ t("Cached") }}' : '{{ t("Live") }}') +
+          (stale ? ' · {{ t("stale") }}' : '') +
+          (fetchedAt ? (' · ' + fetchedAt) : '') +
+          (warn ? (' · ' + warn) : '');
+
+        const vendors = Array.isArray(data.vendors) ? data.vendors : [];
+        const rows = vendors.map((v) => {
+          const label = String((v && v.label) || '');
+          const count = Number((v && v.count) || 0) || 0;
+          const minIn = _trackerFmtUsdPerM(v && v.min_in);
+          const minOut = _trackerFmtUsdPerM(v && v.min_out);
+          const top = Array.isArray(v && v.top) ? v.top : [];
+          const topHtml = top.map((m) => {
+            const id = String((m && m.id) || '');
+            const i = _trackerFmtUsdPerM(m && m.in_usd_per_m);
+            const o = _trackerFmtUsdPerM(m && m.out_usd_per_m);
+            if (!id) return '';
+            return '<div class="muted"><code>' + id + '</code> · in=' + i + ' out=' + o + '</div>';
+          }).join('');
+          return (
+            '<tr>' +
+              '<td><b>' + label + '</b><div class="muted">n=' + count + '</div></td>' +
+              '<td class="muted">in=' + minIn + '<br/>out=' + minOut + '</td>' +
+              '<td>' + (topHtml || '<div class="muted">n/a</div>') + '</td>' +
+            '</tr>'
+          );
+        }).join('');
+
+        tableEl.innerHTML =
+          '<table>' +
+            '<thead><tr>' +
+              '<th>{{ t("Vendor") }}</th>' +
+              '<th>{{ t("Cheapest") }}</th>' +
+              '<th>{{ t("Examples") }}</th>' +
+            '</tr></thead>' +
+            '<tbody>' + rows + '</tbody>' +
+          '</table>';
+      } catch (e) {
+        statusEl.textContent = String(e || 'error');
+      }
     }
 
     function _trackerPostJson(path, bodyObj) {
@@ -1762,6 +1918,7 @@ TRACKER_EMAIL_TO=...{% endif %}
 	        if (!data || !data.ok) throw new Error((data && (data.message || data.error)) ? String(data.message || data.error) : 'bad response');
 	        const rid = parseInt(String(data.run_id || '0'), 10) || 0;
 	        if (runIdEl) runIdEl.value = String(rid || '');
+	        try { _trackerAiSetupMarkUnapplied(rid); } catch (e) {}
 	        if (previewEl) previewEl.textContent = String(data.preview_markdown || '');
 	        const warns = Array.isArray(data.warnings) ? data.warnings : [];
 	        const warnText = warns.length ? (' · warnings=' + warns.length) : '';
@@ -1823,6 +1980,7 @@ TRACKER_EMAIL_TO=...{% endif %}
         if (!data || !data.ok) throw new Error((data && (data.message || data.error)) ? String(data.message || data.error) : 'bad response');
         const notes = Array.isArray(data.notes) ? data.notes : [];
         if (statusEl) statusEl.textContent = '{{ t("Saved") }}' + (notes.length ? (' · notes=' + notes.length) : '');
+        try { _trackerAiSetupClearUnapplied(); } catch (e) {}
 
         try { localStorage.setItem('tracker_ai_setup_last_run_id', String(rid)); } catch (e) {}
 
@@ -2084,6 +2242,10 @@ TRACKER_EMAIL_TO=...{% endif %}
 	      if (runIdEl) runIdEl.value = String(n);
 	      const st = String(status || '').trim().toLowerCase();
 	      if (applyBtn) applyBtn.disabled = !(st === 'planned');
+	      try {
+	        if (st === 'planned') _trackerAiSetupMarkUnapplied(n);
+	        else _trackerAiSetupClearUnapplied();
+	      } catch (e) {}
 	      if (statusEl) statusEl.textContent = 'Run #' + n + (st ? (' · ' + st) : '');
 	      if (previewEl) previewEl.textContent = '';
 	      try {
@@ -2092,6 +2254,10 @@ TRACKER_EMAIL_TO=...{% endif %}
 	          const st2 = String(data.status || st || '').trim().toLowerCase();
 	          if (statusEl) statusEl.textContent = 'Run #' + n + (st2 ? (' · ' + st2) : '');
 	          if (applyBtn) applyBtn.disabled = !(st2 === 'planned');
+	          try {
+	            if (st2 === 'planned') _trackerAiSetupMarkUnapplied(n);
+	            else _trackerAiSetupClearUnapplied();
+	          } catch (e) {}
 	          const md = (data && data.preview_markdown) ? String(data.preview_markdown || '') : '';
 	          const err = (data && data.error) ? String(data.error || '') : '';
 	          if (previewEl) previewEl.textContent = md || (err ? ('error: ' + err) : '');
@@ -2146,6 +2312,87 @@ TRACKER_EMAIL_TO=...{% endif %}
         const tgEl = document.getElementById('aiSetupNotifyTgEnabled');
         if (bsEl) bsEl.addEventListener('change', () => { trackerAiSetupSaveNotifySettings().catch(() => {}); });
         if (tgEl) tgEl.addEventListener('change', () => { trackerAiSetupSaveNotifySettings().catch(() => {}); });
+      } catch (e) {}
+    }
+
+    // --- AI Setup leave guard (plan generated but not applied)
+    let _trackerAiSetupPendingHref = null;
+    function trackerAiSetupHasUnappliedPlan() {
+      try {
+        const runIdEl = document.getElementById('aiSetupRunId');
+        const applyBtn = document.getElementById('aiSetupApplyBtn');
+        const rid = parseInt(String(runIdEl ? (runIdEl.value || '') : ''), 10) || 0;
+        if (!(rid > 0)) return false;
+        // Apply enabled implies status=planned.
+        return !!(applyBtn && !applyBtn.disabled);
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function _trackerAiSetupMarkUnapplied(rid) {
+      try {
+        const n = parseInt(String(rid || ''), 10) || 0;
+        if (!(n > 0)) return;
+        localStorage.setItem('tracker_ai_setup_unapplied_run_id', String(n));
+      } catch (e) {}
+    }
+
+    function _trackerAiSetupClearUnapplied() {
+      try { localStorage.removeItem('tracker_ai_setup_unapplied_run_id'); } catch (e) {}
+    }
+
+    function trackerAiSetupLeaveWithoutApply() {
+      const href = _trackerAiSetupPendingHref;
+      _trackerAiSetupPendingHref = null;
+      try { trackerCloseDialog('dlgAiSetupUnappliedLeave'); } catch (e) {}
+      if (href) window.location.href = String(href);
+    }
+
+    async function trackerAiSetupApplyThenLeave() {
+      const href = _trackerAiSetupPendingHref;
+      _trackerAiSetupPendingHref = null;
+      try { trackerCloseDialog('dlgAiSetupUnappliedLeave'); } catch (e) {}
+      try { await trackerAiSetupApply(true); } catch (e) {}
+      if (href) window.location.href = String(href);
+    }
+
+    function trackerAiSetupInitLeaveGuard() {
+      try {
+        const sec = '{{ section }}';
+        if (sec !== 'ai_setup') return;
+
+        // Catch browser refresh/back/close.
+        window.addEventListener('beforeunload', (e) => {
+          try {
+            if (!trackerAiSetupHasUnappliedPlan()) return;
+            e.preventDefault();
+            e.returnValue = '';
+            return '';
+          } catch (e2) {}
+        });
+
+        // Catch in-app navigation links (tabs/menus).
+        document.addEventListener('click', (e) => {
+          try {
+            if (!trackerAiSetupHasUnappliedPlan()) return;
+            const a = e.target && e.target.closest ? e.target.closest('a') : null;
+            if (!a) return;
+            if (a.target && String(a.target).toLowerCase() === '_blank') return;
+            const href = String(a.getAttribute('href') || '').trim();
+            if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+
+            const dest = new URL(a.href, window.location.href);
+            const cur = new URL(window.location.href);
+            const samePage = (dest.pathname === cur.pathname && dest.search === cur.search);
+            if (samePage) return;
+
+            e.preventDefault();
+            e.stopPropagation();
+            _trackerAiSetupPendingHref = String(dest.href);
+            trackerOpenDialog('dlgAiSetupUnappliedLeave');
+          } catch (e2) {}
+        }, true);
       } catch (e) {}
     }
 
@@ -2494,6 +2741,175 @@ TRACKER_EMAIL_TO=...{% endif %}
         trackerShowToast(msg, 'success', 'Telegram');
       } catch (e) {
         trackerShowToast(String(e || 'error'), 'error', 'Telegram');
+      }
+    }
+
+    function trackerTelegramVal(id) {
+      try {
+        const el = document.getElementById(String(id || '').trim());
+        return el ? String(el.value || '').trim() : '';
+      } catch (e) {
+        return '';
+      }
+    }
+
+    async function trackerTelegramRefreshStatus() {
+      try {
+        const stEl = document.getElementById('telegramStatus');
+        const linkEl = document.getElementById('telegramLink');
+        if (!stEl && !linkEl) return null;
+        const data = await _trackerFetchJson('/telegram/status');
+        const bot = (data && data.bot_username) ? data.bot_username : 'OpenInfoMateBot';
+        const pending = (data && data.pending_code) ? data.pending_code : '';
+        const chatId = (data && data.chat_id) ? data.chat_id : '';
+        const hasToken = !!(data && data.has_bot_token);
+        if (linkEl && pending) {
+          linkEl.value = `https://t.me/${bot}?start=${pending}`;
+        }
+        if (stEl) {
+          if (!hasToken) {
+            stEl.textContent = '{{ t("Telegram bot token is not configured yet.") }}';
+          } else if (chatId) {
+            stEl.textContent = '{{ t("Telegram connected") }}' + ': chat_id=' + chatId;
+          } else if (pending) {
+            stEl.textContent = '{{ t("Waiting for /start…") }}';
+          } else {
+            stEl.textContent = '{{ t("Telegram not connected") }}';
+          }
+        }
+        return data;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    let _trackerTelegramAutoPollTimer = null;
+    let _trackerTelegramAutoPollAttempts = 0;
+
+    function trackerTelegramStopAutoPoll() {
+      if (_trackerTelegramAutoPollTimer) {
+        clearInterval(_trackerTelegramAutoPollTimer);
+        _trackerTelegramAutoPollTimer = null;
+      }
+      _trackerTelegramAutoPollAttempts = 0;
+    }
+
+    async function trackerTelegramMaybeAutoPoll() {
+      const data = await trackerTelegramRefreshStatus();
+      const pending = (data && data.pending_code) ? String(data.pending_code) : '';
+      const chatId = (data && data.chat_id) ? String(data.chat_id) : '';
+      const hasToken = !!(data && data.has_bot_token);
+      if (!hasToken || chatId || !pending) {
+        trackerTelegramStopAutoPoll();
+        return;
+      }
+      if (_trackerTelegramAutoPollTimer) return;
+
+      _trackerTelegramAutoPollAttempts = 0;
+      _trackerTelegramAutoPollTimer = setInterval(async () => {
+        _trackerTelegramAutoPollAttempts += 1;
+        if (_trackerTelegramAutoPollAttempts > 40) { // ~2 minutes
+          trackerTelegramStopAutoPoll();
+          return;
+        }
+        try {
+          const resp = await fetch('/telegram/poll' + (_trackerToken ? ('?token=' + encodeURIComponent(_trackerToken)) : ''), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({})
+          });
+          const out = await resp.json().catch(() => null);
+          if (resp.ok && out && out.status === 'connected') {
+            trackerShowToast('{{ t("Telegram connected") }}', 'success', '{{ t("Telegram") }}');
+            trackerTelegramStopAutoPoll();
+          }
+        } catch (e) {}
+        const st = await trackerTelegramRefreshStatus();
+        if (st && st.chat_id) trackerTelegramStopAutoPoll();
+      }, 3000);
+    }
+
+    async function trackerTelegramTestBotToken() {
+      try {
+        const el = document.getElementById('telegramTokenStatus');
+        if (el) el.textContent = '{{ t("Loading…") }}';
+        const data = await _trackerPostForm('/admin/telegram/test-bot', {});
+        const msg = (data && data.message) ? String(data.message) : 'ok';
+        if (el) el.textContent = msg;
+        trackerShowToast(msg, 'success', '{{ t("Telegram") }}');
+        try {
+          const u = (data && data.username) ? String(data.username || '').trim() : '';
+          if (u && !trackerTelegramVal('f_telegram_username')) {
+            const inp = document.getElementById('f_telegram_username');
+            if (inp) inp.value = u.replace(/^@+/, '');
+          }
+        } catch (e) {}
+        return data;
+      } catch (e) {
+        const el = document.getElementById('telegramTokenStatus');
+        const msg = String(e || 'error');
+        if (el) el.textContent = msg;
+        trackerShowToast(msg, 'error', '{{ t("Telegram") }}', 5200);
+        return null;
+      }
+    }
+
+    async function trackerTelegramSaveTokenAndConnect() {
+      const tok = trackerTelegramVal('f_telegram_token');
+      if (!tok) {
+        trackerShowToast('{{ t("Missing") }}: TRACKER_TELEGRAM_BOT_TOKEN', 'warning', '{{ t("Telegram") }}');
+        return;
+      }
+      const ok = confirm('{{ t("Save") }} TRACKER_TELEGRAM_BOT_TOKEN?\\n\\n- {{ t("Secrets are never echoed back.") }}');
+      if (!ok) return;
+      try {
+        await _trackerPostForm('/admin/settings/patch', { telegram_bot_token: tok });
+        trackerShowToast('{{ t("Saved") }}', 'success', '{{ t("Telegram") }}');
+        await trackerTelegramRefreshStatus();
+        await trackerTelegramTestBotToken();
+        await trackerTelegramGenerateLink();
+      } catch (e) {
+        trackerShowToast(String(e || 'error'), 'error', '{{ t("Telegram") }}', 5200);
+      }
+    }
+
+    async function trackerTelegramGenerateLink() {
+      try {
+        const botUsername = trackerTelegramVal('f_telegram_username');
+        const data = await _trackerPostJson('/telegram/link', { bot_username: botUsername || null });
+        const linkEl = document.getElementById('telegramLink');
+        if (linkEl && data && data.link) linkEl.value = String(data.link);
+        trackerShowToast('{{ t("Telegram connect link generated.") }}', 'success', '{{ t("Telegram") }}');
+        await trackerTelegramMaybeAutoPoll();
+      } catch (e) {
+        trackerShowToast(String(e || 'error'), 'error', '{{ t("Telegram") }}');
+      }
+    }
+
+    async function trackerTelegramPoll() {
+      try {
+        const data = await _trackerPostJson('/telegram/poll', {});
+        const st = (data && data.status) ? String(data.status) : '';
+        if (st === 'connected') {
+          trackerShowToast('{{ t("Telegram connected") }}', 'success', '{{ t("Telegram") }}');
+        } else if (st === 'no_code') {
+          trackerShowToast('{{ t("No pending Telegram link. Generate one first.") }}', 'warning', '{{ t("Telegram") }}');
+        } else {
+          trackerShowToast('{{ t("Not connected yet. Click the link and press Check again.") }}', 'warning', '{{ t("Telegram") }}');
+        }
+        await trackerTelegramRefreshStatus();
+      } catch (e) {
+        trackerShowToast(String(e || 'error'), 'error', '{{ t("Telegram") }}');
+      }
+    }
+
+    async function trackerTelegramDisconnect() {
+      try {
+        await _trackerPostForm('/telegram/disconnect', {});
+        trackerShowToast('{{ t("Telegram disconnected.") }}', 'success', '{{ t("Telegram") }}');
+        await trackerTelegramRefreshStatus();
+      } catch (e) {
+        trackerShowToast(String(e || 'error'), 'error', '{{ t("Telegram") }}');
       }
     }
 
@@ -3822,7 +4238,10 @@ TRACKER_EMAIL_TO=...{% endif %}
 			      trackerPromptsInit();
 			      trackerCfgInit();
 			      trackerAutoTestLlmOnLoad();
-		        trackerAutoTestLlmIfNeeded();
+			      trackerAutoTestLlmIfNeeded();
+			      trackerAiSetupInitLeaveGuard();
+			      try { trackerTelegramMaybeAutoPoll(); } catch (e) {}
+			      try { trackerLoadOpenRouterPrices(false); } catch (e2) {}
 	        try {
 	          const prefillKey = 'tracker_ai_setup_prefill_prompt';
 	          const prefill = localStorage.getItem(prefillKey) || '';

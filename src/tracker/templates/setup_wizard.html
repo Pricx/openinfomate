@@ -92,7 +92,8 @@
           </div>
           <div class="actions">
             <span class="badge {{ 'ok' if push_ok else 'warn' }}">{{ t("status") }}={{ 'ok' if push_ok else 'missing' }}</span>
-            <a class="btn-ghost" href="/setup/push{{ token_qs }}">{{ t("Open") }}</a>
+            {% set admin_push_url = ("/admin?token=" ~ token ~ "&section=push") if token else "/admin?section=push" %}
+            <a class="btn-ghost" href="{{ admin_push_url }}">{{ t("Open") }}</a>
             <a class="btn-ghost" href="{{ admin_config_push }}">{{ t("Config") }}</a>
           </div>
         </div>

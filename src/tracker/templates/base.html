@@ -228,6 +228,7 @@
   </head>
   <body>
     {% set token_qs = ("?token=" ~ token) if token else "" %}
+    {% set admin_push_qs = ("?token=" ~ token ~ "&section=push") if token else "?section=push" %}
     <div class="topbar">
       <div class="topbar-inner">
         <div class="brand">
@@ -237,7 +238,7 @@
         <div class="top-actions">
           <a class="btn-ghost" style="padding:10px 12px; border-radius:10px;" href="/setup/wizard{{ token_qs }}">{{ t("Setup Wizard") }}</a>
           <a class="btn-ghost" style="padding:10px 12px; border-radius:10px;" href="/setup/profile{{ token_qs }}">{{ t("Profile Setup") }}</a>
-          <a class="btn-ghost" style="padding:10px 12px; border-radius:10px;" href="/setup/push{{ token_qs }}">{{ t("Push Setup") }}</a>
+          <a class="btn-ghost" style="padding:10px 12px; border-radius:10px;" href="/admin{{ admin_push_qs }}">{{ t("Push Setup") }}</a>
           <select id="trackerLang" aria-label="{{ t('Language') }}" title="{{ t('Language') }}" style="width:auto; padding:10px 10px; border-radius:10px;" onchange="trackerSetLang(this.value)">
             {% for l in supported_langs %}
               <option value="{{ l['code'] }}" {% if (lang or 'en') == l['code'] %}selected{% endif %}>{{ l['label'] }}</option>

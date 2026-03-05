@@ -2064,6 +2064,22 @@ def create_app(settings: Settings) -> FastAPI:
         )
 
     @app.get(
+        "/admin/openrouter/prices",
+        response_class=JSONResponse,
+        dependencies=[Depends(auth_dep)],
+        include_in_schema=False,
+    )
+    def admin_openrouter_prices(
+        request: Request,
+        refresh: bool = False,
+        session: Session = Depends(get_db),
+    ) -> dict:
+        repo = Repo(session)
+        from tracker.openrouter_prices import get_openrouter_prices
+
+        return get_openrouter_prices(repo, ttl_seconds=6 * 3600, force_refresh=bool(refresh))
+
+    @app.get(
         "/management",
         response_class=HTMLResponse,
         dependencies=[Depends(auth_dep)],
@@ -4750,45 +4766,18 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/setup/push", response_class=HTMLResponse, dependencies=[Depends(auth_dep)])
     def setup_push(request: Request, session: Session = Depends(get_db)):
-        repo = Repo(session)
         token = request.query_params.get("token") if _token_auth_enabled(settings) else None
-        lang = get_request_lang(request)
-        _seed_locale_defaults(repo=repo, request_lang=lang)
         msg = request.query_params.get("msg")
+        qs = []
+        if token:
+            qs.append(f"token={token}")
+        qs.append("section=push")
+        if msg:
+            from urllib.parse import quote_plus
 
-        try:
-            from tracker.dynamic_config import effective_settings
-
-            eff = effective_settings(repo=repo, settings=settings)
-        except Exception:
-            eff = settings
-
-        try:
-            stats = repo.get_stats()
-            from tracker.doctor import build_doctor_report
-
-            doctor_report = build_doctor_report(
-                settings=eff,
-                stats=stats,
-                db_ok=True,
-                db_error=None,
-                profile_configured=bool(repo.get_app_config("profile_text")),
-                telegram_chat_configured=bool(repo.get_app_config("telegram_chat_id")),
-                activity=repo.get_activity_snapshot(),
-            )
-        except Exception:
-            doctor_report = None
-
-        return templates.TemplateResponse(
-            request,
-            "setup_push.html",
-            {
-                "token": token,
-                "lang": lang,
-                "msg": msg,
-                "doctor_report": doctor_report,
-            },
-        )
+            qs.append("msg=" + quote_plus(str(msg)))
+        url = "/admin?" + "&".join(qs)
+        return RedirectResponse(url=url, status_code=302)
 
     @app.post("/setup/push/apply", dependencies=[Depends(auth_dep)])
     def setup_push_apply(
