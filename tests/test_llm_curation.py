@@ -420,9 +420,8 @@ def test_llm_curation_tick_curates_new_candidates(db_session, monkeypatch):
     assert result.total_pushed_alerts == 0
 
     rows = list(db_session.scalars(select(ItemTopic).order_by(ItemTopic.item_id)))
-    # tick-time: persist digest picks as `digest` so Curated Info batches can include them
-    # without relying on a separate per-topic digest promotion job.
-    assert sorted([r.decision for r in rows]) == ["alert", "digest", "ignore"]
+    # tick-time: digest decisions should remain as candidate (so daily digest can cap once/day)
+    assert sorted([r.decision for r in rows]) == ["alert", "candidate", "ignore"]
 
 
 def test_llm_curation_tick_does_not_slice_when_triage_fails(db_session, monkeypatch):

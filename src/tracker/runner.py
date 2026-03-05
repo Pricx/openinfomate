@@ -1789,11 +1789,8 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                     hint = "alert"
                     alert_item_ids.append(d.item_id)
                 elif d.decision == "digest":
-                    # Curated Info reads only `digest|alert` decisions. If we keep digest picks as
-                    # `candidate` here, scheduled Curated Info batches can go empty even though
-                    # the LLM selected items (especially when per-topic digest jobs are not used).
-                    it_row.decision = "digest"
-                    hint = "digest"
+                    it_row.decision = "candidate"
+                    hint = "digest_candidate"
                 else:
                     it_row.decision = "ignore"
                     hint = "ignored"
@@ -3799,13 +3796,9 @@ async def run_curated_info(
     by_item_id: dict[int, dict] = {}
 
     # NOTE: list_recent_events is ordered by recency; we still re-sort after grouping.
-    # NOTE: historical compatibility:
-    # older versions stored LLM "digest" picks as decision=`candidate` with
-    # a reason hint like "llm_hint: digest_candidate". Include `candidate`
-    # here and re-map only those hinted rows to digest, otherwise skip.
     rows = repo.list_recent_events(
         topic=None,
-        decisions=["alert", "digest", "candidate"],
+        decisions=["alert", "digest"],
         since=since,
         # Curated Info is the "show all" surface; keep a high cap but still bounded.
         limit=5000,
@@ -3833,13 +3826,8 @@ async def run_curated_info(
         when = item.published_at or item.created_at
         ts = int(when.timestamp()) if when else 0
         dec = (str(getattr(it_row, "decision", "") or "")).strip().lower() or "digest"
-        if dec == "candidate":
-            rsn = str(getattr(it_row, "reason", "") or "")
-            if "digest_candidate" not in rsn:
-                continue
-            dec = "digest"
         if dec not in {"alert", "digest"}:
-            continue
+            dec = "digest"
 
         entry = by_item_id.get(iid)
         if entry is None:
