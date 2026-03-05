@@ -41,7 +41,9 @@ def openai_compat_responses_url(base_url: str) -> str:
     return f"{base}/v1/responses"
 
 
-_RESPONSES_HINT_RE = re.compile(r"(/v1/responses\\b|\\bresponses\\b)", re.IGNORECASE)
+# Keep this heuristic permissive: many OpenAI-compatible providers return an error
+# message like "Please use /v1/responses" when they drop `/v1/chat/completions`.
+_RESPONSES_HINT_RE = re.compile(r"(/v1/responses\b|\bresponses\b)", re.IGNORECASE)
 
 
 def _looks_like_responses_required(status_code: int, body: str) -> bool:
@@ -52,7 +54,27 @@ def _looks_like_responses_required(status_code: int, body: str) -> bool:
     raw = (body or "").strip()
     if not raw:
         return False
-    return bool(_RESPONSES_HINT_RE.search(raw))
+    # Some providers escape slashes inside JSON strings.
+    norm = raw.replace("\\/", "/")
+    if _RESPONSES_HINT_RE.search(norm):
+        return True
+    # Best-effort: check common JSON error fields.
+    try:
+        obj = json.loads(norm)
+    except Exception:
+        obj = None
+    if isinstance(obj, dict):
+        msg = ""
+        try:
+            if isinstance(obj.get("error"), dict):
+                msg = str(obj["error"].get("message") or "")
+            if not msg:
+                msg = str(obj.get("message") or obj.get("detail") or "")
+        except Exception:
+            msg = ""
+        if msg and _RESPONSES_HINT_RE.search(msg.replace("\\/", "/")):
+            return True
+    return False
 
 
 def _load_mode_cache(repo: Repo) -> dict[str, str]:
@@ -270,7 +292,14 @@ async def post_openai_compat_json(
         except Exception:
             body = ""
         if preferred == "chat_completions" and _looks_like_responses_required(exc.response.status_code, body):
-            data2 = await _post("responses")
+            try:
+                data2 = await _post("responses")
+            except httpx.HTTPStatusError as exc2:
+                # Best-effort retry for transient upstream errors.
+                if exc2.response is not None and int(exc2.response.status_code or 0) in {500, 502, 503, 504}:
+                    data2 = await _post("responses")
+                else:
+                    raise
             set_cached_mode(repo, base_url=base_url, mode="responses")
             return data2, "responses"
         raise
