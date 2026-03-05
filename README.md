@@ -21,7 +21,7 @@ OpenInfoMate🥷 是一个“越用越聪明”的信息助手：把 **你感兴
 
 ## 快速开始
 
-前提：Linux + Docker（本项目 compose 默认使用 `network_mode: host`）。
+前提：Linux + Docker（默认使用 Docker bridge 网络；仅暴露 Web Admin/API 端口）。
 
 一行启动（会下载 `docker-compose.ghcr.yml` 并拉取 `ghcr.io/pricx/openinfomate:latest`）：
 
@@ -31,6 +31,12 @@ mkdir -p ~/openinfomate && cd ~/openinfomate && curl -fsSLO https://raw.githubus
 
 打开管理后台：
 - `http://127.0.0.1:${OPENINFOMATE_API_PORT:-8899}/admin`
+
+如果你必须让容器访问宿主机的 `127.0.0.1`（例如你的 LLM gateway 只绑定在宿主机 loopback），使用 host 网络覆盖文件：
+
+```bash
+docker compose -f docker-compose.ghcr.yml -f docker-compose.host.yml up -d
+```
 
 重置到“全新安装”（会删除数据卷）：
 

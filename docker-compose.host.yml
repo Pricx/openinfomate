@@ -1,0 +1,21 @@
+services:
+  api:
+    # Opt-in host networking for operators who need host-loopback access
+    # (e.g. LLM gateways bound to 127.0.0.1 on the host).
+    network_mode: host
+    ports: []
+    environment:
+      TRACKER_API_HOST: "127.0.0.1"
+      TRACKER_API_PORT: "${OPENINFOMATE_API_PORT:-8899}"
+      TRACKER_SEARXNG_BASE_URL: "${OPENINFOMATE_SEARXNG_BASE_URL:-http://127.0.0.1:${OPENINFOMATE_SEARXNG_PORT:-8888}}"
+
+  scheduler:
+    network_mode: host
+    environment:
+      TRACKER_SEARXNG_BASE_URL: "${OPENINFOMATE_SEARXNG_BASE_URL:-http://127.0.0.1:${OPENINFOMATE_SEARXNG_PORT:-8888}}"
+
+  searxng:
+    # Host-mode expects SearxNG reachable via host network.
+    # If you still want to run it in this compose stack, bind it on host loopback.
+    ports:
+      - "127.0.0.1:${OPENINFOMATE_SEARXNG_PORT:-8888}:8080"
