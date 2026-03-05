@@ -1,0 +1,19 @@
+# Tracker topics file example
+#
+# Format: one topic per line:
+#   name|query
+#
+# - `query` is optional; if omitted, it defaults to `name`.
+# - Use comma-separated keywords in `query` (v1 heuristic matching).
+#
+# Copy this to `topics.txt`, edit, then run:
+#   tracker topic bootstrap-file --in topics.txt --searxng-base-url "http://127.0.0.1:8888" --discourse-base-url "https://linux.do"
+#
+# Tip: NodeSeek RSS is auto-added for “China dev/中文开发社区/论坛” style topics.
+# To force-add NodeSeek for all topics, append: `--add-nodeseek`
+#
+AI Agents|crewai,autogen,langgraph,agentic,workflow
+LLM Security|prompt injection,agent security,ssrf,rce,supply chain
+AI Chips|ai chips,gpu,asic,accelerator,hbm
+Open Source Infra|searxng,sqlite,systemd,fastapi,playwright
+China Dev社区|AI,LLM,开源,安全,系统,infra,工程化

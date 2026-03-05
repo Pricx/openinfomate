@@ -1,0 +1,706 @@
+{% extends "base.html" %}
+{% block content %}
+  <h1>{{ t("Push Setup") }}</h1>
+  {% if msg %}
+    <div class="card wide" style="margin-top:12px">
+      <div class="muted">{{ msg }}</div>
+    </div>
+  {% endif %}
+
+  <div class="row" style="margin-top:12px">
+    <div class="card wide">
+      {% set admin_config_url = ("/admin?token=" ~ token ~ "&section=config") if token else "/admin?section=config" %}
+      {% set admin_config_push = admin_config_url ~ "#cfg-push" %}
+      {% set admin_config_llm = admin_config_url ~ "#cfg-llm" %}
+
+      <h2>{{ t("Push Hub") }}</h2>
+      <div class="muted">
+        {{ t("Use Config Center to view and edit settings (shows effective values + autosave).") }}
+      </div>
+	      <div class="actions" style="margin-top:10px; flex-wrap:wrap">
+	        <a class="btn-primary" href="{{ admin_config_push }}">{{ t("Open Config Center (Push)") }}</a>
+	        <a class="btn-ghost" href="{{ admin_config_llm }}">{{ t("Open Config Center (LLM)") }}</a>
+	        <a class="btn-ghost" href="/setup/wizard{{ token_qs }}">{{ t("Setup Wizard") }}</a>
+	      </div>
+
+	      <div class="card" style="margin-top:12px">
+	        <h3>{{ t("Telegram") }}</h3>
+	        <div class="muted">
+	          {{ t("Connect a Telegram chat by clicking a /start link, then press Check Connection.") }}
+	        </div>
+
+	        <div class="muted" style="margin-top:10px">{{ t("Bot token") }} ({{ t("required") }})</div>
+	        <div class="row" style="margin-top:6px; gap:10px; align-items:flex-end; flex-wrap:wrap">
+	          <div style="flex: 1 1 320px; min-width:260px">
+	            <input id="f_telegram_token" type="password" placeholder="123456:ABC..." />
+	            <div class="muted" style="margin-top:6px"><code>TRACKER_TELEGRAM_BOT_TOKEN</code></div>
+	          </div>
+	          <div class="actions" style="flex-wrap:wrap">
+	            <button type="button" class="btn-ok" onclick="trackerTelegramSaveTokenAndConnect()">{{ t("Save + Connect") }}</button>
+	            <button type="button" onclick="trackerTelegramTestBotToken()">{{ t("Test Telegram token") }}</button>
+	          </div>
+	        </div>
+	        <div class="muted" id="telegramTokenStatus" style="margin-top:6px"></div>
+
+	        <div class="muted" style="margin-top:10px">{{ t("Bot username") }} ({{ t("optional") }})</div>
+	        <div class="row" style="margin-top:6px; gap:10px; align-items:flex-end; flex-wrap:wrap">
+	          <div style="flex: 1 1 320px; min-width:260px">
+	            <input id="f_telegram_username" placeholder="OpenInfoMateBot" />
+	            <div class="muted" style="margin-top:6px"><code>TRACKER_TELEGRAM_BOT_USERNAME</code></div>
+	          </div>
+	          <div class="actions" style="flex-wrap:wrap">
+	            <button type="button" onclick="trackerTelegramGenerateLink()">{{ t("Generate Connect Link") }}</button>
+	            <button type="button" onclick="trackerTelegramPoll()">{{ t("Check Connection") }}</button>
+	            <button type="button" onclick="trackerTelegramDisconnect()">{{ t("Disconnect") }}</button>
+	          </div>
+	        </div>
+	        <div class="row" style="margin-top:8px; gap: 10px; align-items:center">
+	          <div style="flex: 1 1 260px"><input id="telegramLink" readonly placeholder="https://t.me/OpenInfoMateBot?start=..." /></div>
+	        </div>
+	        <div class="muted" id="telegramStatus" style="margin-top:6px"></div>
+	      </div>
+	
+	      <details style="margin-top:12px">
+	        <summary class="muted">{{ t("Legacy guided env builder (advanced)") }}</summary>
+	        <div style="margin-top:10px">
+	          <h3>{{ t("Guided Setup") }}</h3>
+      <div class="muted">
+        {{ t("This page writes a small set of keys into") }} <code>TRACKER_ENV_PATH</code>. {{ t("Secrets are never echoed back.") }}
+      </div>
+      <div class="muted" style="margin-top:8px">
+        {{ t("After applying, click Restart (top right) to reload services.") }}
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <div style="flex: 1 1 520px">
+	          <h3>{{ t("DingTalk (signed webhook supported)") }}</h3>
+	          <div class="muted">
+	            {{ t("If you enabled “加签”, set TRACKER_DINGTALK_SECRET (starts with SEC).") | replace("TRACKER_DINGTALK_SECRET", "<code>TRACKER_DINGTALK_SECRET</code>") | replace("SEC", "<code>SEC</code>") | safe }}
+	          </div>
+	          <div class="muted" style="margin-top:8px">{{ t("Enabled") }}</div>
+	          <div>
+	            <select id="f_push_dingtalk_enabled">
+	              <option value="">{{ t("Leave") }}</option>
+	              <option value="true">true</option>
+	              <option value="false">false</option>
+	            </select>
+	          </div>
+	          <div class="muted" style="margin-top:6px"><code>TRACKER_PUSH_DINGTALK_ENABLED</code></div>
+	          <div class="muted" style="margin-top:10px">{{ t("Webhook URL") }} ({{ t("required") }})</div>
+	          <div><input id="f_dingtalk_url" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." /></div>
+	          <div class="muted" style="margin-top:6px"><code>TRACKER_DINGTALK_WEBHOOK_URL</code></div>
+	          <div class="muted" style="margin-top:10px">{{ t("Secret") }} ({{ t("optional") }})</div>
+	          <div><input id="f_dingtalk_secret" placeholder="SEC..." /></div>
+	          <div class="muted" style="margin-top:6px"><code>TRACKER_DINGTALK_SECRET</code></div>
+
+	          <h3 style="margin-top:14px">{{ t("Schedules + formatting") }}</h3>
+	          <div class="muted" style="margin-top:8px">{{ t("cron_timezone") }} ({{ t("required") }})</div>
+	          <div><input id="f_cron_timezone" placeholder="+8" /></div>
+	          <div class="muted" style="margin-top:6px"><code>TRACKER_CRON_TIMEZONE</code></div>
+          <div class="row" style="margin-top:8px">
+            <div style="flex: 1 1 240px">
+              <div class="muted" style="margin-bottom:6px">{{ t("Cron misfire grace seconds") }}</div>
+              <input id="f_cron_misfire_grace_seconds" placeholder="21600 (0=disable)" />
+              <div class="muted" style="margin-top:6px"><code>TRACKER_CRON_MISFIRE_GRACE_SECONDS</code></div>
+            </div>
+          </div>
+          <div class="muted" style="margin-top:8px">{{ t("Output language follows UI language (top right).") }}</div>
+          <div class="row" style="margin-top:8px">
+            <div style="flex: 1 1 240px">
+              <div class="muted" style="margin-bottom:6px">{{ t("Digest push enabled") }}</div>
+              <select id="f_digest_push_enabled">
+                <option value="">{{ t("Leave") }}</option>
+                <option value="true">true</option>
+                <option value="false">false ({{ t("recommended") }})</option>
+              </select>
+              <div class="muted" style="margin-top:6px"><code>TRACKER_DIGEST_PUSH_ENABLED</code></div>
+            </div>
+          </div>
+
+          <h3 style="margin-top:14px">{{ t("LLM (OpenAI-compatible)") }}</h3>
+          <div class="muted">
+            {{ t("Configure the LLM gateway used for AI curation and writing. Use model routing to keep reasoning on gpt-5.2+ and compression on a mini model.") }}
+          </div>
+          <div class="row" style="margin-top:8px">
+            <div style="flex: 1 1 240px">
+              <div class="muted" style="margin-bottom:6px">{{ t("Curation enabled") }}</div>
+              <select id="f_llm_curation_enabled">
+                <option value="">{{ t("Leave") }}</option>
+                <option value="true">true ({{ t("recommended") }})</option>
+                <option value="false">false</option>
+              </select>
+              <div class="muted" style="margin-top:6px"><code>TRACKER_LLM_CURATION_ENABLED</code></div>
+            </div>
+            <div style="flex: 1 1 240px">
+              <div class="muted" style="margin-bottom:6px">{{ t("Full-text enrichment") }}</div>
+              <select id="f_fulltext_enabled">
+                <option value="">{{ t("Leave") }}</option>
+                <option value="true">true</option>
+                <option value="false">false</option>
+              </select>
+              <div class="muted" style="margin-top:6px"><code>TRACKER_FULLTEXT_ENABLED</code></div>
+            </div>
+          </div>
+
+          <h4 style="margin-top:12px">{{ t("Reasoning provider") }}</h4>
+          <div class="row" style="margin-top:8px">
+            <div style="flex: 1 1 320px; min-width:260px">
+              <div class="muted" style="margin-bottom:6px">{{ t("Base URL") }}</div>
+              <input id="f_llm_base_url" placeholder="http://127.0.0.1:8317/v1" />
+              <div class="muted" style="margin-top:6px"><code>TRACKER_LLM_BASE_URL</code></div>
+            </div>
+	            <div style="flex: 1 1 320px; min-width:260px">
+	              <div class="muted" style="margin-bottom:6px">{{ t("Model") }}</div>
+	              <input id="f_llm_model" placeholder="gpt-5.2" />
+	              <div class="muted" style="margin-top:6px"><code>TRACKER_LLM_MODEL</code></div>
+	            </div>
+	          </div>
+          <div class="row" style="margin-top:10px">
+            <div style="flex: 1 1 320px; min-width:260px">
+              <div class="muted" style="margin-bottom:6px">{{ t("Reasoning model override (optional)") }}</div>
+              <input id="f_llm_model_reasoning" placeholder="(leave empty)" />
+              <div class="muted" style="margin-top:6px"><code>TRACKER_LLM_MODEL_REASONING</code></div>
+            </div>
+            <div style="flex: 1 1 320px; min-width:260px">
+              <div class="muted" style="margin-bottom:6px">{{ t("Mini model") }}</div>
+              <input id="f_llm_model_mini" placeholder="gpt-5.1-codex-mini" />
+              <div class="muted" style="margin-top:6px"><code>TRACKER_LLM_MODEL_MINI</code></div>
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <div style="flex: 1 1 320px; min-width:260px">
+              <div class="muted" style="margin-bottom:6px">{{ t("API key") }} ({{ t("optional") }})</div>
+              <input id="f_llm_api_key" type="password" placeholder="(leave blank to keep)" />
+              <div class="muted" style="margin-top:6px"><code>TRACKER_LLM_API_KEY</code></div>
+            </div>
+            <div style="flex: 1 1 320px; min-width:260px">
+              <div class="muted" style="margin-bottom:6px">{{ t("Proxy (optional)") }}</div>
+              <input id="f_llm_proxy" placeholder="http://user:pass@host:port" />
+              <div class="muted" style="margin-top:6px"><code>TRACKER_LLM_PROXY</code></div>
+            </div>
+          </div>
+
+          <div style="margin-top:10px">
+            <div class="muted" style="margin-bottom:6px">{{ t("Extra request body (optional)") }}</div>
+            <textarea id="f_llm_extra_body_json" rows="3" placeholder='{"reasoning":{"effort":"xhigh"}}'></textarea>
+            <div class="muted" style="margin-top:6px"><code>TRACKER_LLM_EXTRA_BODY_JSON</code></div>
+          </div>
+          <div class="muted" style="margin-top:6px">
+            {{ t("Tip: you can set reasoning effort via TRACKER_LLM_EXTRA_BODY_JSON, e.g.") }} <code>{"reasoning":{"effort":"xhigh"}}</code>
+          </div>
+          <div class="muted" style="margin-top:6px">
+            {{ t("Note: this legacy builder does not autosave. Your Extra request body draft is kept locally in this browser until you click Apply.") }}
+          </div>
+          <details style="margin-top:10px">
+            <summary class="muted">{{ t("Mini provider") }} ({{ t("optional") }})</summary>
+            <div class="muted" style="margin-top:8px">{{ t("Use a cheaper provider for triage/digest summary workloads.") }}</div>
+            <div class="row" style="margin-top:10px">
+              <div style="flex: 1 1 320px; min-width:260px">
+                <div class="muted" style="margin-bottom:6px">{{ t("Mini base URL (optional)") }}</div>
+                <input id="f_llm_mini_base_url" placeholder="http://127.0.0.1:8317/v1" />
+                <div class="muted" style="margin-top:6px"><code>TRACKER_LLM_MINI_BASE_URL</code></div>
+              </div>
+              <div style="flex: 1 1 320px; min-width:260px">
+                <div class="muted" style="margin-bottom:6px">{{ t("Mini API key") }}</div>
+                <input id="f_llm_mini_api_key" type="password" placeholder="(leave blank to keep)" />
+                <div class="muted" style="margin-top:6px"><code>TRACKER_LLM_MINI_API_KEY</code></div>
+              </div>
+            </div>
+            <div class="row" style="margin-top:10px">
+              <div style="flex: 1 1 320px; min-width:260px">
+                <div class="muted" style="margin-bottom:6px">{{ t("Mini proxy (optional)") }}</div>
+                <input id="f_llm_mini_proxy" placeholder="http://user:pass@host:port" />
+                <div class="muted" style="margin-top:6px"><code>TRACKER_LLM_MINI_PROXY</code></div>
+              </div>
+            </div>
+          </details>
+
+          <h3 style="margin-top:14px">{{ t("Email (SMTP)") }}</h3>
+          <div class="row" style="margin-top:8px">
+            <div style="flex: 1 1 240px"><input id="f_smtp_host" placeholder="smtp.example.com" /></div>
+            <div style="flex: 0 0 160px"><input id="f_smtp_port" placeholder="587" /></div>
+          </div>
+          <div style="margin-top:8px"><input id="f_smtp_user" placeholder="you@example.com" /></div>
+          <div style="margin-top:8px"><input id="f_smtp_password" type="password" placeholder="(not echoed)" /></div>
+          <div class="row" style="margin-top:8px">
+            <div style="flex: 1 1 240px">
+              <select id="f_smtp_starttls">
+                <option value="">{{ t("Leave") }}</option>
+                <option value="true">true</option>
+                <option value="false">false</option>
+              </select>
+            </div>
+            <div style="flex: 1 1 240px">
+              <select id="f_smtp_use_ssl">
+                <option value="">{{ t("Leave") }}</option>
+                <option value="true">true (465)</option>
+                <option value="false">false</option>
+              </select>
+            </div>
+          </div>
+          <div style="margin-top:8px"><input id="f_email_from" placeholder="you@example.com" /></div>
+          <div style="margin-top:8px"><input id="f_email_to" placeholder="you@example.com,friend@example.com" /></div>
+
+          <h3 style="margin-top:14px">{{ t("Optional") }}</h3>
+          <div style="margin-top:8px"><input id="f_webhook_url" placeholder="https://example.com/your/webhook" /></div>
+
+          <div class="actions" style="margin-top:12px">
+            <button type="button" class="btn-primary" onclick="trackerGenerateEnvBlock()">{{ t("Generate .env Block") }}</button>
+            <button type="button" onclick="trackerCopyText(document.getElementById('envBlock').value || '', '{{ t('Env block copied') }}')">{{ t("Copy") }}</button>
+            <button type="button" class="btn-ok" onclick="trackerPushTest()">{{ t("Send Test Notification") }}</button>
+          </div>
+        </div>
+        <div style="flex: 1 1 360px">
+          <h3>{{ t(".env Block") }}</h3>
+          <div class="muted">{{ t("You can also paste directly (advanced).") }}</div>
+		          <textarea id="envBlock" name="env_block" rows="16" style="margin-top:8px" placeholder="TRACKER_CRON_TIMEZONE=+8
+TRACKER_CRON_MISFIRE_GRACE_SECONDS=21600
+TRACKER_DIGEST_PUSH_ENABLED=false
+TRACKER_DINGTALK_WEBHOOK_URL=...
+TRACKER_DINGTALK_SECRET=SEC...
+TRACKER_SMTP_HOST=...
+TRACKER_SMTP_PORT=587
+TRACKER_SMTP_USER=...
+TRACKER_SMTP_PASSWORD=...
+TRACKER_SMTP_STARTTLS=true
+TRACKER_SMTP_USE_SSL=false
+TRACKER_EMAIL_FROM=...
+TRACKER_EMAIL_TO=you@example.com
+# Optional:
+TRACKER_WEBHOOK_URL=..."></textarea>
+          <div class="actions" style="margin-top:10px">
+            <button type="button" onclick="trackerPasteFromClipboard()">{{ t("Paste") }}</button>
+          </div>
+        </div>
+      </div>
+
+      <form id="applyForm" method="post" action="/setup/push/apply{{ token_qs }}" style="margin-top:12px">
+        <input type="hidden" name="env_block" id="envBlockHidden" />
+        <div class="actions">
+          <button type="submit" class="btn-primary" onclick="return trackerSubmitApply()">{{ t("Apply") }}</button>
+          <a href="/management{{ token_qs }}" style="align-self:center">{{ t("Back to Admin") }}</a>
+        </div>
+          <div class="muted" style="margin-top:10px">
+		          {{ t("Allowed keys only:") }} TRACKER_CRON_TIMEZONE, TRACKER_CRON_MISFIRE_GRACE_SECONDS, TRACKER_DIGEST_PUSH_ENABLED, TRACKER_LLM_CURATION_ENABLED, TRACKER_FULLTEXT_ENABLED, TRACKER_LLM_BASE_URL, TRACKER_LLM_API_KEY, TRACKER_LLM_PROXY, TRACKER_LLM_MODEL, TRACKER_LLM_MODEL_REASONING, TRACKER_LLM_MODEL_MINI, TRACKER_LLM_MINI_BASE_URL, TRACKER_LLM_MINI_API_KEY, TRACKER_LLM_MINI_PROXY, TRACKER_LLM_EXTRA_BODY_JSON, TRACKER_PUSH_DINGTALK_ENABLED, TRACKER_DINGTALK_WEBHOOK_URL, TRACKER_DINGTALK_SECRET, TRACKER_TELEGRAM_BOT_TOKEN, TRACKER_TELEGRAM_BOT_USERNAME, TRACKER_TELEGRAM_CHAT_ID, TRACKER_TELEGRAM_OWNER_USER_ID, TRACKER_TELEGRAM_DISABLE_PREVIEW, TRACKER_TELEGRAM_CONNECT_POLL_SECONDS, TRACKER_WEBHOOK_URL, TRACKER_SMTP_*, TRACKER_EMAIL_*.
+          </div>
+      </form>
+        </div>
+      </details>
+    </div>
+
+    <div class="card narrow">
+      <h2>{{ t("Doctor") }}</h2>
+      {% if doctor_report %}
+        <div class="muted">
+          {{ t("cron_timezone") }}={{ doctor_report.cron_timezone }}
+          {{ t("ok") }}={{ doctor_report.cron_timezone_ok }}
+          {{ t("now") }}={{ doctor_report.cron_now_iso }}
+        </div>
+        <div class="muted" style="margin-top:6px">
+          API=<code>{{ doctor_report.api_host }}:{{ doctor_report.api_port }}</code>
+          · auth=<code>{{ 'on' if doctor_report.api_auth_configured else 'off' }}</code>
+          · bind=<code>{{ 'public' if doctor_report.api_bind_public else 'localhost' }}</code>
+        </div>
+        {% if doctor_report.next_health_report_at or doctor_report.next_discover_sources_at %}
+          <div class="muted" style="margin-top:6px">
+            {{ t("Next health") }}={{ doctor_report.next_health_report_at or "-" }}
+            · {{ t("Next source discovery") }}={{ doctor_report.next_discover_sources_at or "-" }}
+          </div>
+        {% endif %}
+        <div style="margin-top:10px" class="actions">
+          <span class="badge {{ 'ok' if doctor_report.push_dingtalk_configured else 'warn' }}">{{ t("DingTalk") }}={{ doctor_report.push_dingtalk_configured }}</span>
+          <span class="badge {{ 'ok' if doctor_report.push_telegram_configured else 'warn' }}">{{ t("Telegram") }}={{ doctor_report.push_telegram_configured }}</span>
+          <span class="badge {{ 'ok' if doctor_report.push_email_configured else 'warn' }}">{{ t("Email") }}={{ doctor_report.push_email_configured }}</span>
+          <span class="badge {{ 'ok' if doctor_report.push_webhook_configured else 'warn' }}">{{ t("Webhook") }}={{ doctor_report.push_webhook_configured }}</span>
+          <span class="badge {{ 'ok' if doctor_report.profile_configured else 'warn' }}">{{ t("Profile") }}={{ doctor_report.profile_configured }}</span>
+        </div>
+        {% if doctor_report.push_missing_env %}
+          <h3 style="margin-top:12px">{{ t("Missing env") }}</h3>
+          <pre>{% for k in doctor_report.push_missing_env %}- {{ k }}
+{% endfor %}</pre>
+        {% endif %}
+      {% else %}
+        <div class="muted">{{ t("Doctor report unavailable.") }}</div>
+      {% endif %}
+    </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  <script>
+    function trackerSetupPushInitDrafts() {
+      // Non-secret convenience: keep the Extra request body draft locally so an accidental refresh
+      // doesn't wipe it before the operator clicks Generate + Apply.
+      try {
+        const el = document.getElementById('f_llm_extra_body_json');
+        if (!el) return;
+        const key = 'openinfomate.setup_push.draft.llm_extra_body_json';
+        try {
+          const saved = localStorage.getItem(key);
+          if (saved && !String(el.value || '').trim()) el.value = saved;
+        } catch (e) {}
+        el.addEventListener('input', () => {
+          try {
+            const v = String(el.value || '');
+            if (!v.trim()) localStorage.removeItem(key);
+            else localStorage.setItem(key, v);
+          } catch (e) {}
+        });
+      } catch (e) {}
+    }
+
+    document.addEventListener('DOMContentLoaded', trackerSetupPushInitDrafts);
+
+    function _val(id) {
+      const el = document.getElementById(id);
+      return (el && el.value ? String(el.value).trim() : '');
+    }
+
+    function _oneLine(text) {
+      return String(text || '').replace(/\\r?\\n/g, ' ').trim();
+    }
+
+	    function trackerGenerateEnvBlock() {
+	      const lines = [];
+
+		      const tz = _val('f_cron_timezone');
+		      const misfire = _val('f_cron_misfire_grace_seconds');
+			      const pushDingtalkEnabled = _val('f_push_dingtalk_enabled');
+		      const dpush = _val('f_digest_push_enabled');
+	      const llmCur = _val('f_llm_curation_enabled');
+	      const ftEnabled = _val('f_fulltext_enabled');
+	      const llmBase = _val('f_llm_base_url');
+      const llmProxy = _val('f_llm_proxy');
+      const llmModel = _val('f_llm_model');
+      const llmKey = _val('f_llm_api_key');
+      const llmReasoning = _val('f_llm_model_reasoning');
+      const llmMini = _val('f_llm_model_mini');
+      const llmExtra = _oneLine(_val('f_llm_extra_body_json'));
+      const llmMiniBase = _val('f_llm_mini_base_url');
+      const llmMiniKey = _val('f_llm_mini_api_key');
+      const llmMiniProxy = _val('f_llm_mini_proxy');
+		      if (tz) lines.push('TRACKER_CRON_TIMEZONE=' + tz);
+		      if (misfire) lines.push('TRACKER_CRON_MISFIRE_GRACE_SECONDS=' + misfire);
+			      if (pushDingtalkEnabled) lines.push('TRACKER_PUSH_DINGTALK_ENABLED=' + pushDingtalkEnabled);
+		      if (dpush) lines.push('TRACKER_DIGEST_PUSH_ENABLED=' + dpush);
+	      if (llmCur) lines.push('TRACKER_LLM_CURATION_ENABLED=' + llmCur);
+	      if (ftEnabled) lines.push('TRACKER_FULLTEXT_ENABLED=' + ftEnabled);
+      if (llmBase) lines.push('TRACKER_LLM_BASE_URL=' + llmBase);
+      if (llmProxy) lines.push('TRACKER_LLM_PROXY=' + llmProxy);
+      if (llmModel) lines.push('TRACKER_LLM_MODEL=' + llmModel);
+      if (llmKey) lines.push('TRACKER_LLM_API_KEY=' + llmKey);
+      if (llmReasoning) lines.push('TRACKER_LLM_MODEL_REASONING=' + llmReasoning);
+      if (llmMini) lines.push('TRACKER_LLM_MODEL_MINI=' + llmMini);
+      if (llmExtra) lines.push('TRACKER_LLM_EXTRA_BODY_JSON=' + llmExtra);
+      if (llmMiniBase) lines.push('TRACKER_LLM_MINI_BASE_URL=' + llmMiniBase);
+      if (llmMiniKey) lines.push('TRACKER_LLM_MINI_API_KEY=' + llmMiniKey);
+      if (llmMiniProxy) lines.push('TRACKER_LLM_MINI_PROXY=' + llmMiniProxy);
+
+      const durl = _val('f_dingtalk_url');
+      const dsec = _val('f_dingtalk_secret');
+      if (durl) lines.push('TRACKER_DINGTALK_WEBHOOK_URL=' + durl);
+      if (dsec) lines.push('TRACKER_DINGTALK_SECRET=' + dsec);
+
+      const tgToken = _val('f_telegram_token');
+      const tgUser = _val('f_telegram_username');
+      const tgOwner = _val('f_telegram_owner_user_id');
+      const tgPoll = _val('f_telegram_connect_poll_seconds');
+      if (tgToken) lines.push('TRACKER_TELEGRAM_BOT_TOKEN=' + tgToken);
+      if (tgUser) lines.push('TRACKER_TELEGRAM_BOT_USERNAME=' + tgUser);
+      if (tgOwner) lines.push('TRACKER_TELEGRAM_OWNER_USER_ID=' + tgOwner);
+      if (tgPoll) lines.push('TRACKER_TELEGRAM_CONNECT_POLL_SECONDS=' + tgPoll);
+
+      const smtpHost = _val('f_smtp_host');
+      const smtpPort = _val('f_smtp_port');
+      const smtpUser = _val('f_smtp_user');
+      const smtpPass = _val('f_smtp_password');
+      const smtpStarttls = _val('f_smtp_starttls');
+      const smtpUseSsl = _val('f_smtp_use_ssl');
+      const emailFrom = _val('f_email_from');
+      const emailTo = _val('f_email_to');
+      if (smtpHost) lines.push('TRACKER_SMTP_HOST=' + smtpHost);
+      if (smtpPort) lines.push('TRACKER_SMTP_PORT=' + smtpPort);
+      if (smtpUser) lines.push('TRACKER_SMTP_USER=' + smtpUser);
+      if (smtpPass) lines.push('TRACKER_SMTP_PASSWORD=' + smtpPass);
+      if (smtpStarttls) lines.push('TRACKER_SMTP_STARTTLS=' + smtpStarttls);
+      if (smtpUseSsl) lines.push('TRACKER_SMTP_USE_SSL=' + smtpUseSsl);
+      if (emailFrom) lines.push('TRACKER_EMAIL_FROM=' + emailFrom);
+      if (emailTo) lines.push('TRACKER_EMAIL_TO=' + emailTo);
+
+      const wh = _val('f_webhook_url');
+      if (wh) lines.push('TRACKER_WEBHOOK_URL=' + wh);
+
+      const text = lines.join('\\n');
+      document.getElementById('envBlock').value = text;
+      trackerShowToast('{{ t("Generated .env block (review then Apply).") }}', 'success');
+    }
+
+    async function trackerPasteFromClipboard() {
+      try {
+        const text = await navigator.clipboard.readText();
+        document.getElementById('envBlock').value = text || '';
+        trackerShowToast('{{ t("Pasted from clipboard.") }}', 'success');
+      } catch (e) {
+        trackerShowToast('{{ t("Clipboard read failed. Please paste manually.") }}', 'error');
+      }
+    }
+
+    function trackerSubmitApply() {
+      const text = document.getElementById('envBlock').value || '';
+      document.getElementById('envBlockHidden').value = text;
+      if (!text.trim()) {
+        trackerShowToast('{{ t("Env block is empty.") }}', 'warning');
+        return false;
+      }
+      return true;
+    }
+
+	    async function trackerPushTest(only) {
+	      try {
+	        const qs = "{{ ('?token=' ~ token) if token else '' }}";
+	        const resp = await fetch('/pushes/test' + qs, {
+	          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ only: only || null })
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok) {
+          const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : ('HTTP ' + resp.status);
+          trackerShowToast(msg, 'error', '{{ t("Push Test Failed") }}');
+          return;
+        }
+        const results = data && data.results ? data.results : [];
+        const lines = results.map(r => `${r.channel}: ${r.status}`).join('\\n');
+        trackerShowToast(lines || 'ok', 'success', '{{ t("Push Test") }}');
+      } catch (e) {
+	        trackerShowToast(String(e || 'error'), 'error', '{{ t("Push Test Failed") }}');
+	      }
+	    }
+
+	    async function trackerTelegramSaveTokenAndConnect() {
+	      const tok = _val('f_telegram_token');
+	      if (!tok) {
+	        trackerShowToast('{{ t("Missing") }}: TRACKER_TELEGRAM_BOT_TOKEN', 'warning', '{{ t("Telegram") }}');
+	        return;
+	      }
+	      const ok = confirm('{{ t("Save") }} TRACKER_TELEGRAM_BOT_TOKEN?\\n\\n- {{ t("Secrets are never echoed back.") }}');
+	      if (!ok) return;
+	      try {
+	        const qs = "{{ ('?token=' ~ token) if token else '' }}";
+	        const fd = new FormData();
+	        fd.set('telegram_bot_token', tok);
+	        const resp = await fetch('/admin/settings/patch' + qs, {
+	          method: 'POST',
+	          credentials: 'same-origin',
+	          headers: { 'accept': 'application/json' },
+	          body: fd
+	        });
+	        const data = await resp.json().catch(() => null);
+	        if (!resp.ok) {
+	          const msg = (data && (data.message || data.detail || data.error)) ? String(data.message || data.detail || data.error) : ('HTTP ' + resp.status);
+	          trackerShowToast(msg, 'error', '{{ t("Telegram") }}', 5200);
+	          return;
+	        }
+	        trackerShowToast('{{ t("Saved") }}', 'success', '{{ t("Telegram") }}');
+	        await trackerTelegramRefreshStatus();
+	        await trackerTelegramTestBotToken();
+	        await trackerTelegramGenerateLink();
+	      } catch (e) {
+	        trackerShowToast(String(e || 'error'), 'error', '{{ t("Telegram") }}', 5200);
+	      }
+	    }
+
+	    async function trackerTelegramTestBotToken() {
+	      try {
+	        const qs = "{{ ('?token=' ~ token) if token else '' }}";
+	        const el = document.getElementById('telegramTokenStatus');
+	        if (el) el.textContent = '{{ t("Loading…") }}';
+	        const resp = await fetch('/admin/telegram/test-bot' + qs, {
+	          method: 'POST',
+	          credentials: 'same-origin',
+	          headers: { 'accept': 'application/json' }
+	        });
+	        const data = await resp.json().catch(() => null);
+	        if (!resp.ok) {
+	          const msg = (data && (data.message || data.detail || data.error)) ? String(data.message || data.detail || data.error) : ('HTTP ' + resp.status);
+	          if (el) el.textContent = msg;
+	          trackerShowToast(msg, 'error', '{{ t("Telegram") }}', 5200);
+	          return null;
+	        }
+	        const msg = (data && data.message) ? String(data.message) : 'ok';
+	        if (el) el.textContent = msg;
+	        trackerShowToast(msg, 'success', '{{ t("Telegram") }}');
+	        try {
+	          const u = (data && data.username) ? String(data.username || '').trim() : '';
+	          if (u && !_val('f_telegram_username')) {
+	            const inp = document.getElementById('f_telegram_username');
+	            if (inp) inp.value = u.replace(/^@+/, '');
+	          }
+	        } catch (e) {}
+	        return data;
+	      } catch (e) {
+	        trackerShowToast(String(e || 'error'), 'error', '{{ t("Telegram") }}', 5200);
+	        return null;
+	      }
+	    }
+
+		    async function trackerTelegramRefreshStatus() {
+		      try {
+		        const qs = "{{ ('?token=' ~ token) if token else '' }}";
+		        const resp = await fetch('/telegram/status' + qs);
+		        const data = await resp.json().catch(() => null);
+	        if (!resp.ok) {
+	          return null;
+	        }
+	        const linkEl = document.getElementById('telegramLink');
+	        const stEl = document.getElementById('telegramStatus');
+	        const bot = (data && data.bot_username) ? data.bot_username : 'OpenInfoMateBot';
+		        const pending = (data && data.pending_code) ? data.pending_code : '';
+		        const chatId = (data && data.chat_id) ? data.chat_id : '';
+		        const hasToken = !!(data && data.has_bot_token);
+	        if (linkEl && pending) {
+	          linkEl.value = `https://t.me/${bot}?start=${pending}`;
+	        }
+	        if (stEl) {
+	          if (!hasToken) {
+	            stEl.textContent = '{{ t("Telegram bot token is not configured yet.") }}';
+	          } else if (chatId) {
+	            stEl.textContent = '{{ t("Telegram connected") }}' + ': chat_id=' + chatId;
+	          } else if (pending) {
+	            stEl.textContent = '{{ t("Waiting for /start…") }}';
+	          } else {
+	            stEl.textContent = '{{ t("Telegram not connected") }}';
+		          }
+		        }
+	        return data;
+	      } catch (e) {
+	        // ignore
+	        return null;
+	      }
+	    }
+	
+	    let _trackerTelegramAutoPollTimer = null;
+	    let _trackerTelegramAutoPollAttempts = 0;
+	
+	    function trackerTelegramStopAutoPoll() {
+	      if (_trackerTelegramAutoPollTimer) {
+	        clearInterval(_trackerTelegramAutoPollTimer);
+	        _trackerTelegramAutoPollTimer = null;
+	      }
+	      _trackerTelegramAutoPollAttempts = 0;
+	    }
+	
+	    async function trackerTelegramMaybeAutoPoll() {
+	      const data = await trackerTelegramRefreshStatus();
+	      const pending = (data && data.pending_code) ? String(data.pending_code) : '';
+	      const chatId = (data && data.chat_id) ? String(data.chat_id) : '';
+	      const hasToken = !!(data && data.has_bot_token);
+	      if (!hasToken || chatId || !pending) {
+	        trackerTelegramStopAutoPoll();
+	        return;
+	      }
+	      if (_trackerTelegramAutoPollTimer) {
+	        return;
+	      }
+	
+	      const qs = "{{ ('?token=' ~ token) if token else '' }}";
+	      _trackerTelegramAutoPollAttempts = 0;
+	      _trackerTelegramAutoPollTimer = setInterval(async () => {
+	        _trackerTelegramAutoPollAttempts += 1;
+	        if (_trackerTelegramAutoPollAttempts > 40) { // ~2 minutes
+	          trackerTelegramStopAutoPoll();
+	          return;
+	        }
+	        try {
+	          const resp = await fetch('/telegram/poll' + qs, {
+	            method: 'POST',
+	            headers: { 'content-type': 'application/json' },
+	            body: JSON.stringify({})
+	          });
+	          const out = await resp.json().catch(() => null);
+	          if (resp.ok && out && out.status === 'connected') {
+	            trackerShowToast('{{ t("Telegram connected") }}', 'success', '{{ t("Telegram") }}');
+	            trackerTelegramStopAutoPoll();
+	          }
+	        } catch (e) {
+	          // ignore transient poll failures
+	        }
+	        const st = await trackerTelegramRefreshStatus();
+	        if (st && st.chat_id) {
+	          trackerTelegramStopAutoPoll();
+	        }
+	      }, 3000);
+	    }
+
+    async function trackerTelegramGenerateLink() {
+      try {
+        const qs = "{{ ('?token=' ~ token) if token else '' }}";
+        const botUsername = _val('f_telegram_username');
+        const resp = await fetch('/telegram/link' + qs, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ bot_username: botUsername || null })
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok) {
+          const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : ('HTTP ' + resp.status);
+          trackerShowToast(msg, 'error', '{{ t("Telegram") }}');
+          return;
+        }
+        const linkEl = document.getElementById('telegramLink');
+	        if (linkEl && data && data.link) {
+	          linkEl.value = String(data.link);
+	        }
+	        trackerShowToast('{{ t("Telegram connect link generated.") }}', 'success', '{{ t("Telegram") }}');
+	        await trackerTelegramMaybeAutoPoll();
+	      } catch (e) {
+	        trackerShowToast(String(e || 'error'), 'error', '{{ t("Telegram") }}');
+	      }
+	    }
+
+    async function trackerTelegramPoll() {
+      try {
+        const qs = "{{ ('?token=' ~ token) if token else '' }}";
+        const resp = await fetch('/telegram/poll' + qs, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({})
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok) {
+          const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : ('HTTP ' + resp.status);
+          trackerShowToast(msg, 'error', '{{ t("Telegram") }}');
+          return;
+        }
+        const st = (data && data.status) ? String(data.status) : '';
+        if (st === 'connected') {
+          trackerShowToast('{{ t("Telegram connected") }}', 'success', '{{ t("Telegram") }}');
+        } else if (st === 'no_code') {
+          trackerShowToast('{{ t("No pending Telegram link. Generate one first.") }}', 'warning', '{{ t("Telegram") }}');
+        } else {
+          trackerShowToast('{{ t("Not connected yet. Click the link and press Check again.") }}', 'warning', '{{ t("Telegram") }}');
+        }
+        await trackerTelegramRefreshStatus();
+      } catch (e) {
+        trackerShowToast(String(e || 'error'), 'error', '{{ t("Telegram") }}');
+      }
+    }
+
+    async function trackerTelegramDisconnect() {
+      try {
+        const qs = "{{ ('?token=' ~ token) if token else '' }}";
+        const resp = await fetch('/telegram/disconnect' + qs, { method: 'POST' });
+        if (!resp.ok) {
+          trackerShowToast('HTTP ' + resp.status, 'error', '{{ t("Telegram") }}');
+          return;
+        }
+        trackerShowToast('{{ t("Telegram disconnected.") }}', 'success', '{{ t("Telegram") }}');
+        await trackerTelegramRefreshStatus();
+      } catch (e) {
+        trackerShowToast(String(e || 'error'), 'error', '{{ t("Telegram") }}');
+      }
+    }
+
+	    trackerTelegramMaybeAutoPoll();
+	  </script>
+	{% endblock %}

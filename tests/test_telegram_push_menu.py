@@ -1,0 +1,233 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from tracker.envfile import parse_env_assignments
+from tracker.repo import Repo
+from tracker.settings import Settings
+from tracker.telegram_connect import telegram_poll
+
+
+@pytest.mark.asyncio
+async def test_telegram_push_menu_renders(db_session, monkeypatch, tmp_path):
+    repo = Repo(db_session)
+    repo.set_app_config("telegram_chat_id", "123")
+    repo.set_app_config("telegram_connected_notified", "1")
+    repo.set_app_config("output_language", "zh")
+
+    env_path = Path(tmp_path) / ".env"
+    settings = Settings(telegram_bot_token="TEST", env_path=str(env_path))
+
+    batches = [
+        [
+            {
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "text": "/push",
+                    "chat": {"id": 123},
+                    "from": {"id": 123},
+                },
+            }
+        ]
+    ]
+
+    async def fake_delete_webhook(*, bot_token: str, client_timeout_seconds: int) -> None:  # noqa: ARG001
+        return
+
+    async def fake_get_updates(*, bot_token: str, offset, timeout_seconds: int, client_timeout_seconds: int):  # noqa: ANN001, ARG001
+        return batches.pop(0) if batches else []
+
+    sent_raw: list[tuple[str, dict | None]] = []
+
+    async def fake_send_raw_text(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        disable_preview: bool = True,
+        reply_markup: dict | None = None,
+    ) -> int:  # noqa: ARG001
+        sent_raw.append((text, reply_markup))
+        return 200
+
+    monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
+    monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
+
+    await telegram_poll(repo=repo, settings=settings)
+
+    assert sent_raw
+    text0, kb0 = sent_raw[-1]
+    assert "Push" in text0
+    assert isinstance(kb0, dict)
+    assert any(
+        any(btn.get("callback_data") == "push:menu" for btn in row) for row in (kb0.get("inline_keyboard") or [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_telegram_push_bool_toggle_writes_env_and_db(db_session, monkeypatch, tmp_path):
+    repo = Repo(db_session)
+    repo.set_app_config("telegram_chat_id", "123")
+    repo.set_app_config("telegram_connected_notified", "1")
+    repo.set_app_config("output_language", "zh")
+
+    env_path = Path(tmp_path) / ".env"
+    settings = Settings(telegram_bot_token="TEST", env_path=str(env_path))
+
+    batches = [
+        [
+            {
+                "update_id": 1,
+                "callback_query": {
+                    "id": "cq1",
+                    "from": {"id": 123},
+                    "data": "push:bool:TRACKER_PUSH_DINGTALK_ENABLED:false",
+                    "message": {"message_id": 999, "chat": {"id": 123}},
+                },
+            }
+        ]
+    ]
+
+    async def fake_delete_webhook(*, bot_token: str, client_timeout_seconds: int) -> None:  # noqa: ARG001
+        return
+
+    async def fake_get_updates(*, bot_token: str, offset, timeout_seconds: int, client_timeout_seconds: int):  # noqa: ANN001, ARG001
+        return batches.pop(0) if batches else []
+
+    async def fake_answer_callback_query(
+        *,
+        bot_token: str,
+        callback_query_id: str,
+        text: str = "",
+        show_alert: bool = False,
+        client_timeout_seconds: int,
+    ) -> None:  # noqa: ARG001
+        return
+
+    sent_acks: list[str] = []
+    sent_raw: list[str] = []
+
+    async def fake_send_text(self, *, chat_id: str, text: str, disable_preview: bool = True):  # noqa: ANN001, ARG001
+        sent_acks.append(text)
+        return [201]
+
+    async def fake_send_raw_text(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        disable_preview: bool = True,
+        reply_markup: dict | None = None,
+    ) -> int:  # noqa: ARG001
+        sent_raw.append(text)
+        return 200
+
+    monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
+    monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
+    monkeypatch.setattr("tracker.telegram_connect.telegram_answer_callback_query", fake_answer_callback_query)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
+
+    await telegram_poll(repo=repo, settings=settings)
+
+    env = parse_env_assignments(env_path.read_text(encoding="utf-8"))
+    assert env.get("TRACKER_PUSH_DINGTALK_ENABLED") == "false"
+    assert (repo.get_app_config("push_dingtalk_enabled") or "").strip() == "false"
+    assert sent_acks
+    assert "无需重启" in sent_acks[-1]
+    assert sent_raw  # menu re-render
+
+
+@pytest.mark.asyncio
+async def test_telegram_push_set_secret_does_not_echo_value(db_session, monkeypatch, tmp_path):
+    repo = Repo(db_session)
+    repo.set_app_config("telegram_chat_id", "123")
+    repo.set_app_config("telegram_connected_notified", "1")
+    repo.set_app_config("output_language", "zh")
+
+    env_path = Path(tmp_path) / ".env"
+    settings = Settings(telegram_bot_token="TEST", env_path=str(env_path))
+
+    secret_url = "https://oapi.dingtalk.com/robot/send?access_token=SECRET_TOKEN"
+
+    batches = [
+        [
+            {
+                "update_id": 1,
+                "callback_query": {
+                    "id": "cq1",
+                    "from": {"id": 123},
+                    "data": "push:set:TRACKER_DINGTALK_WEBHOOK_URL",
+                    "message": {"message_id": 999, "chat": {"id": 123}},
+                },
+            }
+        ],
+        [
+            {
+                "update_id": 2,
+                "message": {
+                    "message_id": 11,
+                    "text": secret_url,
+                    "chat": {"id": 123},
+                    "from": {"id": 123},
+                    "reply_to_message": {"message_id": 200},
+                },
+            }
+        ],
+    ]
+
+    async def fake_delete_webhook(*, bot_token: str, client_timeout_seconds: int) -> None:  # noqa: ARG001
+        return
+
+    async def fake_get_updates(*, bot_token: str, offset, timeout_seconds: int, client_timeout_seconds: int):  # noqa: ANN001, ARG001
+        return batches.pop(0) if batches else []
+
+    async def fake_answer_callback_query(
+        *,
+        bot_token: str,
+        callback_query_id: str,
+        text: str = "",
+        show_alert: bool = False,
+        client_timeout_seconds: int,
+    ) -> None:  # noqa: ARG001
+        return
+
+    sent_prompts: list[str] = []
+    sent_acks: list[str] = []
+
+    async def fake_send_raw_text(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        disable_preview: bool = True,
+        reply_markup: dict | None = None,
+    ) -> int:  # noqa: ARG001
+        sent_prompts.append(text)
+        # Stable id so reply flow can reference it.
+        return 200
+
+    async def fake_send_text(self, *, chat_id: str, text: str, disable_preview: bool = True):  # noqa: ANN001, ARG001
+        sent_acks.append(text)
+        return [201]
+
+    monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
+    monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
+    monkeypatch.setattr("tracker.telegram_connect.telegram_answer_callback_query", fake_answer_callback_query)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
+
+    await telegram_poll(repo=repo, settings=settings)
+    await telegram_poll(repo=repo, settings=settings)
+
+    env = parse_env_assignments(env_path.read_text(encoding="utf-8"))
+    assert env.get("TRACKER_DINGTALK_WEBHOOK_URL") == secret_url
+    assert sent_prompts
+    assert sent_acks
+    # Bot ack must not echo the secret value.
+    assert secret_url not in sent_acks[-1]
+

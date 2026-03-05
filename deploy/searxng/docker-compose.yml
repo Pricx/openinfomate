@@ -1,0 +1,10 @@
+services:
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080"
+    volumes:
+      # Persist config+cache on the host so we can safely tweak settings.yml
+      - "./searxng_etc:/etc/searxng"
+      - "./searxng_cache:/var/cache/searxng"

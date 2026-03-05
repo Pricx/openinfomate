@@ -1,0 +1,16 @@
+# OpenInfoMate embedded SearxNG config.
+#
+# Keep it minimal and rely on upstream defaults.
+# Critical: enable JSON output for the `searxng_search` connector.
+use_default_settings: true
+
+server:
+  # Local-only by default (bound via docker-compose to 127.0.0.1:8888).
+  # For public instances, you must change this secret.
+  secret_key: "openinfomate-change-me"
+  limiter: false
+
+search:
+  formats:
+    - html
+    - json

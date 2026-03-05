@@ -1,0 +1,22 @@
+{
+  "topic_list": {
+    "topics": [
+      {
+        "id": 111,
+        "title": "AI chips: new accelerator announced",
+        "slug": "ai-chips-new-accelerator",
+        "excerpt": "<p>New accelerator details and benchmarks.</p>",
+        "created_at": "2026-02-10T01:02:03.000Z",
+        "last_posted_at": "2026-02-10T02:00:00.000Z"
+      },
+      {
+        "id": 222,
+        "title": "Linux kernel patch discussion",
+        "slug": "linux-kernel-patch-discussion",
+        "excerpt": "<p>Patch set discussion and review notes.</p>",
+        "created_at": "2026-02-10T03:04:05.000Z",
+        "last_posted_at": "2026-02-10T03:30:00.000Z"
+      }
+    ]
+  }
+}

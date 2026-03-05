@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0">
+  <channel>
+    <title>Sample Feed</title>
+    <link>https://example.com/</link>
+    <description>Sample RSS feed</description>
+    <item>
+      <title>Breaking: AI chips get faster</title>
+      <link>https://example.com/post1?utm_source=rss</link>
+      <pubDate>Tue, 10 Feb 2026 01:02:03 GMT</pubDate>
+      <description>This is a summary about AI chips.</description>
+    </item>
+    <item>
+      <title>AI chips roundup</title>
+      <link>https://example.com/post2</link>
+      <pubDate>Tue, 10 Feb 2026 03:04:05 GMT</pubDate>
+      <description>More on AI chips.</description>
+    </item>
+  </channel>
+</rss>
+

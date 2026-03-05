@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Sample</title>
+    <link>https://example.com/</link>
+    <description>Sample feed</description>
+
+    <item>
+      <title>Item 1</title>
+      <link>https://localhost/stream/abc123</link>
+      <guid isPermaLink="false">https://localhost/stream/abc123</guid>
+      <pubDate>Sat, 28 Feb 2026 10:00:13 GMT</pubDate>
+      <content:encoded><![CDATA[
+        <a href="https://target.example/post1">https://target.example/post1</a>
+        <p>Item 1 body</p>
+      ]]></content:encoded>
+    </item>
+
+    <item>
+      <title>Item 2</title>
+      <link>https://localhost/stream/def456</link>
+      <guid isPermaLink="false">https://localhost/stream/def456</guid>
+      <pubDate>Sat, 28 Feb 2026 10:01:13 GMT</pubDate>
+      <content:encoded><![CDATA[
+        <a href="https://target.example/post2">https://target.example/post2</a>
+        <a href="https://another.example/alt">https://another.example/alt</a>
+        <p>Item 2 body</p>
+      ]]></content:encoded>
+    </item>
+  </channel>
+</rss>

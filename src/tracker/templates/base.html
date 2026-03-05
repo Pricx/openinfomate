@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="{{ lang or 'en' }}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>{{ title or t("OpenInfoMate") }}🥷 v{{ app_version or 'unknown' }}</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20viewBox%3D%270%200%20100%20100%27%3E%3Ctext%20y%3D%27.9em%27%20font-size%3D%2790%27%3E%F0%9F%A5%B7%3C/text%3E%3C/svg%3E" />
+    <style>
+      :root {
+        color-scheme: light;
+        --bg0: #f8fafc;
+        --bg1: #eef2ff;
+        --text: #0f172a;
+        --muted: #64748b;
+        --card: rgba(255, 255, 255, 0.78);
+        --card-border: rgba(148, 163, 184, 0.35);
+        --shadow: 0 10px 30px rgba(2, 6, 23, 0.10);
+        --primary: #2563eb;
+        --primary-hover: #1d4ed8;
+        --danger: #dc2626;
+        --danger-hover: #b91c1c;
+        --ok: #16a34a;
+        --warn: #d97706;
+        --input-bg: rgba(255, 255, 255, 0.8);
+        --input-border: rgba(148, 163, 184, 0.55);
+        --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      }
+      html.dark {
+        color-scheme: dark;
+        --bg0: #0b1220;
+        --bg1: #111827;
+        --text: #e5e7eb;
+        --muted: #9ca3af;
+        --card: rgba(17, 24, 39, 0.78);
+        --card-border: rgba(55, 65, 81, 0.65);
+        --shadow: 0 14px 40px rgba(0, 0, 0, 0.35);
+        --input-bg: rgba(17, 24, 39, 0.75);
+        --input-border: rgba(55, 65, 81, 0.85);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: var(--sans);
+        color: var(--text);
+        background:
+          radial-gradient(1200px 600px at 10% 10%, rgba(59, 130, 246, 0.14), transparent 60%),
+          radial-gradient(1200px 600px at 90% 20%, rgba(99, 102, 241, 0.14), transparent 60%),
+          linear-gradient(180deg, var(--bg0), var(--bg1));
+        min-height: 100vh;
+      }
+      a { color: var(--primary); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      code { font-family: var(--mono); }
+      pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+
+      .container { max-width: 1100px; margin: 0 auto; padding: 18px 18px 56px; }
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 50;
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        background: rgba(255, 255, 255, 0.55);
+        border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+      }
+      html.dark .topbar { background: rgba(17, 24, 39, 0.55); border-bottom: 1px solid rgba(55, 65, 81, 0.55); }
+      .topbar-inner { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 18px; max-width: 1100px; margin: 0 auto; }
+      .brand { font-weight: 700; letter-spacing: 0.2px; }
+      .brand a { color: var(--text); text-decoration: none; }
+      .top-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+      h1 { margin: 6px 0 14px; font-size: 22px; }
+      h2 { margin: 0 0 10px; font-size: 16px; }
+      h3 { margin: 0 0 8px; font-size: 14px; }
+
+      .row { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+      .card {
+        border: 1px solid var(--card-border);
+        border-radius: 14px;
+        padding: 16px;
+        background: var(--card);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        min-width: 360px;
+      }
+      .card.wide { min-width: 520px; flex: 1 1 520px; }
+      .card.narrow { flex: 1 1 360px; }
+
+      table { border-collapse: collapse; width: 100%; }
+      th, td { border-bottom: 1px solid rgba(148, 163, 184, 0.20); padding: 8px; text-align: left; vertical-align: top; }
+      html.dark th, html.dark td { border-bottom: 1px solid rgba(55, 65, 81, 0.55); }
+
+      input, select, button, textarea { font: inherit; }
+      input, select, textarea {
+        width: 100%;
+        border: 1px solid var(--input-border);
+        background: var(--input-bg);
+        color: var(--text);
+        border-radius: 10px;
+        padding: 10px 12px;
+        outline: none;
+      }
+      textarea { font-family: var(--mono); }
+      input:focus, select:focus, textarea:focus { border-color: rgba(37, 99, 235, 0.65); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.18); }
+
+      button {
+        border: 0;
+        border-radius: 10px;
+        padding: 10px 12px;
+        cursor: pointer;
+        background: rgba(148, 163, 184, 0.22);
+        color: var(--text);
+        transition: background 0.15s ease, transform 0.02s ease;
+      }
+      button:hover { background: rgba(148, 163, 184, 0.30); }
+      button:active { transform: translateY(1px); }
+      button:disabled { opacity: 0.6; cursor: not-allowed; }
+      .btn-primary { background: var(--primary); color: white; }
+      .btn-primary:hover { background: var(--primary-hover); }
+      .btn-danger { background: var(--danger); color: white; }
+      .btn-danger:hover { background: var(--danger-hover); }
+      .btn-ok { background: var(--ok); color: white; }
+      .btn-ok:hover { filter: brightness(0.96); }
+      .btn-ghost { background: transparent; border: 1px solid var(--card-border); }
+
+      .muted { color: var(--muted); font-size: 12px; }
+      .nowrap { white-space: nowrap; }
+      .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+      .badge { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 4px 10px; font-size: 12px; border: 1px solid var(--card-border); background: rgba(148, 163, 184, 0.16); }
+      .badge.ok { border-color: rgba(22, 163, 74, 0.40); background: rgba(22, 163, 74, 0.12); }
+      .badge.warn { border-color: rgba(217, 119, 6, 0.40); background: rgba(217, 119, 6, 0.12); }
+      .badge.err { border-color: rgba(220, 38, 38, 0.40); background: rgba(220, 38, 38, 0.12); }
+
+      /* Sidebar navigation */
+      .nav { display: flex; flex-direction: column; gap: 6px; }
+      .nav .label { margin-top: 8px; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+      .nav a {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 9px 10px;
+        border-radius: 10px;
+        color: var(--text);
+        text-decoration: none;
+        border: 1px solid transparent;
+      }
+      .nav a:hover { background: rgba(148, 163, 184, 0.16); }
+      .nav a.active { background: rgba(37, 99, 235, 0.14); border-color: rgba(37, 99, 235, 0.35); }
+      .nav details.nav-group { margin-top: 8px; }
+      .nav details.nav-group > summary.label { cursor: pointer; user-select: none; }
+      .nav details.nav-group > .nav-sub { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; margin-left: 6px; }
+
+      /* Toggle switch */
+      .switch { position: relative; display: inline-block; width: 46px; height: 26px; }
+      .switch input { opacity: 0; width: 0; height: 0; }
+      .switch .slider {
+        position: absolute; cursor: pointer; inset: 0;
+        background: rgba(148, 163, 184, 0.45);
+        transition: .18s; border-radius: 999px; border: 1px solid var(--card-border);
+      }
+      .switch .slider:before {
+        position: absolute; content: "";
+        height: 20px; width: 20px; left: 3px; top: 2.5px;
+        background: white; transition: .18s; border-radius: 50%;
+      }
+      .switch input:checked + .slider { background: rgba(37, 99, 235, 0.85); border-color: rgba(37, 99, 235, 0.55); }
+      .switch input:checked + .slider:before { transform: translateX(20px); }
+
+      /* Modal dialogs */
+      dialog.modal {
+        border: 1px solid var(--card-border);
+        border-radius: 16px;
+        padding: 0;
+        background: var(--card);
+        color: var(--text);
+        box-shadow: var(--shadow);
+        width: min(720px, calc(100vw - 24px));
+      }
+      dialog.modal::backdrop { background: rgba(2, 6, 23, 0.58); }
+      html.dark dialog.modal::backdrop { background: rgba(0, 0, 0, 0.70); }
+      .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid rgba(148, 163, 184, 0.20); }
+      html.dark .modal-head { border-bottom: 1px solid rgba(55, 65, 81, 0.55); }
+      .modal-title { font-weight: 700; }
+      .modal-body { padding: 16px; }
+      .modal-foot { padding: 14px 16px; border-top: 1px solid rgba(148, 163, 184, 0.20); display: flex; justify-content: flex-end; gap: 8px; }
+      html.dark .modal-foot { border-top: 1px solid rgba(55, 65, 81, 0.55); }
+
+      /* Toasts */
+      #toast-container { position: fixed; top: 18px; right: 18px; z-index: 10000; display: flex; flex-direction: column; gap: 12px; }
+      .toast {
+        min-width: 320px; max-width: 520px;
+        border-radius: 16px;
+        border: 1px solid var(--card-border);
+        background: var(--card);
+        box-shadow: var(--shadow);
+        padding: 12px 12px;
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        transform: translateX(110%);
+        transition: transform 0.22s ease-in-out;
+      }
+      .toast.show { transform: translateX(0); }
+      .toast .title { font-size: 12px; font-weight: 700; margin: 0 0 4px; }
+      .toast .msg { font-size: 12px; color: var(--text); opacity: 0.92; line-height: 1.35; white-space: pre-wrap; word-break: break-word; }
+      .toast .close { background: transparent; border: 0; padding: 4px; margin-left: auto; cursor: pointer; opacity: 0.75; }
+      .toast.success { border-color: rgba(22, 163, 74, 0.45); }
+      .toast.error { border-color: rgba(220, 38, 38, 0.45); }
+      .toast.warning { border-color: rgba(217, 119, 6, 0.45); }
+      .toast.info { border-color: rgba(37, 99, 235, 0.35); }
+      .toast-row { display: flex; gap: 10px; align-items: flex-start; }
+      .toast-dot { width: 10px; height: 10px; border-radius: 999px; margin-top: 4px; background: rgba(37, 99, 235, 0.70); flex-shrink: 0; }
+      .toast.success .toast-dot { background: rgba(22, 163, 74, 0.85); }
+      .toast.error .toast-dot { background: rgba(220, 38, 38, 0.85); }
+      .toast.warning .toast-dot { background: rgba(217, 119, 6, 0.85); }
+    </style>
+    <script>
+      (function() {
+        try {
+          const pref = localStorage.getItem('tracker_theme');
+          if (pref === 'dark') document.documentElement.classList.add('dark');
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    {% set token_qs = ("?token=" ~ token) if token else "" %}
+    <div class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <a href="/admin{{ token_qs }}">{{ t("OpenInfoMate") }}🥷</a>
+          <span class="muted" style="margin-left:8px">v{{ app_version or 'unknown' }}</span>
+        </div>
+        <div class="top-actions">
+          <a class="btn-ghost" style="padding:10px 12px; border-radius:10px;" href="/setup/wizard{{ token_qs }}">{{ t("Setup Wizard") }}</a>
+          <a class="btn-ghost" style="padding:10px 12px; border-radius:10px;" href="/setup/profile{{ token_qs }}">{{ t("Profile Setup") }}</a>
+          <a class="btn-ghost" style="padding:10px 12px; border-radius:10px;" href="/setup/push{{ token_qs }}">{{ t("Push Setup") }}</a>
+          <select id="trackerLang" aria-label="{{ t('Language') }}" title="{{ t('Language') }}" style="width:auto; padding:10px 10px; border-radius:10px;" onchange="trackerSetLang(this.value)">
+            {% for l in supported_langs %}
+              <option value="{{ l['code'] }}" {% if (lang or 'en') == l['code'] %}selected{% endif %}>{{ l['label'] }}</option>
+            {% endfor %}
+          </select>
+          <button class="btn-ghost" type="button" onclick="trackerOpenDialog('dlgRestartServices')">{{ t("Restart") }}</button>
+          <button class="btn-ghost" type="button" onclick="trackerToggleTheme()">{{ t("Theme") }}</button>
+        </div>
+      </div>
+    </div>
+    <div class="container">
+      {% block content %}{% endblock %}
+    </div>
+
+    <dialog id="dlgRestartServices" class="modal">
+      <div class="modal-head">
+        <div class="modal-title">{{ t("Restart services") }}</div>
+        <button type="button" class="btn-ghost" onclick="trackerCloseDialog('dlgRestartServices')">{{ t("Close") }}</button>
+      </div>
+      <div class="modal-body">
+        <div class="muted">{{ t("Some settings require a restart to fully apply (cron schedules, background workers, API bind).") }}</div>
+	        <div class="row" style="margin-top:12px; align-items:center">
+	          <label class="badge" style="user-select:none">
+	            <input id="restartUnitTracker" type="checkbox" checked />
+	            OpenInfoMate🥷
+	          </label>
+	          <label class="badge" style="user-select:none">
+	            <input id="restartUnitApi" type="checkbox" checked />
+	            OpenInfoMate🥷 API
+	          </label>
+	        </div>
+        <div id="restartServicesHint" class="muted" style="margin-top:10px"></div>
+      </div>
+      <div class="modal-foot">
+        <button type="button" onclick="trackerCloseDialog('dlgRestartServices')">{{ t("Cancel") }}</button>
+        <button type="button" class="btn-danger" onclick="trackerRestartServicesNow()">{{ t("Restart") }}</button>
+      </div>
+    </dialog>
+
+    <div id="toast-container" aria-live="polite"></div>
+    <script>
+      function trackerToggleTheme() {
+        const el = document.documentElement;
+        const isDark = el.classList.toggle('dark');
+        try { localStorage.setItem('tracker_theme', isDark ? 'dark' : 'light'); } catch (e) {}
+      }
+
+      function trackerShowToast(message, type, title, durationMs) {
+        const container = document.getElementById('toast-container');
+        const toast = document.createElement('div');
+        const t = (type || 'info').toLowerCase();
+        toast.className = 'toast ' + (t === 'success' || t === 'error' || t === 'warning' ? t : 'info');
+
+        const head = title ? `<div class="title">${title}</div>` : '';
+        toast.innerHTML = `
+          <div class="toast-row">
+            <div class="toast-dot"></div>
+            <div style="flex:1; min-width:0">
+              ${head}
+              <div class="msg"></div>
+            </div>
+            <button class="close" type="button" aria-label="{{ t('Close') }}">✕</button>
+          </div>
+        `;
+        toast.querySelector('.msg').textContent = String(message || '');
+        toast.querySelector('.close').onclick = () => toast.remove();
+        container.appendChild(toast);
+        setTimeout(() => toast.classList.add('show'), 10);
+
+        const d = (durationMs === undefined || durationMs === null) ? 3200 : Number(durationMs);
+        if (d > 0) {
+          setTimeout(() => {
+            toast.classList.remove('show');
+            setTimeout(() => toast.remove(), 250);
+          }, d);
+        }
+      }
+
+      async function trackerCopyText(text, successMsg) {
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(text);
+          } else {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+          }
+          trackerShowToast(successMsg || '{{ t("Copied") }}', 'success');
+          return true;
+        } catch (e) {
+          trackerShowToast('{{ t("Copy failed") }}', 'error');
+          return false;
+        }
+      }
+
+      function trackerSetLang(lang) {
+        try {
+          const next = window.location.pathname + window.location.search;
+          let url = '/lang?lang=' + encodeURIComponent(lang) + '&next=' + encodeURIComponent(next) + '&apply_output=1';
+          const tok = "{{ (token or '')|e }}";
+          if (tok) url += '&token=' + encodeURIComponent(tok);
+          window.location.href = url;
+        } catch (e) {}
+      }
+
+      async function trackerRestartServicesNow() {
+        const units = [];
+        const u1 = document.getElementById('restartUnitTracker');
+        const u2 = document.getElementById('restartUnitApi');
+        const unitScheduler = "{{ (systemd_unit_scheduler or 'tracker')|e }}";
+        const unitApi = "{{ (systemd_unit_api or 'tracker-api')|e }}";
+        if (u1 && u1.checked) units.push(unitScheduler);
+        if (u2 && u2.checked) units.push(unitApi);
+        if (!units.length) {
+          trackerShowToast('{{ t("Pick at least one service.") }}', 'warning', '{{ t("Restart services") }}');
+          return;
+        }
+
+        // Optional per-page hook: allow pages (e.g. Config Center) to flush pending autosaves
+        // before restarting services. If it returns false, abort restart.
+        try {
+          const hook = window.trackerBeforeRestart;
+          if (typeof hook === 'function') {
+            const ok = await hook();
+            if (ok === false) return;
+          }
+        } catch (e) {}
+
+        const qs = "{{ ('?token=' ~ token) if token else '' }}";
+        const fd = new FormData();
+        fd.append('units', units.join(','));
+        try {
+          const resp = await fetch('/admin/services/restart' + qs, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'accept': 'application/json' },
+            body: fd
+          });
+          const data = await resp.json().catch(() => null);
+          if (!resp.ok || !data) {
+            trackerShowToast('HTTP ' + resp.status, 'error', '{{ t("Restart services") }}', 4200);
+            return;
+          }
+          if (!data.ok) {
+            const msg = (data && (data.message || data.detail)) ? String(data.message || data.detail) : ('HTTP ' + resp.status);
+            const cmd = (data && data.command) ? String(data.command) : '';
+            const hint = document.getElementById('restartServicesHint');
+            if (hint) hint.textContent = cmd ? (msg + ' · ' + cmd) : msg;
+            const sev = (data && data.severity) ? String(data.severity) : 'warning';
+            const toastType = (sev === 'success' || sev === 'warning' || sev === 'error') ? sev : 'warning';
+            trackerShowToast(msg, toastType, '{{ t("Restart services") }}', 5200);
+            return;
+          }
+          const hint = document.getElementById('restartServicesHint');
+          if (hint) hint.textContent = data.command ? String(data.command) : '';
+          trackerCloseDialog('dlgRestartServices');
+          trackerShowToast('{{ t("Restart queued. Refresh in a few seconds.") }}', 'success', '{{ t("Restart services") }}', 5200);
+        } catch (e) {
+          trackerShowToast(String(e || 'error'), 'error', '{{ t("Restart services") }}', 4200);
+        }
+      }
+
+      function trackerOpenDialog(id) {
+        const dlg = document.getElementById(id);
+        if (!dlg) return;
+        if (typeof dlg.showModal === 'function') {
+          dlg.showModal();
+        } else {
+          dlg.setAttribute('open', 'open');
+        }
+      }
+
+      function trackerCloseDialog(id) {
+        const dlg = document.getElementById(id);
+        if (!dlg) return;
+        if (typeof dlg.close === 'function') dlg.close();
+        else dlg.removeAttribute('open');
+      }
+    </script>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>

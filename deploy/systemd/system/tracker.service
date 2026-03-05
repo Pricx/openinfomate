@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenInfoMate (Info Mate)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tracker
+EnvironmentFile=/opt/tracker/.env
+ExecStart=/opt/tracker/.venv/bin/tracker service run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

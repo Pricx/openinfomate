@@ -1,0 +1,1038 @@
+{% extends "base.html" %}
+{% block content %}
+  <h1>{{ t("Profile Setup") }}</h1>
+  {% if msg %}
+    <div class="card wide" style="margin-top:12px">
+      <div class="muted">{{ msg }}</div>
+    </div>
+  {% endif %}
+
+  <div class="row" style="margin-top:12px">
+    <div class="card wide">
+      <h2>{{ t("AI-native Interest Profile") }}</h2>
+      <div class="muted">
+        {{ t("Paste any text (bookmarks, notes, project list). AI will extract your real interests and generate a strict curation prompt. This is not keyword matching: it fetches broad streams, then the LLM reads content and decides ignore|digest|alert.") }}
+      </div>
+
+      <form id="profileForm" method="post" action="/setup/profile/apply{{ token_qs }}" style="margin-top:14px">
+        <h3>{{ t("0) Input (any text)") }}</h3>
+        <div class="muted">{{ t("Examples: bookmark titles+URLs, topics you care about, a mini “about me”.") }}</div>
+        <div class="row" style="margin-top:10px; align-items:center">
+          <div style="flex: 1 1 320px">
+            <input id="f_profile_file" type="file" accept=".html,.htm,.txt" />
+          </div>
+          <button type="button" class="btn-ghost" onclick="trackerLoadProfileFile()">{{ t("Load file") }}</button>
+        </div>
+        <div style="margin-top:10px">
+          <textarea id="f_profile_text" name="profile_text" rows="8" placeholder="{{ t('Paste anything…') }}">{{ profile_text or '' }}</textarea>
+        </div>
+        <input id="f_profile_understanding" type="hidden" name="profile_understanding" value="{{ profile_understanding or '' }}" />
+        <textarea id="f_profile_interest_axes" name="profile_interest_axes" style="display:none">{{ profile_interest_axes or '' }}</textarea>
+        <textarea id="f_profile_interest_keywords" name="profile_interest_keywords" style="display:none">{{ profile_interest_keywords or '' }}</textarea>
+        <textarea id="f_profile_retrieval_queries" name="profile_retrieval_queries" style="display:none">{{ profile_retrieval_queries or '' }}</textarea>
+	        <div class="actions" style="margin-top:10px; flex-wrap:wrap">
+	          <button id="btnProfileSuggest" type="button" class="btn-primary" onclick="trackerSuggestProfile(this)">{{ t("AI Suggest") }}</button>
+	          <button type="button" class="btn-ok" onclick="trackerOneClickConfig(this)">{{ t("One-click config") }}</button>
+	        </div>
+	        <div id="profileSuggestStatus" class="muted" style="margin-top:6px"></div>
+	        <div id="interestAxesBox" class="muted" style="margin-top:10px"></div>
+
+        <div class="muted" style="margin-top:10px">
+          {{ t("Recommended: use One-click config to jump to Tracking → AI Setup. The sections below are legacy bootstrap and may overlap with AI Setup.") }}
+        </div>
+
+        <details style="margin-top:12px">
+          <summary>{{ t("Advanced (legacy bootstrap)") }}</summary>
+
+        <h3 style="margin-top:14px">{{ t("1) Profile") }}</h3>
+        <div class="row" style="margin-top:8px">
+          <div style="flex: 1 1 260px"><input id="f_profile_name" name="name" value="{{ profile_topic_name or 'Profile' }}" placeholder="{{ t('Profile name') }}" required /></div>
+	          <div style="flex: 1 1 260px"><input id="f_digest_cron" name="digest_cron" value="{{ (profile_digest_cron or '0 9 * * *')|e }}" placeholder="{{ t('Digest cron (e.g. 0 9 * * *)') }}" /></div>
+	        </div>
+        <div class="row" style="margin-top:8px; align-items:center">
+          <div style="flex: 0 0 140px" class="muted">{{ t('Daily time') }}</div>
+          <div style="flex: 1 1 260px">
+            <div class="actions" style="align-items:center">
+              <select id="f_digest_hour" style="max-width: 92px"></select>
+              <select id="f_digest_minute" style="max-width: 92px"></select>
+            </div>
+          </div>
+          <button type="button" class="btn-ghost" onclick="trackerDisableDigestCron()">{{ t('Disable') }}</button>
+        </div>
+        <div class="row" style="margin-top:8px; align-items:center">
+          <div style="flex: 0 0 140px" class="muted">{{ t('Every N minutes') }}</div>
+          <div class="actions" style="flex: 1 1 260px; align-items:center; flex-wrap:wrap">
+            <input id="f_digest_interval_minutes" type="number" min="1" max="1440" step="1" placeholder="30" style="max-width: 120px" />
+            <button type="button" onclick="trackerSetDigestInterval(10)">10m</button>
+            <button type="button" onclick="trackerSetDigestInterval(30)">30m</button>
+            <button type="button" onclick="trackerSetDigestInterval(60)">1h</button>
+          </div>
+        </div>
+        <div id="f_digest_hint" class="muted" style="margin-top:6px"></div>
+
+        <h3 style="margin-top:14px">{{ t("2) Streams (firehose)") }}</h3>
+        <div class="muted">{{ t("Choose a few “firehose” sources; AI will filter hard.") }}</div>
+        <div class="row" style="margin-top:10px">
+          <label class="badge" style="user-select:none">
+            <input id="f_add_hn_rss" type="checkbox" name="add_hn_rss" value="true" checked />
+            {{ t("HN frontpage RSS") }}
+          </label>
+          <label class="badge" style="user-select:none">
+            <input id="f_add_hn_popularity" type="checkbox" name="add_hn_popularity" value="true" checked />
+            {{ t("HN Popularity blogs (Karpathy 90+ RSS)") }}
+          </label>
+          <label class="badge" style="user-select:none">
+            <input id="f_add_github_daily" type="checkbox" name="add_github_trending_daily" value="true" checked />
+            {{ t("GitHub Trending (daily)") }}
+          </label>
+          <label class="badge" style="user-select:none">
+            <input id="f_add_github_weekly" type="checkbox" name="add_github_trending_weekly" value="true" />
+            {{ t("GitHub Trending (weekly)") }}
+          </label>
+          <label class="badge" style="user-select:none">
+            <input id="f_add_github_monthly" type="checkbox" name="add_github_trending_monthly" value="true" />
+            {{ t("GitHub Trending (monthly)") }}
+          </label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label class="badge" style="user-select:none">
+            <input id="f_add_arxiv" type="checkbox" name="add_arxiv" value="true" checked />
+            {{ t("arXiv RSS (new papers)") }}
+          </label>
+          <label class="badge" style="user-select:none">
+            <input id="f_add_discourse" type="checkbox" name="add_discourse" value="true" {% if lang == 'zh' %}checked{% endif %} />
+            {{ t("Discourse latest") }}
+          </label>
+          <label class="badge" style="user-select:none">
+            <input id="f_add_nodeseek" type="checkbox" name="add_nodeseek" value="true" {% if lang == 'zh' %}checked{% endif %} />
+            {{ t("NodeSeek RSS") }}
+          </label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <div style="flex: 1 1 320px"><input id="f_github_languages" name="github_languages" placeholder="{{ t('GitHub languages (optional, e.g. python,rust,go)') }}" /></div>
+          <div style="flex: 1 1 320px"><input id="f_arxiv_categories" name="arxiv_categories" value="cs.AI,cs.LG,cs.CL,cs.CV,stat.ML" placeholder="{{ t('arXiv categories (e.g. cs.AI,cs.LG,stat.ML)') }}" /></div>
+        </div>
+        <h3 style="margin-top:14px">{{ t("Optional: Web Search (AI queries)") }}</h3>
+        <div class="muted">{{ t("Uses AI-generated retrieval queries for recall; final selection still relies on the AI prompt (not keyword rules).") }}</div>
+        <div class="row" style="margin-top:10px; align-items:center">
+          <label class="badge" style="user-select:none">
+            <input id="f_add_searxng" type="checkbox" name="add_searxng" value="true" checked />
+            {{ t("SearxNG search (AI queries)") }}
+          </label>
+          <div style="flex: 1 1 360px"><input id="f_searxng_base_url" name="searxng_base_url" value="http://127.0.0.1:8888" placeholder="{{ t('SearxNG base URL (e.g. http://127.0.0.1:8888)') }}" /></div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <div style="flex: 1 1 320px"><input id="f_discourse_base_url" name="discourse_base_url" value="" placeholder="{{ t('Discourse base URL (e.g. https://forum.example.com)') }}" /></div>
+          <div style="flex: 0 0 180px"><input id="f_discourse_json_path" name="discourse_json_path" value="/latest.json" placeholder="/latest.json" /></div>
+        </div>
+        <div style="margin-top:10px">
+          <textarea name="rss_urls" rows="5" placeholder="{{ t('Extra RSS/Atom URLs (one per line)') }}"></textarea>
+        </div>
+
+        <h3 style="margin-top:14px">{{ t("3) AI Policy (prompt-driven)") }}</h3>
+        <div class="muted">
+          {{ t("Requires global TRACKER_LLM_CURATION_ENABLED=true + configured LLM (TRACKER_LLM_BASE_URL, TRACKER_LLM_MODEL).") }}
+        </div>
+
+        <div class="row" style="margin-top:10px; align-items:center">
+          <div style="flex: 1 1 320px">
+            <select id="f_ai_preset" onchange="trackerProfilePresetChanged()">
+              <option value="">{{ t("Prompt preset (optional)") }}</option>
+              {% for p in topic_policy_presets or [] %}
+                <option value="{{ p.id }}">{{ p.label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+        <div id="f_ai_preset_desc" class="muted" style="margin-top:6px"></div>
+        <div style="margin-top:10px">
+          <textarea id="f_ai_prompt" name="ai_prompt" rows="12" placeholder="{{ t('AI curation prompt (required)') }}">{{ profile_prompt or '' }}</textarea>
+        </div>
+        <details style="margin-top:10px">
+          <summary>{{ t("Save as preset") }}</summary>
+          <div class="muted" style="margin-top:8px">{{ t("Save the current topic AI policy prompt as a reusable preset.") }}</div>
+          <div class="muted" style="margin-top:6px">{{ t("Tip: use the same preset id to override a built-in preset; use a new id to create a new one.") }}</div>
+          <div class="row" style="margin-top:10px; align-items:center">
+            <div style="flex: 0 0 220px">
+              <input id="f_ai_preset_id" type="text" placeholder="{{ t('Preset id (a-z0-9_-)') }}" />
+            </div>
+            <div style="flex: 1 1 260px">
+              <input id="f_ai_preset_label" type="text" placeholder="{{ t('Label') }}" />
+            </div>
+          </div>
+          <div class="row" style="margin-top:8px; align-items:center">
+            <div style="flex: 1 1 260px">
+              <input id="f_ai_preset_description" type="text" placeholder="{{ t('Description (optional)') }}" />
+            </div>
+          </div>
+          <div class="actions" style="margin-top:10px; flex-wrap:wrap">
+            <button type="button" class="btn-ok" onclick="trackerSaveAiPreset()">{{ t("Save as preset") }}</button>
+            <button id="btnDeleteAiPreset" type="button" class="btn-danger" onclick="trackerDeleteAiPreset()" disabled>{{ t("Remove") }}</button>
+          </div>
+          <div id="f_ai_preset_hint" class="muted" style="margin-top:8px"></div>
+        </details>
+        {% if custom_topic_policy_presets and custom_topic_policy_presets|length > 0 %}
+          <details style="margin-top:10px">
+            <summary class="muted">{{ t("Your presets") }}</summary>
+            <div class="muted" style="margin-top:8px">{{ t("Tap Edit to load a preset into the editor above.") }}</div>
+            <table style="margin-top:8px">
+              <thead>
+                <tr><th>{{ t("Name") }}</th><th>{{ t("Description") }}</th><th></th></tr>
+              </thead>
+              <tbody>
+                {% for p in custom_topic_policy_presets %}
+                  <tr>
+                    <td class="muted"><code>{{ p.id }}</code> · {{ p.label }}</td>
+                    <td class="muted">{{ p.description }}</td>
+                    <td class="actions">
+                      <button type="button" class="btn-ghost" onclick="trackerLoadProfilePreset('{{ p.id|e }}')">{{ t("Edit") }}</button>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </details>
+        {% endif %}
+
+        <h3 style="margin-top:14px">{{ t("3.5) Profile Delta (incremental)") }}</h3>
+        <div class="muted">
+          {{ t("Paste new preferences/tags/notes. AI will propose a small delta_prompt (confirmable) to keep your profile stable.") }}
+        </div>
+        <div style="margin-top:10px">
+          <textarea id="f_profile_delta_input" rows="6" placeholder="{{ t('Paste delta notes…') }}"></textarea>
+        </div>
+        <div class="actions" style="margin-top:10px">
+          <button type="button" class="btn-primary" onclick="trackerSuggestProfileDelta()">{{ t("AI Propose Delta") }}</button>
+          <button type="button" class="btn-ok" onclick="trackerApplyProfileDelta()">{{ t("Apply Delta") }}</button>
+        </div>
+        <div class="muted" style="margin-top:8px">{{ t("Proposed delta_prompt (editable):") }}</div>
+        <div style="margin-top:8px">
+          <textarea id="f_profile_delta_prompt" rows="8" placeholder="{{ t('Delta prompt will appear here…') }}"></textarea>
+        </div>
+        {% if profile_prompt_delta %}
+          <details style="margin-top:10px">
+            <summary class="muted">{{ t("Current delta_prompt (applied)") }}</summary>
+            <pre>{{ profile_prompt_delta }}</pre>
+          </details>
+        {% endif %}
+
+        <h3 style="margin-top:14px">{{ t("4) Kickoff (optional)") }}</h3>
+        <div class="muted">{{ t("Run a one-off ingest + digest now to validate the profile.") }}</div>
+        <div class="row" style="margin-top:10px">
+          <label class="badge" style="user-select:none">
+            <input id="f_kickoff_tick" type="checkbox" name="kickoff_tick_now" value="true" checked />
+            {{ t("Run tick now (ingest)") }}
+          </label>
+          <label class="badge" style="user-select:none">
+            <input id="f_kickoff_digest" type="checkbox" name="kickoff_digest_now" value="true" checked />
+            {{ t("Run digest now") }}
+          </label>
+          <label class="badge" style="user-select:none">
+            <input id="f_kickoff_push_digest" type="checkbox" name="kickoff_push_digest_now" value="true" {% if doctor_report and (doctor_report.push_dingtalk_configured or doctor_report.push_email_configured) %}checked{% endif %} />
+            {{ t("Push first digest now") }}
+          </label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <div style="flex: 0 0 220px"><input id="f_kickoff_hours" name="kickoff_digest_hours" value="24" placeholder="{{ t('Digest window hours (24)') }}" /></div>
+        </div>
+
+        <div class="actions" style="margin-top:12px">
+          <button type="button" class="btn-ok" onclick="trackerCreateRunProfile(this)">{{ t("AI Apply & Run") }}</button>
+          <button type="submit" class="btn-primary">{{ t("Apply") }}</button>
+          <a href="/admin{{ token_qs }}" style="align-self:center">{{ t("Back to Admin") }}</a>
+        </div>
+
+        </details>
+      </form>
+    </div>
+
+    <div class="card narrow">
+      <h2>{{ t("Doctor") }}</h2>
+      {% if doctor_report %}
+        <div class="muted">
+          {{ t("cron_timezone") }}={{ doctor_report.cron_timezone }}
+          {{ t("ok") }}={{ doctor_report.cron_timezone_ok }}
+          {{ t("now") }}={{ doctor_report.cron_now_iso }}
+        </div>
+        <div class="muted" style="margin-top:6px">
+          API=<code>{{ doctor_report.api_host }}:{{ doctor_report.api_port }}</code>
+          · auth=<code>{{ 'on' if doctor_report.api_auth_configured else 'off' }}</code>
+          · bind=<code>{{ 'public' if doctor_report.api_bind_public else 'localhost' }}</code>
+        </div>
+        <div style="margin-top:10px" class="actions">
+          <span class="badge {{ 'ok' if doctor_report.profile_configured else 'warn' }}">{{ t("Profile") }}={{ doctor_report.profile_configured }}</span>
+        </div>
+        {% if doctor_report.recommendations %}
+          <div class="muted" style="margin-top:10px">
+            {% for r in doctor_report.recommendations %}
+              <div>- {{ r }}</div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% else %}
+        <div class="muted">{{ t("Doctor report unavailable.") }}</div>
+      {% endif %}
+    </div>
+  </div>
+{% endblock %}
+
+  {% block scripts %}
+	  <script>
+	    const TRACKER_TOPIC_POLICY_PRESETS = {{ (topic_policy_presets or []) | tojson }};
+	    const TRACKER_CUSTOM_TOPIC_POLICY_PRESETS = {{ (custom_topic_policy_presets or []) | tojson }};
+	    const TRACKER_UI_LANG = "{{ lang or 'en' }}";
+
+    function _v(id) {
+      const el = document.getElementById(id);
+      return (el && el.value ? String(el.value).trim() : '');
+    }
+
+	    function _set(id, value) {
+	      const el = document.getElementById(id);
+	      if (!el) return;
+	      el.value = value || '';
+	    }
+
+	    function _normalizeNewlines(value) {
+	      return String(value || '')
+	        // literal "\\n" artifacts (backslash + n)
+	        .replace(/\\r\\n/g, '\n')
+	        .replace(/\\n/g, '\n')
+	        .replace(/\\r/g, '\n')
+	        // real CRLF/CR
+	        .replace(/\r\n/g, '\n')
+	        .replace(/\r/g, '\n');
+	    }
+
+	    function _extractBookmarksFromHtml(html) {
+	      const text = String(html || '');
+	      const lower = text.toLowerCase();
+	      if (!(lower.includes('<a') && lower.includes('href'))) return '';
+
+      try {
+        const doc = new DOMParser().parseFromString(text, 'text/html');
+        const anchors = Array.from(doc.querySelectorAll('a[href]'));
+        const seen = new Set();
+        const lines = [];
+        for (const a of anchors) {
+          const href = String(a.getAttribute('href') || '').trim();
+          if (!href || href.startsWith('#')) continue;
+          const low = href.toLowerCase();
+          if (low.startsWith('javascript:') || low.startsWith('mailto:') || low.startsWith('tel:')) continue;
+          if (seen.has(href)) continue;
+          seen.add(href);
+	          const title = String(a.textContent || '').replace(/\s+/g, ' ').trim();
+	          lines.push('- ' + (title || href) + ' | ' + href);
+	          if (lines.length >= 400) break;
+	        }
+	        return lines.length ? ('BOOKMARKS (' + lines.length + ' links):\n' + lines.join('\n')) : '';
+	      } catch (e) {
+	        return '';
+	      }
+	    }
+
+    async function trackerLoadProfileFile() {
+      const inp = document.getElementById('f_profile_file');
+      if (!inp || !inp.files || !inp.files.length) {
+        trackerShowToast('{{ t("Pick a file first.") }}', 'warning', '{{ t("Load file") }}');
+        return;
+      }
+      const file = inp.files[0];
+      const reader = new FileReader();
+      reader.onload = () => {
+        const raw = String(reader.result || '');
+        const extracted = _extractBookmarksFromHtml(raw);
+        _set('f_profile_text', extracted || raw);
+        trackerShowToast(extracted ? '{{ t("Loaded bookmarks from HTML.") }}' : '{{ t("Loaded file text.") }}', 'success', '{{ t("Load file") }}');
+      };
+      reader.onerror = () => {
+        trackerShowToast('{{ t("Failed to read file.") }}', 'error', '{{ t("Load file") }}');
+      };
+      reader.readAsText(file);
+    }
+
+	    function trackerProfilePresetChanged() {
+	      const sel = document.getElementById('f_ai_preset');
+	      const desc = document.getElementById('f_ai_preset_desc');
+	      if (!sel || !desc) return;
+	      const id = String(sel.value || '').trim();
+	      const preset = (TRACKER_TOPIC_POLICY_PRESETS || []).find((p) => p && p.id === id);
+	      desc.textContent = preset ? (preset.description || '') : '';
+	      if (preset) {
+	        _set('f_ai_prompt', preset.prompt || '');
+	        _set('f_ai_preset_id', preset.id || '');
+	        _set('f_ai_preset_label', preset.label || '');
+	        _set('f_ai_preset_description', preset.description || '');
+	      }
+	      trackerAiPresetHint();
+	    }
+
+	    function trackerLoadProfilePreset(presetId) {
+	      try {
+	        const pid = String(presetId || '').trim();
+	        if (!pid) return;
+	        const sel = document.getElementById('f_ai_preset');
+	        if (sel) sel.value = pid;
+	        trackerProfilePresetChanged();
+	        const ta = document.getElementById('f_ai_prompt');
+	        if (ta) ta.scrollIntoView({ behavior: 'smooth', block: 'center' });
+	      } catch (e) {}
+	    }
+
+	    function _customPresetIdSet() {
+	      const out = new Set();
+	      try {
+	        for (const p of (TRACKER_CUSTOM_TOPIC_POLICY_PRESETS || [])) {
+	          const pid = p && p.id ? String(p.id).trim() : '';
+	          if (pid) out.add(pid);
+	        }
+	      } catch (e) {}
+	      return out;
+	    }
+
+	    const TRACKER_CUSTOM_TOPIC_POLICY_PRESET_IDS = _customPresetIdSet();
+
+	    function trackerAiPresetHint() {
+	      const hint = document.getElementById('f_ai_preset_hint');
+	      const delBtn = document.getElementById('btnDeleteAiPreset');
+	      if (!hint || !delBtn) return;
+	      const pid = _v('f_ai_preset_id');
+	      const isCustom = pid && TRACKER_CUSTOM_TOPIC_POLICY_PRESET_IDS.has(pid);
+	      delBtn.disabled = !isCustom;
+	      if (!pid) {
+	        hint.textContent = '';
+	        return;
+	      }
+	      if (TRACKER_UI_LANG === 'zh') {
+	        hint.textContent = isCustom
+	          ? '该模板 id 已有自定义覆盖；点击“移除”将回退到内置模板（若存在）。'
+	          : '提示：使用相同的模板 id 可覆盖内置模板；改成新的 id 可新建模板。';
+	      } else {
+	        hint.textContent = isCustom
+	          ? 'This preset id is overridden by your custom preset. Remove to revert to the built-in preset (if any).'
+	          : 'Tip: use the same preset id to override a built-in preset; use a new id to create a new one.';
+	      }
+	    }
+
+	    async function trackerSaveAiPreset() {
+	      const pid = _v('f_ai_preset_id');
+	      const label = _v('f_ai_preset_label');
+	      const description = _v('f_ai_preset_description');
+	      const prompt = String((document.getElementById('f_ai_prompt') || {}).value || '').trim();
+	      if (!pid) {
+	        trackerShowToast('missing preset_id', 'warning', '{{ t("Save as preset") }}');
+	        return;
+	      }
+	      if (!label) {
+	        trackerShowToast('missing label', 'warning', '{{ t("Save as preset") }}');
+	        return;
+	      }
+	      if (!prompt) {
+	        trackerShowToast('{{ t("Prompt is empty.") }}', 'warning', '{{ t("Save as preset") }}');
+	        return;
+	      }
+	      const qs = "{{ ('?token=' ~ token) if token else '' }}";
+	      const fd = new FormData();
+	      fd.append('preset_id', pid);
+	      fd.append('label', label);
+	      fd.append('description', description);
+	      fd.append('prompt', prompt);
+	      try {
+	        const resp = await fetch('/setup/profile/preset/save' + qs, { method: 'POST', credentials: 'same-origin', body: fd });
+	        const data = await resp.json().catch(() => null);
+	        if (!resp.ok) {
+	          const msg = (data && (data.detail || data.message)) ? String(data.detail || data.message) : ('HTTP ' + resp.status);
+	          trackerShowToast(msg, 'error', '{{ t("Save as preset") }}');
+	          return;
+	        }
+	        trackerShowToast('preset saved: ' + pid, 'success', '{{ t("Save as preset") }}');
+	        window.location.reload();
+	      } catch (e) {
+	        trackerShowToast(String(e || 'error'), 'error', '{{ t("Save as preset") }}');
+	      }
+	    }
+
+	    async function trackerDeleteAiPreset() {
+	      const pid = _v('f_ai_preset_id');
+	      if (!pid) return;
+	      if (!TRACKER_CUSTOM_TOPIC_POLICY_PRESET_IDS.has(pid)) return;
+	      if (!confirm('{{ t("Delete preset?") }}')) return;
+	      const qs = "{{ ('?token=' ~ token) if token else '' }}";
+	      const fd = new FormData();
+	      fd.append('preset_id', pid);
+	      try {
+	        const resp = await fetch('/setup/profile/preset/delete' + qs, { method: 'POST', credentials: 'same-origin', body: fd });
+	        const data = await resp.json().catch(() => null);
+	        if (!resp.ok) {
+	          const msg = (data && (data.detail || data.message)) ? String(data.detail || data.message) : ('HTTP ' + resp.status);
+	          trackerShowToast(msg, 'error', '{{ t("Remove") }}');
+	          return;
+	        }
+	        trackerShowToast('preset removed: ' + pid, 'success', '{{ t("Remove") }}');
+	        window.location.reload();
+	      } catch (e) {
+	        trackerShowToast(String(e || 'error'), 'error', '{{ t("Remove") }}');
+	      }
+	    }
+
+	    function _splitLines(value, maxItems) {
+	      const raw = _normalizeNewlines(value);
+	      const lines = raw.split(/\n/).map((s) => String(s || '').trim()).filter(Boolean);
+	      const out = [];
+	      const seen = new Set();
+	      for (const l of lines) {
+	        const k = l.toLowerCase();
+        if (seen.has(k)) continue;
+        seen.add(k);
+        out.push(l);
+        if (out.length >= (maxItems || 50)) break;
+      }
+      return out;
+	    }
+
+	    function _splitKeywords(value, maxItems) {
+	      const raw = _normalizeNewlines(value);
+	      const s = raw.replace(/，/g, ',').replace(/；/g, ',').replace(/;/g, ',').replace(/\n/g, ',');
+	      const parts = s.split(',').map((p) => String(p || '').trim()).filter(Boolean);
+	      const out = [];
+	      const seen = new Set();
+      for (const p of parts) {
+        const k = p.toLowerCase();
+        if (seen.has(k)) continue;
+        seen.add(k);
+        out.push(p);
+        if (out.length >= (maxItems || 80)) break;
+      }
+      return out;
+    }
+
+    function _renderProfileInsights(data) {
+      const box = document.getElementById('interestAxesBox');
+      if (!box) return;
+
+      while (box.firstChild) box.removeChild(box.firstChild);
+
+      const understanding = (data && data.understanding) ? String(data.understanding).trim() : '';
+      const axes = (data && Array.isArray(data.interest_axes)) ? data.interest_axes.map((x) => String(x || '').trim()).filter(Boolean) : [];
+      const keywords = (data && Array.isArray(data.interest_keywords)) ? data.interest_keywords.map((x) => String(x || '').trim()).filter(Boolean) : [];
+      const queries = (data && Array.isArray(data.retrieval_queries)) ? data.retrieval_queries.map((x) => String(x || '').trim()).filter(Boolean) : [];
+
+      if (!understanding && !axes.length && !keywords.length && !queries.length) return;
+
+      if (understanding) {
+        const d = document.createElement('div');
+        d.textContent = '{{ t("AI understanding (not used for keyword matching):") }} ' + understanding;
+        box.appendChild(d);
+      }
+
+      function _section(title) {
+        const wrap = document.createElement('div');
+        wrap.style.marginTop = '8px';
+        const h = document.createElement('div');
+        h.style.fontWeight = '700';
+        h.textContent = title;
+        wrap.appendChild(h);
+        box.appendChild(wrap);
+        return wrap;
+      }
+
+      if (axes.length) {
+        const wrap = _section('{{ t("Interest Axes") }}');
+        const ul = document.createElement('ul');
+        ul.style.margin = '6px 0 0 18px';
+        for (const a of axes.slice(0, 10)) {
+          const li = document.createElement('li');
+          li.textContent = a;
+          ul.appendChild(li);
+        }
+        wrap.appendChild(ul);
+      }
+
+      if (keywords.length) {
+        const wrap = _section('{{ t("Recall Hints") }}');
+        const d = document.createElement('div');
+        d.textContent = keywords.slice(0, 40).join('、');
+        wrap.appendChild(d);
+      }
+
+      if (queries.length) {
+        const wrap = _section('{{ t("Retrieval Queries") }}');
+        const ul = document.createElement('ul');
+        ul.style.margin = '6px 0 0 18px';
+        for (const q of queries.slice(0, 12)) {
+          const li = document.createElement('li');
+          li.textContent = q;
+          ul.appendChild(li);
+        }
+        wrap.appendChild(ul);
+      }
+    }
+
+    function _renderProfileInsightsFromHidden() {
+      const understanding = _v('f_profile_understanding');
+      const axes = _splitLines(_v('f_profile_interest_axes'), 10);
+      const keywords = _splitKeywords(_v('f_profile_interest_keywords'), 40);
+      const queries = _splitLines(_v('f_profile_retrieval_queries'), 12);
+      _renderProfileInsights({
+        understanding: understanding,
+        interest_axes: axes,
+        interest_keywords: keywords,
+        retrieval_queries: queries
+      });
+    }
+
+    function _maybeAutoFillSources(text) {
+      const raw = String(text || '');
+      const t = raw.toLowerCase();
+      const disc = document.getElementById('f_add_discourse');
+      const ns = document.getElementById('f_add_nodeseek');
+      if (ns && (t.includes('nodeseek') || t.includes('node seek'))) ns.checked = true;
+
+      const wantsForum =
+        t.includes('discourse') ||
+        t.includes('forum') ||
+        raw.includes('论坛') ||
+        raw.includes('社区');
+
+      if (disc && wantsForum && !_v('f_discourse_base_url')) {
+        const urlRe = /https?:\/\/[^\s<>()]+/ig;
+        const m = urlRe.exec(raw);
+        if (m && m[0]) {
+          const u0 = String(m[0]).replace(/[)\]}>.,;]+$/, '');
+          try {
+            const u = new URL(u0);
+            if (u && u.origin) {
+              _set('f_discourse_base_url', u.origin);
+              disc.checked = true;
+            }
+          } catch (e) {}
+        }
+      }
+    }
+
+	    async function trackerSuggestProfile(btn) {
+	      const text = _v('f_profile_text');
+	      if (!text) {
+	        trackerShowToast('{{ t("Please paste some text first.") }}', 'warning', '{{ t("AI Suggest") }}');
+	        return;
+	      }
+
+	      const qs = "{{ ('?token=' ~ token) if token else '' }}";
+	      const box = document.getElementById('interestAxesBox');
+	      const stEl = document.getElementById('profileSuggestStatus');
+	      const btn0 = btn || document.getElementById('btnProfileSuggest');
+	      const prevText = (btn0 && btn0.textContent) ? String(btn0.textContent) : '';
+	      const unloadHandler = (e) => {
+	        try {
+	          e.preventDefault();
+	          e.returnValue = '';
+	        } catch (e2) {}
+	        return '';
+	      };
+	      if (btn0) {
+	        btn0.disabled = true;
+	        btn0.textContent = prevText ? (prevText + '…') : '{{ t("AI Suggest") }}…';
+	      }
+	      if (box) box.textContent = '';
+	      if (stEl) stEl.textContent = '{{ t("Generating AI suggestions…") }}';
+	      try { window.addEventListener('beforeunload', unloadHandler); } catch (e) {}
+	      try {
+	        const resp = await fetch('/profile/propose' + qs, {
+	          method: 'POST',
+	          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ text })
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok) {
+          const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : ('HTTP ' + resp.status);
+	          trackerShowToast(msg, 'error', '{{ t("AI Suggest Failed") }}');
+	          if (stEl) stEl.textContent = msg;
+	          return;
+	        }
+
+	        if (data && data.ai_prompt) _set('f_ai_prompt', data.ai_prompt);
+	        _set('f_profile_understanding', (data && data.understanding) ? String(data.understanding) : '');
+	        _set('f_profile_interest_axes', (data && data.interest_axes) ? (data.interest_axes || []).join('\n') : '');
+	        _set('f_profile_interest_keywords', (data && data.interest_keywords) ? (data.interest_keywords || []).join(', ') : '');
+	        _set('f_profile_retrieval_queries', (data && data.retrieval_queries) ? (data.retrieval_queries || []).join('\n') : '');
+	        _renderProfileInsights(data || {});
+	        _maybeAutoFillSources(text);
+	        try {
+	          if (stEl) stEl.textContent = '{{ t("Saving…") }}';
+	          trackerShowToast('{{ t("Saving…") }}', 'info', '{{ t("Profile Setup") }}');
+	          await trackerSaveProfileCoreOnly();
+	          const doneMsg = '{{ t("Saved") }}';
+	          if (stEl) stEl.textContent = doneMsg;
+	          trackerShowToast(doneMsg, 'success', '{{ t("Profile Setup") }}');
+	        } catch (e2) {
+	          const msg2 = String(e2 || 'error');
+	          if (stEl) stEl.textContent = msg2;
+	          trackerShowToast(msg2, 'error', '{{ t("Profile Setup") }}', 5200);
+	        }
+	      } catch (e) {
+	        trackerShowToast(String(e || 'error'), 'error', '{{ t("AI Suggest Failed") }}');
+	        if (stEl) stEl.textContent = String(e || 'error');
+	      } finally {
+	        try { window.removeEventListener('beforeunload', unloadHandler); } catch (e) {}
+	        if (btn0) {
+	          btn0.disabled = false;
+	          btn0.textContent = prevText || '{{ t("AI Suggest") }}';
+	        }
+	      }
+	    }
+
+    async function trackerSuggestProfileDelta() {
+      const text = _v('f_profile_delta_input');
+      if (!text) {
+        trackerShowToast('{{ t("Please paste some text first.") }}', 'warning', '{{ t("AI Propose Delta") }}');
+        return;
+      }
+      const qs = "{{ ('?token=' ~ token) if token else '' }}";
+      try {
+        const resp = await fetch('/profile/delta/propose' + qs, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ text })
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok) {
+          const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : ('HTTP ' + resp.status);
+          trackerShowToast(msg, 'error', '{{ t("AI Propose Delta Failed") }}');
+          return;
+        }
+        const dp = (data && data.delta_prompt) ? String(data.delta_prompt) : '';
+        _set('f_profile_delta_prompt', dp);
+        trackerShowToast('{{ t("Delta proposed (review then Apply).") }}', 'success', '{{ t("AI Propose Delta") }}');
+      } catch (e) {
+        trackerShowToast(String(e || 'error'), 'error', '{{ t("AI Propose Delta Failed") }}');
+      }
+    }
+
+	    async function trackerApplyProfileDelta() {
+      const dp = _v('f_profile_delta_prompt');
+      if (!dp) {
+        trackerShowToast('{{ t("Delta prompt is empty.") }}', 'warning', '{{ t("Apply Delta") }}');
+        return;
+	    }
+      const qs = "{{ ('?token=' ~ token) if token else '' }}";
+      try {
+        const resp = await fetch('/profile/delta/apply' + qs, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ delta_prompt: dp, note: '' })
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok) {
+          const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : ('HTTP ' + resp.status);
+          trackerShowToast(msg, 'error', '{{ t("Apply Delta Failed") }}');
+          return;
+        }
+        const rid = (data && data.rev_id) ? String(data.rev_id) : '';
+        trackerShowToast('{{ t("Delta applied.") }}' + (rid ? (' rev=' + rid) : ''), 'success', '{{ t("Apply Delta") }}');
+        // Refresh to show the applied delta.
+        window.location.reload();
+      } catch (e) {
+        trackerShowToast(String(e || 'error'), 'error', '{{ t("Apply Delta Failed") }}');
+      }
+    }
+
+    function _pad2(n) {
+      const x = parseInt(String(n || '0'), 10);
+      if (!Number.isFinite(x)) return '00';
+      return String(x).padStart(2, '0');
+    }
+
+    function _parseDailyCron(expr) {
+      const s = String(expr || '').trim();
+      if (!s) return null;
+      const parts = s.split(/\\s+/).filter(Boolean);
+      if (parts.length !== 5) return null;
+      const m = parseInt(parts[0], 10);
+      const h = parseInt(parts[1], 10);
+      if (!(Number.isFinite(m) && Number.isFinite(h))) return null;
+      if (parts[2] !== '*' || parts[3] !== '*' || parts[4] !== '*') return null;
+      if (m < 0 || m > 59 || h < 0 || h > 23) return null;
+      const hh = _pad2(h);
+      const mm = _pad2(m);
+      return { h, m, time: `${hh}:${mm}` };
+    }
+
+    function _parseIntervalCron(expr) {
+      const s = String(expr || '').trim();
+      if (!s) return null;
+      const parts = s.split(/\\s+/).filter(Boolean);
+      if (parts.length !== 5) return null;
+      const head = parts[0] || '';
+      if (!head.startsWith('*/')) return null;
+      const n = parseInt(head.slice(2), 10);
+      if (!(Number.isFinite(n) && n > 0)) return null;
+      if (parts[1] !== '*' || parts[2] !== '*' || parts[3] !== '*' || parts[4] !== '*') return null;
+      return n;
+    }
+
+    function trackerSyncDigestCron() {
+      try {
+        const cronEl = document.getElementById('f_digest_cron');
+        const hourEl = document.getElementById('f_digest_hour');
+        const minEl = document.getElementById('f_digest_minute');
+        const intEl = document.getElementById('f_digest_interval_minutes');
+        const hintEl = document.getElementById('f_digest_hint');
+        if (!cronEl || !hintEl) return;
+        const raw = String(cronEl.value || '').trim();
+        if (!raw) {
+          if (hourEl) hourEl.value = '';
+          if (minEl) minEl.value = '';
+          if (intEl) intEl.value = '';
+          hintEl.textContent = '{{ t("Disabled") }}';
+          return;
+        }
+        const daily = _parseDailyCron(raw);
+        if (daily) {
+          if (hourEl) hourEl.value = _pad2(daily.h);
+          if (minEl) minEl.value = _pad2(daily.m);
+          if (intEl) intEl.value = '';
+          hintEl.textContent = '{{ t("Daily at") }} ' + daily.time;
+          return;
+        }
+        const n = _parseIntervalCron(raw);
+        if (n) {
+          if (hourEl) hourEl.value = '';
+          if (minEl) minEl.value = '';
+          if (intEl) intEl.value = String(n);
+          hintEl.textContent = '{{ t("Every") }} ' + n + '{{ t("minutes") }}';
+          return;
+        }
+        if (hourEl) hourEl.value = '';
+        if (minEl) minEl.value = '';
+        if (intEl) intEl.value = '';
+        hintEl.textContent = '{{ t("Custom cron") }}';
+      } catch (e) {}
+    }
+
+    function trackerDisableDigestCron() {
+      try {
+        const cronEl = document.getElementById('f_digest_cron');
+        if (!cronEl) return;
+        cronEl.value = '';
+        trackerSyncDigestCron();
+      } catch (e) {}
+    }
+
+    function trackerSetDigestInterval(minutes) {
+      try {
+        const cronEl = document.getElementById('f_digest_cron');
+        const intEl = document.getElementById('f_digest_interval_minutes');
+        if (!cronEl || !intEl) return;
+        const n = parseInt(String(minutes || '0'), 10);
+        if (!Number.isFinite(n) || n <= 0) return;
+        intEl.value = String(n);
+        cronEl.value = '*/' + n + ' * * * *';
+        trackerSyncDigestCron();
+      } catch (e) {}
+    }
+
+    async function trackerCreateRunProfile(buttonEl) {
+      const btn = buttonEl || null;
+      if (btn && btn.disabled) return;
+      if (btn) btn.disabled = true;
+
+      trackerShowToast('{{ t("Planning…") }}', 'info', '{{ t("AI Apply") }}');
+      await trackerSuggestProfile();
+
+      const form = document.getElementById('profileForm');
+      if (!form) {
+        trackerShowToast('{{ t("Form not found.") }}', 'error', '{{ t("AI Apply Failed") }}');
+        if (btn) btn.disabled = false;
+        return;
+      }
+      if (!_v('f_ai_prompt')) {
+        trackerShowToast('{{ t("AI prompt is still empty. Please retry AI Suggest.") }}', 'warning', '{{ t("AI Apply") }}');
+        if (btn) btn.disabled = false;
+        return;
+      }
+      trackerShowToast('{{ t("Applying profile…") }}', 'info', '{{ t("AI Apply") }}');
+      form.submit();
+      if (btn) btn.disabled = false;
+    }
+
+    function _buildAiSetupPrefillFromProfile() {
+      const understanding = _v('f_profile_understanding');
+      const axes = _v('f_profile_interest_axes');
+      const keywords = _v('f_profile_interest_keywords');
+      const queries = _v('f_profile_retrieval_queries');
+      const aiPrompt = _v('f_ai_prompt');
+
+      const lines = [];
+      lines.push('PROFILE (generated):');
+      if (understanding) {
+        lines.push('');
+        lines.push('UNDERSTANDING:');
+        lines.push(understanding);
+      }
+	      if (axes) {
+	        lines.push('');
+	        lines.push('INTEREST_AXES:');
+	        _normalizeNewlines(axes).split('\n').map((x) => String(x || '').trim()).filter(Boolean).forEach((x) => lines.push('- ' + x));
+	      }
+      if (keywords) {
+        lines.push('');
+        lines.push('INTEREST_KEYWORDS:');
+        String(keywords || '')
+          .replace(/，/g, ',')
+          .split(',')
+          .map((x) => String(x || '').trim())
+          .filter(Boolean)
+          .forEach((x) => lines.push('- ' + x));
+      }
+	      if (queries) {
+	        lines.push('');
+	        lines.push('RETRIEVAL_QUERIES:');
+	        _normalizeNewlines(queries).split('\n').map((x) => String(x || '').trim()).filter(Boolean).forEach((x) => lines.push('- ' + x));
+	      }
+      if (aiPrompt) {
+        lines.push('');
+        lines.push('AI_CURATION_PROMPT:');
+        lines.push(aiPrompt);
+      }
+      lines.push('');
+      lines.push('REQUEST:');
+      lines.push('- Convert this profile into tracking topics/sources/bindings.');
+	      lines.push('- Expand sources as much as possible (web search seeds + discovery candidates).');
+	      lines.push('- Keep Profile.topic query empty (profile is curation-only; do not stuff keywords into Profile query).');
+	      lines.push('- If SearxNG base_url is not set, use the default http://127.0.0.1:8888 (or configure it in Config Center).');
+	      lines.push('- Do NOT omit sources because you judge them sensitive/gray/harmful; keep candidates for human review.');
+	      return lines.join('\n').trim();
+	    }
+
+    async function trackerSaveProfileCoreOnly() {
+      const form = document.getElementById('profileForm');
+      if (!form) throw new Error('{{ t("Form not found.") }}');
+      const fd = new FormData(form);
+      fd.set('save_only', 'true');
+      const url = String(form.getAttribute('action') || '/setup/profile/apply');
+      const resp = await fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'accept': 'application/json' }, body: fd });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        const msg = (data && (data.detail || data.message || data.error)) ? String(data.detail || data.message || data.error) : ('HTTP ' + resp.status);
+        throw new Error(msg);
+      }
+      return data;
+    }
+
+	    async function trackerOneClickConfig(buttonEl) {
+	      const btn = buttonEl || null;
+	      if (btn && btn.disabled) return;
+	      if (btn) btn.disabled = true;
+
+	      try {
+	        trackerShowToast('{{ t("Planning…") }}', 'info', '{{ t("AI Setup") }}');
+	        if (!_v('f_ai_prompt')) {
+	          await trackerSuggestProfile();
+	        } else {
+	          // Ensure profile is saved (e.g., operator pasted new text but didn't click AI Suggest).
+	          try { await trackerSaveProfileCoreOnly(); } catch (e0) {}
+	        }
+	        if (!_v('f_ai_prompt')) {
+	          trackerShowToast('{{ t("AI prompt is still empty. Please retry AI Suggest.") }}', 'warning', '{{ t("AI Setup") }}');
+	          if (btn) btn.disabled = false;
+	          return;
+	        }
+
+	        try {
+	          const prefill = _buildAiSetupPrefillFromProfile();
+	          localStorage.setItem('tracker_ai_setup_prefill_prompt', prefill);
+	          localStorage.setItem('tracker_ai_setup_autoplan', '1');
+	        } catch (e) {}
+
+	        const qs = "{{ ('?token=' ~ token) if token else '' }}";
+	        const url = qs ? ('/admin' + qs + '&section=ai_setup') : '/admin?section=ai_setup';
+	        window.location.href = url;
+	      } catch (e) {
+	        trackerShowToast(String(e || 'error'), 'error', '{{ t("AI Setup") }}', 5200);
+	        if (btn) btn.disabled = false;
+	      }
+	    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      trackerProfilePresetChanged();
+      const text = _v('f_profile_text');
+      if (text) _maybeAutoFillSources(text);
+      _renderProfileInsightsFromHidden();
+      try {
+        const hourEl = document.getElementById('f_digest_hour');
+        const minEl = document.getElementById('f_digest_minute');
+        const intEl = document.getElementById('f_digest_interval_minutes');
+        const cronEl = document.getElementById('f_digest_cron');
+        if (cronEl) {
+          function _fill(sel, values) {
+            if (!sel) return;
+            try {
+              if (sel.options && sel.options.length > 0) return;
+              const opt0 = document.createElement('option');
+              opt0.value = '';
+              opt0.textContent = '--';
+              sel.appendChild(opt0);
+              (values || []).forEach((v) => {
+                const opt = document.createElement('option');
+                opt.value = String(v);
+                opt.textContent = String(v);
+                sel.appendChild(opt);
+              });
+            } catch (e) {}
+          }
+          const hours = [];
+          for (let h = 0; h <= 23; h += 1) hours.push(_pad2(h));
+          const mins = [];
+          for (let m = 0; m <= 55; m += 5) mins.push(_pad2(m));
+          _fill(hourEl, hours);
+          _fill(minEl, mins);
+
+          const applyDaily = () => {
+            const hh = hourEl ? String(hourEl.value || '').trim() : '';
+            const mm = minEl ? String(minEl.value || '').trim() : '';
+            if (hh && mm) {
+              cronEl.value = String(parseInt(mm, 10)) + ' ' + String(parseInt(hh, 10)) + ' * * *';
+              if (intEl) intEl.value = '';
+            }
+            trackerSyncDigestCron();
+          };
+
+          if (hourEl) hourEl.addEventListener('change', applyDaily);
+          if (minEl) minEl.addEventListener('change', applyDaily);
+          if (intEl) {
+            intEl.addEventListener('change', () => {
+              const v = String(intEl.value || '').trim();
+              const n = parseInt(v || '0', 10);
+              if (Number.isFinite(n) && n > 0) {
+                cronEl.value = '*/' + n + ' * * * *';
+                if (hourEl) hourEl.value = '';
+                if (minEl) minEl.value = '';
+              }
+              trackerSyncDigestCron();
+            });
+          }
+          cronEl.addEventListener('change', () => trackerSyncDigestCron());
+          trackerSyncDigestCron();
+        }
+      } catch (e) {}
+      if (!text && TRACKER_UI_LANG === 'zh') {
+        const disc = document.getElementById('f_add_discourse');
+        const ns = document.getElementById('f_add_nodeseek');
+        if ((disc && !disc.checked) || (ns && !ns.checked) || !_v('f_discourse_base_url')) {
+          _maybeAutoFillSources('中文 开发者 论坛');
+        }
+      }
+
+      const file = document.getElementById('f_profile_file');
+      if (file) {
+        file.addEventListener('change', () => {
+          // Auto-load on selection to reduce clicks.
+          trackerLoadProfileFile();
+        });
+      }
+    });
+  </script>
+{% endblock %}

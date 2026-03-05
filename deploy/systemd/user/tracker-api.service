@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenInfoMate API (Admin UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tracker
+EnvironmentFile=%h/tracker/.env
+ExecStart=%h/tracker/.venv/bin/tracker api serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

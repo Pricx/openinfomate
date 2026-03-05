@@ -1,0 +1,58 @@
+services:
+  api:
+    build: .
+    image: openinfomate:local
+    restart: unless-stopped
+    command: ["tracker", "api", "serve"]
+    # Host networking avoids the "localhost-in-container" trap:
+    # many operators run LLM gateways / search services bound to 127.0.0.1 on the host.
+    # With bridge networking, containers cannot reach host-loopback.
+    #
+    # Security: we still bind the API to 127.0.0.1 by default.
+    network_mode: host
+    environment:
+      # Localhost-only binding means Web Admin writes are allowed without enabling remote env updates.
+      # (Operators can still enable this explicitly if they expose the admin UI.)
+      TRACKER_ADMIN_ALLOW_REMOTE_ENV_UPDATE: "false"
+      # First-run UX: start without preconfigured password/token (localhost-only port binding above).
+      TRACKER_BOOTSTRAP_ALLOW_NO_AUTH: "true"
+      TRACKER_API_HOST: "127.0.0.1"
+      TRACKER_API_PORT: "${OPENINFOMATE_API_PORT:-8899}"
+      TRACKER_DB_URL: "sqlite:////data/tracker.db"
+      TRACKER_ENV_PATH: "/data/.env"
+      # Optional: local meta-search backend (recommended). See `deploy/searxng/` for details.
+      TRACKER_SEARXNG_BASE_URL: "${OPENINFOMATE_SEARXNG_BASE_URL:-http://127.0.0.1:${OPENINFOMATE_SEARXNG_PORT:-8888}}"
+    volumes:
+      - openinfomate-data:/data
+
+  scheduler:
+    build: .
+    image: openinfomate:local
+    restart: unless-stopped
+    command: ["tracker", "service", "run"]
+    depends_on:
+      - api
+    network_mode: host
+    environment:
+      TRACKER_ADMIN_ALLOW_REMOTE_ENV_UPDATE: "false"
+      TRACKER_BOOTSTRAP_ALLOW_NO_AUTH: "true"
+      TRACKER_DB_URL: "sqlite:////data/tracker.db"
+      TRACKER_ENV_PATH: "/data/.env"
+      TRACKER_SEARXNG_BASE_URL: "${OPENINFOMATE_SEARXNG_BASE_URL:-http://127.0.0.1:${OPENINFOMATE_SEARXNG_PORT:-8888}}"
+    volumes:
+      - openinfomate-data:/data
+
+  # Local meta-search backend (SearxNG).
+  # Binds to host-only `127.0.0.1:${OPENINFOMATE_SEARXNG_PORT:-8888}` for safety.
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${OPENINFOMATE_SEARXNG_PORT:-8888}:8080"
+    volumes:
+      - ./deploy/searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - openinfomate-searxng-cache:/var/cache/searxng
+
+volumes:
+  openinfomate-data:
+  openinfomate-searxng-cache:

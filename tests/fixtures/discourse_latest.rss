@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0">
+  <channel>
+    <title>LINUX DO - 最新话题</title>
+    <link>https://forum.example.com/latest</link>
+    <description>最新话题</description>
+    <language>zh-CN</language>
+    <lastBuildDate>Wed, 11 Feb 2026 02:00:16 +0000</lastBuildDate>
+    <item>
+      <title>Test topic from RSS</title>
+      <link>https://forum.example.com/t/test-topic/123</link>
+      <pubDate>Wed, 11 Feb 2026 02:00:16 +0000</pubDate>
+      <description><![CDATA[<p>hello</p>]]></description>
+    </item>
+  </channel>
+</rss>

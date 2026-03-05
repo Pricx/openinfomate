@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% block content %}
+  <h1>{{ t("Setup Wizard") }}</h1>
+  {% if msg %}
+    <div class="card wide" style="margin-top:12px">
+      <div class="muted">{{ msg }}</div>
+    </div>
+  {% endif %}
+
+  {% set token_qs = ("?token=" ~ token) if token else "" %}
+  {% set admin_config_url = ("/admin?token=" ~ token ~ "&section=config") if token else "/admin?section=config" %}
+  {% set admin_config_basics = admin_config_url ~ "#cfg-basics" %}
+  {% set admin_config_access = admin_config_url ~ "#cfg-access" %}
+  {% set admin_config_llm = admin_config_url ~ "#cfg-llm" %}
+  {% set admin_config_priority = admin_config_url ~ "#cfg-priority" %}
+  {% set admin_config_push = admin_config_url ~ "#cfg-push" %}
+  {% set admin_config_schedule = admin_config_url ~ "#cfg-schedule" %}
+  {% set admin_ai_setup_url = ("/admin?token=" ~ token ~ "&section=ai_setup") if token else "/admin?section=ai_setup" %}
+
+  {% set access_ok = settings_snapshot.get("access_ok") %}
+  {% set basics_ok_raw = (settings_snapshot.get("cron_timezone") or "") %}
+  {% set llm_model_primary = (settings_snapshot.get("llm_model_reasoning") or settings_snapshot.get("llm_model") or "") %}
+  {% set llm_ready = (settings_snapshot.get("llm_base_url") or "") and llm_model_primary and (settings_snapshot.get("llm_api_key_set") or false) %}
+  {% set quick_enabled = (settings_snapshot.get("priority_lane_enabled") or false) %}
+  {% set curated_enabled = (settings_snapshot.get("digest_push_enabled") or false) %}
+  {% set push_configured = doctor_report and (doctor_report.push_telegram_configured or doctor_report.push_dingtalk_configured or doctor_report.push_email_configured or doctor_report.push_webhook_configured) %}
+  {% set profile_configured = doctor_report and doctor_report.profile_configured %}
+
+  {# Dependency order: Access -> LLM -> Profile -> Push / Message scheduling -> (Basics) #}
+  {% set basics_ok = access_ok and basics_ok_raw %}
+  {% set llm_ok = access_ok and llm_ready %}
+  {% set profile_ok = access_ok and llm_ready and profile_configured %}
+  {% set push_ok = access_ok and llm_ready and profile_configured and push_configured %}
+  {% set msg_schedule_ok = access_ok and llm_ready and profile_configured and quick_enabled and curated_enabled %}
+
+  <div class="row" style="margin-top:12px">
+    <div class="card wide">
+      <h2>{{ t("Checklist") }}</h2>
+      <div class="muted">{{ t("Follow these steps to bootstrap OpenInfoMate without SSH.") }}</div>
+
+      <div style="margin-top:12px">
+        <div class="row" style="align-items:center; justify-content:space-between">
+          <div style="flex:1 1 520px; min-width:260px">
+            <b>1) {{ t("Access") }}</b>
+            <div class="muted" style="margin-top:4px">{{ t("Configure Web Admin/API authentication. Secrets are stored in `.env` and take effect immediately.") }}</div>
+          </div>
+          <div class="actions">
+            <span class="badge {{ 'ok' if access_ok else 'warn' }}">{{ t("status") }}={{ 'ok' if access_ok else 'missing' }}</span>
+            <a class="btn-ghost" href="{{ admin_config_access }}">{{ t("Open") }}</a>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:12px">
+        <div class="row" style="align-items:center; justify-content:space-between">
+          <div style="flex:1 1 520px; min-width:260px">
+            <b>2) {{ t("LLM Providers") }}</b>
+            <div class="muted" style="margin-top:4px">{{ t("Reasoning provider + optional mini provider.") }}</div>
+          </div>
+          <div class="actions">
+            <span class="badge {{ 'ok' if llm_ok else 'warn' }}">{{ t("status") }}={{ 'ok' if llm_ok else 'missing' }}</span>
+            <a class="btn-ghost" href="{{ admin_config_llm }}">{{ t("Open") }}</a>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:12px">
+        <div class="row" style="align-items:center; justify-content:space-between">
+          <div style="flex:1 1 520px; min-width:260px">
+            <b>3) {{ t("Profile") }}</b>
+            <div class="muted" style="margin-top:4px">{{ t("Generate your interest profile (requires LLM), then use One-click config to jump into Tracking → AI Setup.") }}</div>
+          </div>
+          <div class="actions">
+            <span class="badge {{ 'ok' if profile_ok else 'warn' }}">{{ t("status") }}={{ 'ok' if profile_ok else 'missing' }}</span>
+            <a class="btn-ghost" href="/setup/profile{{ token_qs }}">{{ t("Open") }}</a>
+            <a class="btn-ghost" href="{{ admin_ai_setup_url }}">{{ t("AI Setup") }}</a>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:12px">
+        <div class="row" style="align-items:center; justify-content:space-between">
+          <div style="flex:1 1 520px; min-width:260px">
+            <b>4) {{ t("Push") }}</b>
+            <div class="muted" style="margin-top:4px">{{ t("Connect push channels (requires LLM + Profile).") }}</div>
+          </div>
+          <div class="actions">
+            <span class="badge {{ 'ok' if push_ok else 'warn' }}">{{ t("status") }}={{ 'ok' if push_ok else 'missing' }}</span>
+            <a class="btn-ghost" href="/setup/push{{ token_qs }}">{{ t("Open") }}</a>
+            <a class="btn-ghost" href="{{ admin_config_push }}">{{ t("Config") }}</a>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:12px">
+        <div class="row" style="align-items:center; justify-content:space-between">
+          <div style="flex:1 1 520px; min-width:260px">
+            <b>5) {{ t("Message scheduling") }}</b>
+            <div class="muted" style="margin-top:4px">{{ t("Configure Quick Messages + Curated Info scheduling (requires LLM + Profile).") }}</div>
+          </div>
+          <div class="actions">
+            <span class="badge {{ 'ok' if msg_schedule_ok else 'warn' }}">{{ t("status") }}={{ 'ok' if msg_schedule_ok else 'missing' }}</span>
+            <a class="btn-ghost" href="{{ admin_config_priority }}">{{ t("Quick Messages") }}</a>
+            <a class="btn-ghost" href="{{ admin_config_schedule }}">{{ t("Curated Info") }}</a>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:12px">
+        <div class="row" style="align-items:center; justify-content:space-between">
+          <div style="flex:1 1 520px; min-width:260px">
+            <b>6) {{ t("Basics") }}</b>
+            <div class="muted" style="margin-top:4px">{{ t("Timezone (output follows UI language).") }}</div>
+          </div>
+          <div class="actions">
+            <span class="badge {{ 'ok' if basics_ok else 'warn' }}">{{ t("status") }}={{ 'ok' if basics_ok else 'missing' }}</span>
+            <a class="btn-ghost" href="{{ admin_config_basics }}">{{ t("Open") }}</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="muted" style="margin-top:12px">
+        {{ t("Tip:") }} {{ t("You can also bootstrap everything via Telegram (/setup).") }}
+      </div>
+    </div>
+
+    <div class="card narrow">
+      <h2>{{ t("Doctor") }}</h2>
+      {% if doctor_report %}
+        <div class="muted">
+          {{ t("cron_timezone") }}={{ doctor_report.cron_timezone }}
+          {{ t("ok") }}={{ doctor_report.cron_timezone_ok }}
+          {{ t("now") }}={{ doctor_report.cron_now_iso }}
+        </div>
+        <div class="muted" style="margin-top:6px">
+          API=<code>{{ doctor_report.api_host }}:{{ doctor_report.api_port }}</code>
+          · auth=<code>{{ 'on' if doctor_report.api_auth_configured else 'off' }}</code>
+          · bind=<code>{{ 'public' if doctor_report.api_bind_public else 'localhost' }}</code>
+        </div>
+        <div style="margin-top:10px" class="actions">
+          <span class="badge {{ 'ok' if doctor_report.profile_configured else 'warn' }}">{{ t("Profile") }}={{ doctor_report.profile_configured }}</span>
+          <span class="badge {{ 'ok' if doctor_report.push_telegram_configured else 'warn' }}">{{ t("Telegram") }}={{ doctor_report.push_telegram_configured }}</span>
+          <span class="badge {{ 'ok' if doctor_report.push_dingtalk_configured else 'warn' }}">{{ t("DingTalk") }}={{ doctor_report.push_dingtalk_configured }}</span>
+          <span class="badge {{ 'ok' if doctor_report.push_email_configured else 'warn' }}">{{ t("Email") }}={{ doctor_report.push_email_configured }}</span>
+        </div>
+      {% else %}
+        <div class="muted">{{ t("Doctor report unavailable.") }}</div>
+      {% endif %}
+      <div class="actions" style="margin-top:12px">
+        <a class="btn-ghost" href="/admin{{ token_qs }}">{{ t("Back to Admin") }}</a>
+      </div>
+    </div>
+  </div>
+{% endblock %}

@@ -1,0 +1,27 @@
+{
+  "hits": [
+    {
+      "created_at": "2026-02-10T01:02:03.000Z",
+      "title": "Breaking: New GPU architecture",
+      "url": "https://example.com/gpu",
+      "story_text": null,
+      "comment_text": null,
+      "objectID": "123456"
+    },
+    {
+      "created_at": "2026-02-10T02:03:04.000Z",
+      "title": "Ask HN: Best Linux distro for servers?",
+      "url": null,
+      "story_text": "Text body",
+      "comment_text": null,
+      "objectID": "789012"
+    }
+  ],
+  "page": 0,
+  "nbHits": 2,
+  "nbPages": 1,
+  "hitsPerPage": 20,
+  "processingTimeMS": 1,
+  "query": "gpu"
+}
+

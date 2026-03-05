@@ -1,0 +1,18 @@
+{
+  "query": "ai chips",
+  "results": [
+    {
+      "title": "AI accelerator released",
+      "url": "https://example.com/accel",
+      "content": "New accelerator details...",
+      "engine": "test"
+    },
+    {
+      "title": "GPU roadmap leak",
+      "url": "https://example.com/roadmap?utm_source=x",
+      "content": "Rumor roundup",
+      "engine": "test"
+    }
+  ]
+}
+

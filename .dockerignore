@@ -1,0 +1,16 @@
+.DS_Store
+._*
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+backups/
+.venv/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.ruff_cache/
+.tracker_locks/
+docs/tracker/plan/bench/
+deploy/chromium/
