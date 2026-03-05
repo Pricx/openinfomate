@@ -291,7 +291,20 @@ async def post_openai_compat_json(
             body = (exc.response.text or "").strip()
         except Exception:
             body = ""
-        if preferred == "chat_completions" and _looks_like_responses_required(exc.response.status_code, body):
+        status = int(exc.response.status_code or 0) if exc.response is not None else 0
+
+        # Main compatibility goal:
+        # - Prefer chat completions when it works.
+        # - If chat completions fails, also try `/v1/responses` (don't rely solely on error-body hints).
+        should_try_responses = False
+        if preferred == "chat_completions":
+            if _looks_like_responses_required(status, body):
+                should_try_responses = True
+            elif status in {400, 404, 405}:
+                # Many providers return a generic 400/404/405 when chat completions is disabled.
+                should_try_responses = True
+
+        if should_try_responses:
             try:
                 data2 = await _post("responses")
             except httpx.HTTPStatusError as exc2:
