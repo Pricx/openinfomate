@@ -2075,7 +2075,7 @@ def create_app(settings: Settings) -> FastAPI:
         session: Session = Depends(get_db),
     ) -> dict:
         repo = Repo(session)
-        from tracker.openrouter_prices import get_openrouter_prices
+        from tracker.integrations.openrouter_prices import get_openrouter_prices
 
         return get_openrouter_prices(repo, ttl_seconds=6 * 3600, force_refresh=bool(refresh))
 

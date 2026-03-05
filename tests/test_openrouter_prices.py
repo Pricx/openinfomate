@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from tracker.openrouter_prices import _compute_prices_summary
+from tracker.integrations.openrouter_prices import _compute_prices_summary
 
 
 def test_compute_prices_summary_groups_vendors_and_picks_top() -> None:
@@ -34,4 +34,3 @@ def test_compute_prices_summary_groups_vendors_and_picks_top() -> None:
     top = openai.get("top")
     assert isinstance(top, list) and top
     assert top[0]["id"] == "openai/gpt-x"
-
