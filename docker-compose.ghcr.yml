@@ -11,6 +11,9 @@ services:
     ports:
       - "127.0.0.1:${OPENINFOMATE_API_PORT:-8899}:8080"
     environment:
+      OPENINFOMATE_INSTANCE: "${OPENINFOMATE_INSTANCE:-openinfomate}"
+      OPENINFOMATE_API_PORT: "${OPENINFOMATE_API_PORT:-8899}"
+      OPENINFOMATE_API_BIND_HOST: "127.0.0.1"
       # Localhost-only binding means Web Admin writes are allowed without enabling remote env updates.
       # (Operators can still enable this explicitly if they expose the admin UI.)
       TRACKER_ADMIN_ALLOW_REMOTE_ENV_UPDATE: "false"
@@ -33,6 +36,9 @@ services:
     depends_on:
       - api
     environment:
+      OPENINFOMATE_INSTANCE: "${OPENINFOMATE_INSTANCE:-openinfomate}"
+      OPENINFOMATE_API_PORT: "${OPENINFOMATE_API_PORT:-8899}"
+      OPENINFOMATE_API_BIND_HOST: "127.0.0.1"
       TRACKER_ADMIN_ALLOW_REMOTE_ENV_UPDATE: "false"
       TRACKER_BOOTSTRAP_ALLOW_NO_AUTH: "true"
       TRACKER_DB_URL: "sqlite:////data/tracker.db"

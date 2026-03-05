@@ -16,6 +16,22 @@ fi
 export TRACKER_ENV_PATH="${ENV_PATH}"
 export TRACKER_DB_URL="${DB_URL}"
 
+INSTANCE="${OPENINFOMATE_INSTANCE:-openinfomate}"
+HOST_BIND_HOST="${OPENINFOMATE_API_BIND_HOST:-127.0.0.1}"
+HOST_BIND_PORT="${OPENINFOMATE_API_PORT:-}"
+LISTEN_HOST="${TRACKER_API_HOST:-0.0.0.0}"
+LISTEN_PORT="${TRACKER_API_PORT:-8080}"
+SEARX_BASE="${TRACKER_SEARXNG_BASE_URL:-}"
+
+if [ -n "${HOST_BIND_PORT}" ]; then
+  echo "[openinfomate] instance=${INSTANCE} admin_url=http://${HOST_BIND_HOST}:${HOST_BIND_PORT}/admin"
+else
+  echo "[openinfomate] instance=${INSTANCE} api_listen=${LISTEN_HOST}:${LISTEN_PORT}"
+fi
+if [ -n "${SEARX_BASE}" ]; then
+  echo "[openinfomate] searxng_base=${SEARX_BASE}"
+fi
+
 # Optional: generate admin/API secrets once (persisted to ENV_PATH) if missing/placeholder.
 #
 # Default UX for the docker-compose quickstart is "no preconfigured password";
