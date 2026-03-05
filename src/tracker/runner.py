@@ -2810,7 +2810,23 @@ async def run_discover_sources(
                     titles: list[str] = []
                     source_content = ""
                     try:
-                        entries = await connector.fetch(url=cand.url)
+                        fetch_url = str(cand.url or "").strip()
+                        # Some sites are `www.`-only; older candidate canonicalization may have stripped it.
+                        # If the candidate was discovered from a `www.` page, prefer that host for preview fetches.
+                        try:
+                            if cand.discovered_from_url:
+                                src = urlsplit(str(cand.discovered_from_url or "").strip())
+                                dst = urlsplit(fetch_url)
+                                src_host = (src.hostname or "").strip().lower()
+                                dst_host = (dst.hostname or "").strip().lower()
+                                if src_host.startswith("www.") and dst_host and dst_host == src_host[4:]:
+                                    fetch_url = urlunsplit(
+                                        (dst.scheme or src.scheme, src.netloc, dst.path, dst.query, dst.fragment)
+                                    )
+                        except Exception:
+                            fetch_url = str(cand.url or "").strip()
+
+                        entries = await connector.fetch(url=fetch_url)
                         lines: list[str] = []
                         for e in entries[:preview_limit]:
                             t = (e.title or "").strip()
@@ -2828,6 +2844,16 @@ async def run_discover_sources(
                                 s2 = " ".join(s.split())
                                 lines.append(f"  summary: {s2[:320]}")
                         source_content = "\n".join(lines).strip()
+
+                        if fetch_url and fetch_url != str(cand.url or "").strip():
+                            try:
+                                cand.url = canonicalize_url(fetch_url, strip_www=False)
+                                session.commit()
+                            except Exception:
+                                try:
+                                    session.rollback()
+                                except Exception:
+                                    pass
                     except Exception:
                         titles = []
                         source_content = ""
