@@ -3638,7 +3638,7 @@ async def run_digest(
         )
         pushed = 0
 
-        if push and items:
+        if push and (items or bool(getattr(settings, "digest_push_empty", True))):
             try:
                 pushed += 1 if await push_dingtalk_markdown(
                     repo=repo,
@@ -4017,7 +4017,7 @@ async def run_curated_info(
     )
 
     pushed = 0
-    if push and total > 0:
+    if push and (total > 0 or bool(getattr(settings, "digest_push_empty", True))):
         try:
             pushed += 1 if await push_dingtalk_markdown(
                 repo=repo,
