@@ -1,3 +1,5 @@
+name: ${OPENINFOMATE_INSTANCE:-openinfomate}
+
 services:
   api:
     image: ghcr.io/pricx/openinfomate:latest

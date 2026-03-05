@@ -22,6 +22,7 @@ HOST_BIND_PORT="${OPENINFOMATE_API_PORT:-}"
 LISTEN_HOST="${TRACKER_API_HOST:-0.0.0.0}"
 LISTEN_PORT="${TRACKER_API_PORT:-8080}"
 SEARX_BASE="${TRACKER_SEARXNG_BASE_URL:-}"
+SEARX_PORT="${OPENINFOMATE_SEARXNG_PORT:-}"
 
 if [ -n "${HOST_BIND_PORT}" ]; then
   echo "[openinfomate] instance=${INSTANCE} admin_url=http://${HOST_BIND_HOST}:${HOST_BIND_PORT}/admin"
@@ -30,6 +31,9 @@ else
 fi
 if [ -n "${SEARX_BASE}" ]; then
   echo "[openinfomate] searxng_base=${SEARX_BASE}"
+fi
+if [ -n "${SEARX_PORT}" ]; then
+  echo "[openinfomate] searxng_host_port=${SEARX_PORT}"
 fi
 
 # Optional: generate admin/API secrets once (persisted to ENV_PATH) if missing/placeholder.

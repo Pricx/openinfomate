@@ -32,6 +32,15 @@ mkdir -p ~/openinfomate && cd ~/openinfomate && curl -fsSLO https://raw.githubus
 打开管理后台：
 - `http://127.0.0.1:${OPENINFOMATE_API_PORT:-8899}/admin`
 
+多开部署（强烈推荐用脚本，自动隔离 volume/network，并自动避让端口冲突）：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/Pricx/openinfomate/main/scripts/deploy_docker_instance.sh && chmod +x deploy_docker_instance.sh
+curl -fsSLO https://raw.githubusercontent.com/Pricx/openinfomate/main/docker-compose.ghcr.yml
+curl -fsSLO https://raw.githubusercontent.com/Pricx/openinfomate/main/docker-compose.host.yml
+./deploy_docker_instance.sh --host --base-port 8901
+```
+
 如果你必须让容器访问宿主机的 `127.0.0.1`（例如你的 LLM gateway 只绑定在宿主机 loopback），使用 host 网络覆盖文件：
 
 ```bash

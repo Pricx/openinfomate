@@ -15,6 +15,7 @@ MODE="ghcr"
 HOST_MODE="false"
 BASE_PORT="8899"
 PORT=""
+SEARX_PORT=""
 PROJECT_PREFIX="openinfomate"
 INSTANCE=""
 
@@ -24,6 +25,7 @@ while [ $# -gt 0 ]; do
     --mode) MODE="${2:-}"; shift 2 ;;
     --base-port) BASE_PORT="${2:-}"; shift 2 ;;
     --port) PORT="${2:-}"; shift 2 ;;
+    --searx-port) SEARX_PORT="${2:-}"; shift 2 ;;
     --project-prefix) PROJECT_PREFIX="${2:-}"; shift 2 ;;
     --instance) INSTANCE="${2:-}"; shift 2 ;;
     -h|--help)
@@ -86,12 +88,27 @@ if [ -z "${INSTANCE}" ]; then
   INSTANCE="${PROJECT_PREFIX}-${PORT}"
 fi
 
+if [ "${HOST_MODE}" = "true" ] && [ -z "${SEARX_PORT}" ]; then
+  # In host mode we may publish searxng to a host port; pick a nearby free one.
+  guess=$((PORT - 10))
+  if [ "${guess}" -lt 1024 ]; then
+    guess=$((PORT + 10))
+  fi
+  SEARX_PORT="$(pick_port "${guess}")"
+fi
+
 export OPENINFOMATE_API_PORT="${PORT}"
 export OPENINFOMATE_INSTANCE="${INSTANCE}"
+if [ -n "${SEARX_PORT}" ]; then
+  export OPENINFOMATE_SEARXNG_PORT="${SEARX_PORT}"
+fi
 export COMPOSE_PROJECT_NAME="${INSTANCE}"
 
 echo "[deploy] project=${COMPOSE_PROJECT_NAME}"
 echo "[deploy] api_port=${OPENINFOMATE_API_PORT}"
+if [ -n "${SEARX_PORT}" ]; then
+  echo "[deploy] searxng_port=${OPENINFOMATE_SEARXNG_PORT}"
+fi
 echo "[deploy] mode=${MODE} host_mode=${HOST_MODE}"
 
 files="-f ${compose_file}"
