@@ -5,6 +5,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import os
 import re
 import secrets
 import httpx
@@ -520,7 +521,28 @@ def create_app(settings: Settings) -> FastAPI:
 
     def _is_trusted_local_request(request: Request) -> bool:
         host = (request.client.host if request.client else "").strip()
-        return host in _trusted_local_client_hosts
+        if host in _trusted_local_client_hosts:
+            return True
+
+        # Support SSH local port-forward (and other localhost-only host exposure).
+        #
+        # In some deployments, requests to a host-loopback bound port may still appear to the
+        # container as coming from a non-loopback IP (or another internal hop). If the
+        # operator explicitly configured the host exposure to be loopback-only via
+        # OPENINFOMATE_API_BIND_HOST, trust requests whose Host header is loopback.
+        bind_host = str(os.environ.get("OPENINFOMATE_API_BIND_HOST") or "").strip()
+        if not _looks_like_loopback_host(bind_host):
+            return False
+
+        host_hdr = str(request.headers.get("host") or "").strip()
+        if not host_hdr:
+            return False
+        # Strip port; tolerate IPv6 bracket form.
+        if host_hdr.startswith("[") and "]" in host_hdr:
+            host_only = host_hdr[1 : host_hdr.index("]")]
+        else:
+            host_only = host_hdr.split(":", 1)[0].strip()
+        return _looks_like_loopback_host(host_only)
 
     def _require_localhost(request: Request) -> None:
         if _is_trusted_local_request(request):

@@ -109,3 +109,35 @@ def test_admin_settings_patch_allows_docker_gateway_as_localhost(tmp_path, monke
 
     # Without remote env update enabled, we still allow the Docker gateway address as "local".
     assert asyncio.run(_run()) == 303
+
+
+def test_admin_settings_patch_allows_loopback_host_header_when_bind_is_loopback(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "api.db"
+    env_path = Path(tmp_path) / ".env"
+    settings = Settings(
+        db_url=f"sqlite:///{db_path}",
+        api_token="secret",
+        env_path=str(env_path),
+        admin_allow_remote_env_update=False,
+    )
+
+    # In SSH local port-forward scenarios, the app may see an internal hop as the client IP
+    # even though the operator only exposed the port on 127.0.0.1. When the operator
+    # explicitly declares loopback-only exposure via OPENINFOMATE_API_BIND_HOST, treat a
+    # loopback Host header as local.
+    monkeypatch.setenv("OPENINFOMATE_API_BIND_HOST", "127.0.0.1")
+
+    app = create_app(settings)
+
+    async def _run() -> int:
+        transport = httpx.ASGITransport(app=app, client=("8.8.8.8", 12345))
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            r = await client.post(
+                "/admin/settings/patch?token=secret&section=config",
+                headers={"host": "127.0.0.1:8899"},
+                data={"output_language": "zh"},
+                follow_redirects=False,
+            )
+        return int(r.status_code)
+
+    assert asyncio.run(_run()) == 303
