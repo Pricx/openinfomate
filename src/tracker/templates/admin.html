@@ -2632,7 +2632,14 @@ TRACKER_EMAIL_TO=...{% endif %}
           }
         }
         inp.value = JSON.stringify(obj, null, 2);
-        if (row) _trackerCfgMarkRow(row);
+        if (row) {
+          _trackerCfgMarkRow(row);
+          try {
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+          } catch (e2) {
+            _trackerCfgScheduleAutosave(row);
+          }
+        }
       } catch (e) {}
     }
 

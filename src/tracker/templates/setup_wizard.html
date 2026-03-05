@@ -32,7 +32,7 @@
   {% set basics_ok = access_ok and basics_ok_raw %}
   {% set llm_test_reasoning_ok = (settings_snapshot.get("llm_test_reasoning_ok") or false) %}
   {% set llm_test_mini_ok = (settings_snapshot.get("llm_test_mini_ok") or false) %}
-  {% set llm_ok = access_ok and llm_ready and llm_test_reasoning_ok and ((not llm_mini_model) or (llm_mini_ready and llm_test_mini_ok)) %}
+  {% set llm_ok = llm_ready and llm_test_reasoning_ok and ((not llm_mini_model) or (llm_mini_ready and llm_test_mini_ok)) %}
   {% set profile_ok = access_ok and llm_ok and profile_configured %}
   {% set push_ok = access_ok and llm_ok and profile_configured and push_configured %}
   {% set msg_schedule_ok = access_ok and llm_ok and profile_configured and quick_enabled and curated_enabled %}
