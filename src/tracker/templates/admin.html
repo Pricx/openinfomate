@@ -2449,7 +2449,7 @@ TRACKER_EMAIL_TO=...{% endif %}
       trackerShowToast('{{ t("Applied preset:") }} ' + (preset.label || id), 'success', '{{ t("AI Policy") }}');
     }
 
-    async function trackerTestLlm(provider) {
+	    async function trackerTestLlm(provider) {
       try {
         const which = String(provider || '').trim().toLowerCase();
         const fd = new FormData();
@@ -2670,6 +2670,97 @@ TRACKER_EMAIL_TO=...{% endif %}
 	      }
 	    }
 
+	    function trackerAutoTestLlmOnLoad() {
+	      try {
+	        const section = '{{ section }}';
+	        if (section !== 'config') return;
+
+	        const llmReady = {{ 'true' if (settings_snapshot.get('llm_base_url') or '') and (settings_snapshot.get('llm_model_reasoning') or settings_snapshot.get('llm_model') or '') and (settings_snapshot.get('llm_api_key_set') or false) else 'false' }};
+	        if (!llmReady) return;
+
+	        const fpR = '{{ (settings_snapshot.get("llm_test_reasoning_fingerprint_current") or "")|e }}';
+	        const okR = {{ 'true' if (settings_snapshot.get("llm_test_reasoning_ok") or false) else 'false' }};
+	        if (fpR && !okR) {
+	          const k = 'tracker_auto_llm_test_reasoning_fp';
+	          const prev = String(sessionStorage.getItem(k) || '');
+	          if (prev !== fpR) {
+	            sessionStorage.setItem(k, fpR);
+	            setTimeout(() => { try { trackerTestLlm('reasoning'); } catch (e2) {} }, 350);
+	          }
+	        }
+
+	        const miniModel = '{{ (settings_snapshot.get("llm_model_mini") or "")|e }}';
+	        const miniReady = {{ 'true' if (settings_snapshot.get('llm_model_mini') or '') and (settings_snapshot.get('llm_mini_api_key_set') or false) and ((settings_snapshot.get('llm_mini_base_url') or settings_snapshot.get('llm_base_url') or '')) else 'false' }};
+	        const fpM = '{{ (settings_snapshot.get("llm_test_mini_fingerprint_current") or "")|e }}';
+	        const okM = {{ 'true' if (settings_snapshot.get("llm_test_mini_ok") or false) else 'false' }};
+	        if (miniModel && miniReady && fpM && !okM) {
+	          const k = 'tracker_auto_llm_test_mini_fp';
+	          const prev = String(sessionStorage.getItem(k) || '');
+	          if (prev !== fpM) {
+	            sessionStorage.setItem(k, fpM);
+	            setTimeout(() => { try { trackerTestLlm('mini'); } catch (e2) {} }, 650);
+	          }
+	        }
+	      } catch (e) {}
+	    }
+
+	    // Auto-test after saving LLM settings (so operators don't need to scroll + click).
+	    const _trackerLlmAutoTimers = { reasoning: null, mini: null };
+	    function _trackerScheduleLlmTest(which) {
+	      try {
+	        const w = (which === 'mini') ? 'mini' : 'reasoning';
+	        if (_trackerLlmAutoTimers[w]) {
+	          try { clearTimeout(_trackerLlmAutoTimers[w]); } catch (e2) {}
+	        }
+	        _trackerLlmAutoTimers[w] = setTimeout(() => { try { trackerTestLlm(w); } catch (e3) {} }, 450);
+	      } catch (e) {}
+	    }
+
+	    function _trackerMaybeAutoTestLlmAfterSave(field) {
+	      try {
+	        const f = String(field || '').trim();
+	        if (!f) return;
+	        const reasonFields = new Set(['llm_base_url', 'llm_model', 'llm_model_reasoning', 'llm_extra_body_json']);
+	        const miniFields = new Set(['llm_mini_base_url', 'llm_model_mini', 'llm_mini_extra_body_json']);
+	        if (reasonFields.has(f)) {
+	          _trackerScheduleLlmTest('reasoning');
+	        } else if (miniFields.has(f)) {
+	          _trackerScheduleLlmTest('mini');
+	        }
+	      } catch (e) {}
+	    }
+
+	    function trackerAutoTestLlmIfNeeded() {
+	      try {
+	        if ('{{ section }}' !== 'config') return;
+	        const ready = {{ 'true' if dep_llm_ok else 'false' }};
+	        if (!ready) return;
+
+	        const fpR = '{{ (settings_snapshot.get("llm_test_reasoning_fingerprint_current") or "")|e }}';
+	        const okR = {{ 'true' if (settings_snapshot.get("llm_test_reasoning_ok") or false) else 'false' }};
+	        if (!okR && fpR) {
+	          const k = 'tracker_auto_llm_test_reasoning_fp';
+	          const prev = String(sessionStorage.getItem(k) || '');
+	          if (prev !== fpR) {
+	            sessionStorage.setItem(k, fpR);
+	            setTimeout(() => { try { trackerTestLlm('reasoning'); } catch (e2) {} }, 300);
+	          }
+	        }
+
+	        const miniConfigured = {{ 'true' if (settings_snapshot.get("llm_model_mini") or settings_snapshot.get("llm_mini_base_url") or settings_snapshot.get("llm_mini_api_key_set")) else 'false' }};
+	        const fpM = '{{ (settings_snapshot.get("llm_test_mini_fingerprint_current") or "")|e }}';
+	        const okM = {{ 'true' if (settings_snapshot.get("llm_test_mini_ok") or false) else 'false' }};
+	        if (miniConfigured && !okM && fpM) {
+	          const k2 = 'tracker_auto_llm_test_mini_fp';
+	          const prev2 = String(sessionStorage.getItem(k2) || '');
+	          if (prev2 !== fpM) {
+	            sessionStorage.setItem(k2, fpM);
+	            setTimeout(() => { try { trackerTestLlm('mini'); } catch (e3) {} }, 700);
+	          }
+	        }
+	      } catch (e) {}
+	    }
+
 	    function _trackerCfgRowIsCold(row) {
 	      try {
 	        const secret = (row.dataset.cfgSecret || '') === '1';
@@ -2724,7 +2815,7 @@ TRACKER_EMAIL_TO=...{% endif %}
       }
     }
 
-    async function _trackerCfgAutosaveRow(row) {
+	    async function _trackerCfgAutosaveRow(row) {
       try {
         if (!row || !_trackerCfgRowIsHot(row)) return true;
         if (!_trackerCfgRowIsDirty(row)) return true;
@@ -2759,12 +2850,13 @@ TRACKER_EMAIL_TO=...{% endif %}
 	          return false;
 	        }
 
-	        // Commit the new baseline so the row becomes clean.
-	        row.dataset.cfgInitial = _trackerCfgRowValue(row);
-	        _trackerCfgMarkRow(row);
-	        const restart = (row.dataset.cfgRestart || '') === '1';
-	        _trackerCfgSetRowStatus(row, restart ? ('{{ t("Saved") }} · {{ t("restart required") }}') : '{{ t("Saved") }}');
-	        return true;
+		        // Commit the new baseline so the row becomes clean.
+		        row.dataset.cfgInitial = _trackerCfgRowValue(row);
+		        _trackerCfgMarkRow(row);
+		        const restart = (row.dataset.cfgRestart || '') === '1';
+		        _trackerCfgSetRowStatus(row, restart ? ('{{ t("Saved") }} · {{ t("restart required") }}') : '{{ t("Saved") }}');
+		        _trackerMaybeAutoTestLlmAfterSave(field);
+		        return true;
 	      } catch (e) {
 	        _trackerCfgSetRowStatus(row, '{{ t("Autosave failed:") }} ' + String(e || ''));
 	        trackerShowToast('{{ t("Autosave failed:") }} ' + String(e || ''), 'error');
@@ -3717,11 +3809,13 @@ TRACKER_EMAIL_TO=...{% endif %}
       } catch (e) {}
     }
 
-			    document.addEventListener('DOMContentLoaded', () => {
+				    document.addEventListener('DOMContentLoaded', () => {
 		      trackerSourceTypeChanged();
 		      trackerTopicPresetChanged();
-		      trackerPromptsInit();
-		      trackerCfgInit();
+			      trackerPromptsInit();
+			      trackerCfgInit();
+			      trackerAutoTestLlmOnLoad();
+		        trackerAutoTestLlmIfNeeded();
 	        try {
 	          const prefillKey = 'tracker_ai_setup_prefill_prompt';
 	          const prefill = localStorage.getItem(prefillKey) || '';

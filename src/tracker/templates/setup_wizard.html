@@ -21,6 +21,8 @@
   {% set basics_ok_raw = (settings_snapshot.get("cron_timezone") or "") %}
   {% set llm_model_primary = (settings_snapshot.get("llm_model_reasoning") or settings_snapshot.get("llm_model") or "") %}
   {% set llm_ready = (settings_snapshot.get("llm_base_url") or "") and llm_model_primary and (settings_snapshot.get("llm_api_key_set") or false) %}
+  {% set llm_mini_model = (settings_snapshot.get("llm_model_mini") or "") %}
+  {% set llm_mini_ready = llm_mini_model and ((settings_snapshot.get("llm_mini_base_url") or settings_snapshot.get("llm_base_url") or "")) and (settings_snapshot.get("llm_mini_api_key_set") or false) %}
   {% set quick_enabled = (settings_snapshot.get("priority_lane_enabled") or false) %}
   {% set curated_enabled = (settings_snapshot.get("digest_push_enabled") or false) %}
   {% set push_configured = doctor_report and (doctor_report.push_telegram_configured or doctor_report.push_dingtalk_configured or doctor_report.push_email_configured or doctor_report.push_webhook_configured) %}
@@ -28,10 +30,12 @@
 
   {# Dependency order: Access -> LLM -> Profile -> Push / Message scheduling -> (Basics) #}
   {% set basics_ok = access_ok and basics_ok_raw %}
-  {% set llm_ok = access_ok and llm_ready %}
-  {% set profile_ok = access_ok and llm_ready and profile_configured %}
-  {% set push_ok = access_ok and llm_ready and profile_configured and push_configured %}
-  {% set msg_schedule_ok = access_ok and llm_ready and profile_configured and quick_enabled and curated_enabled %}
+  {% set llm_test_reasoning_ok = (settings_snapshot.get("llm_test_reasoning_ok") or false) %}
+  {% set llm_test_mini_ok = (settings_snapshot.get("llm_test_mini_ok") or false) %}
+  {% set llm_ok = access_ok and llm_ready and llm_test_reasoning_ok and ((not llm_mini_model) or (llm_mini_ready and llm_test_mini_ok)) %}
+  {% set profile_ok = access_ok and llm_ok and profile_configured %}
+  {% set push_ok = access_ok and llm_ok and profile_configured and push_configured %}
+  {% set msg_schedule_ok = access_ok and llm_ok and profile_configured and quick_enabled and curated_enabled %}
 
   <div class="row" style="margin-top:12px">
     <div class="card wide">

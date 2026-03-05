@@ -1817,6 +1817,50 @@ def create_app(settings: Settings) -> FastAPI:
             ai_setup_max_sources_total = 500
         ai_setup_max_sources_total = max(50, min(5000, int(ai_setup_max_sources_total or 500)))
 
+        def _app_bool(key: str) -> bool:
+            try:
+                v = str(repo.get_app_config(key) or "").strip().lower()
+            except Exception:
+                v = ""
+            return v in {"1", "true", "yes", "y", "on"}
+
+        def _app_str(key: str) -> str:
+            try:
+                return str(repo.get_app_config(key) or "").strip()
+            except Exception:
+                return ""
+
+        llm_reasoning_base_url = str(getattr(eff_settings, "llm_base_url", "") or "").strip()
+        llm_reasoning_model = str(
+            (getattr(eff_settings, "llm_model_reasoning", "") or getattr(eff_settings, "llm_model", "") or "")
+        ).strip()
+        llm_test_reasoning_fingerprint_current = f"{llm_reasoning_base_url}|{llm_reasoning_model}".strip("|")
+        llm_test_reasoning_last_ok = _app_bool("llm_test_reasoning_last_ok")
+        llm_test_reasoning_last_fingerprint = _app_str("llm_test_reasoning_last_fingerprint")
+        llm_test_reasoning_ok = bool(
+            llm_test_reasoning_last_ok
+            and llm_test_reasoning_fingerprint_current
+            and llm_test_reasoning_last_fingerprint == llm_test_reasoning_fingerprint_current
+        )
+
+        llm_mini_base_url = str(getattr(eff_settings, "llm_mini_base_url", "") or "").strip() or llm_reasoning_base_url
+        llm_mini_model = str(
+            (
+                getattr(eff_settings, "llm_model_mini", "")
+                or getattr(eff_settings, "llm_model_reasoning", "")
+                or getattr(eff_settings, "llm_model", "")
+                or ""
+            )
+        ).strip()
+        llm_test_mini_fingerprint_current = f"{llm_mini_base_url}|{llm_mini_model}".strip("|")
+        llm_test_mini_last_ok = _app_bool("llm_test_mini_last_ok")
+        llm_test_mini_last_fingerprint = _app_str("llm_test_mini_last_fingerprint")
+        llm_test_mini_ok = bool(
+            llm_test_mini_last_ok
+            and llm_test_mini_fingerprint_current
+            and llm_test_mini_last_fingerprint == llm_test_mini_fingerprint_current
+        )
+
         return templates.TemplateResponse(
             request,
             "admin.html",
@@ -1918,6 +1962,18 @@ def create_app(settings: Settings) -> FastAPI:
                     "llm_proxy_set": bool(str(getattr(eff_settings, "llm_proxy", "") or "").strip()),
                     "llm_mini_api_key_set": bool(str(getattr(eff_settings, "llm_mini_api_key", "") or "").strip()),
                     "llm_mini_proxy_set": bool(str(getattr(eff_settings, "llm_mini_proxy", "") or "").strip()),
+                    "llm_test_reasoning_last_ok": bool(llm_test_reasoning_last_ok),
+                    "llm_test_reasoning_last_at": _app_str("llm_test_reasoning_last_at"),
+                    "llm_test_reasoning_last_message": _app_str("llm_test_reasoning_last_message"),
+                    "llm_test_reasoning_last_fingerprint": llm_test_reasoning_last_fingerprint,
+                    "llm_test_reasoning_fingerprint_current": llm_test_reasoning_fingerprint_current,
+                    "llm_test_reasoning_ok": bool(llm_test_reasoning_ok),
+                    "llm_test_mini_last_ok": bool(llm_test_mini_last_ok),
+                    "llm_test_mini_last_at": _app_str("llm_test_mini_last_at"),
+                    "llm_test_mini_last_message": _app_str("llm_test_mini_last_message"),
+                    "llm_test_mini_last_fingerprint": llm_test_mini_last_fingerprint,
+                    "llm_test_mini_fingerprint_current": llm_test_mini_fingerprint_current,
+                    "llm_test_mini_ok": bool(llm_test_mini_ok),
                 },
             },
             headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
@@ -2466,9 +2522,6 @@ def create_app(settings: Settings) -> FastAPI:
                 return JSONResponse(status_code=400, content={"ok": False, "message": msg})
             return _redir(request, msg=msg)
 
-        base = base_url.rstrip("/")
-        endpoint = (f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions")
-
         headers = {"Authorization": f"Bearer {api_key}", "User-Agent": "tracker/0.1"}
         timeout = max(8.0, float(getattr(eff, "llm_timeout_seconds", 30) or 30))
 
@@ -2516,14 +2569,20 @@ def create_app(settings: Settings) -> FastAPI:
 
         started = dt.datetime.utcnow()
         try:
+            from tracker.openai_compat import extract_text_from_openai_compat_response, post_openai_compat_json
+
             async with httpx.AsyncClient(
                 timeout=timeout,
                 follow_redirects=True,
                 proxy=(proxy or None),
             ) as client:
-                resp = await client.post(endpoint, headers=headers, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
+                data, mode = await post_openai_compat_json(
+                    repo=repo,
+                    client=client,
+                    base_url=base_url,
+                    headers=headers,
+                    payload_chat=payload,  # type: ignore[arg-type]
+                )
         except httpx.HTTPStatusError as exc:
             body = ""
             try:
@@ -2545,22 +2604,13 @@ def create_app(settings: Settings) -> FastAPI:
             return _redir(request, msg=msg)
 
         elapsed_ms = int((dt.datetime.utcnow() - started).total_seconds() * 1000)
-        out = ""
-        try:
-            choices = data.get("choices") if isinstance(data, dict) else None
-            if isinstance(choices, list) and choices:
-                msg0 = choices[0].get("message") if isinstance(choices[0], dict) else None
-                content = msg0.get("content") if isinstance(msg0, dict) else None
-                if isinstance(content, str):
-                    out = content.strip()
-        except Exception:
-            out = ""
+        out = extract_text_from_openai_compat_response(data)
         if not out:
             out = "(empty)"
         if len(out) > 200:
             out = out[:200] + "…"
 
-        msg = f"llm test ({which}): ok in {elapsed_ms}ms · {out}"
+        msg = f"llm test ({which}): ok in {elapsed_ms}ms · mode={mode} · {out}"
         _record(True, msg)
         if want_json:
             return JSONResponse(status_code=200, content={"ok": True, "message": msg})
@@ -4542,6 +4592,45 @@ def create_app(settings: Settings) -> FastAPI:
         try:
             admin_user = str(getattr(eff, "admin_username", "") or "").strip()
             admin_pw_set = bool(str(getattr(eff, "admin_password", "") or "").strip())
+
+            def _app_bool(key: str) -> bool:
+                try:
+                    v = str(repo.get_app_config(key) or "").strip().lower()
+                except Exception:
+                    v = ""
+                return v in {"1", "true", "yes", "y", "on"}
+
+            def _app_str(key: str) -> str:
+                try:
+                    return str(repo.get_app_config(key) or "").strip()
+                except Exception:
+                    return ""
+
+            llm_reasoning_base_url = str(getattr(eff, "llm_base_url", "") or "").strip()
+            llm_reasoning_model = str((getattr(eff, "llm_model_reasoning", "") or getattr(eff, "llm_model", "") or "")).strip()
+            llm_test_reasoning_fingerprint_current = f"{llm_reasoning_base_url}|{llm_reasoning_model}".strip("|")
+            llm_test_reasoning_ok = bool(
+                _app_bool("llm_test_reasoning_last_ok")
+                and llm_test_reasoning_fingerprint_current
+                and _app_str("llm_test_reasoning_last_fingerprint") == llm_test_reasoning_fingerprint_current
+            )
+
+            llm_mini_base_url = str(getattr(eff, "llm_mini_base_url", "") or "").strip() or llm_reasoning_base_url
+            llm_mini_model = str(
+                (
+                    getattr(eff, "llm_model_mini", "")
+                    or getattr(eff, "llm_model_reasoning", "")
+                    or getattr(eff, "llm_model", "")
+                    or ""
+                )
+            ).strip()
+            llm_test_mini_fingerprint_current = f"{llm_mini_base_url}|{llm_mini_model}".strip("|")
+            llm_test_mini_ok = bool(
+                _app_bool("llm_test_mini_last_ok")
+                and llm_test_mini_fingerprint_current
+                and _app_str("llm_test_mini_last_fingerprint") == llm_test_mini_fingerprint_current
+            )
+
             settings_snapshot = {
                 "output_language": str(getattr(eff, "output_language", "") or "").strip(),
                 "cron_timezone": str(getattr(eff, "cron_timezone", "") or "").strip(),
@@ -4551,6 +4640,9 @@ def create_app(settings: Settings) -> FastAPI:
                 "llm_model_mini": str(getattr(eff, "llm_model_mini", "") or "").strip(),
                 "llm_mini_base_url": str(getattr(eff, "llm_mini_base_url", "") or "").strip(),
                 "llm_api_key_set": bool(str(getattr(eff, "llm_api_key", "") or "").strip()),
+                "llm_mini_api_key_set": bool(str(getattr(eff, "llm_mini_api_key", "") or "").strip()),
+                "llm_test_reasoning_ok": bool(llm_test_reasoning_ok),
+                "llm_test_mini_ok": bool(llm_test_mini_ok),
                 "health_report_cron": str(getattr(eff, "health_report_cron", "") or "").strip(),
                 "priority_lane_enabled": bool(getattr(eff, "priority_lane_enabled", False)),
                 "digest_scheduler_enabled": bool(getattr(eff, "digest_scheduler_enabled", False)),

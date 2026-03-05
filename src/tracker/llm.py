@@ -15,6 +15,11 @@ from tracker.repo import Repo
 from tracker.prompt_templates import resolve_prompt_best_effort
 from tracker.settings import Settings
 from tracker.story import extract_notable_links
+from tracker.openai_compat import (
+    extract_text_from_openai_compat_response,
+    extract_usage_tokens,
+    post_openai_compat_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +259,6 @@ async def llm_plan_tracking_ai_setup(
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
 
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -308,19 +312,19 @@ async def llm_plan_tracking_ai_setup(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode_used = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(usage_cb, kind=kind, model=resp_model, data=data)
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text content")
 
     obj = _extract_first_json_object(content)
     if not obj or not isinstance(obj, dict):
@@ -365,7 +369,6 @@ async def llm_transform_tracking_ai_setup_input(
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
 
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -397,19 +400,19 @@ async def llm_transform_tracking_ai_setup_input(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode_used = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(usage_cb, kind=kind, model=resp_model, data=data)
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text content")
 
     obj = _extract_first_json_object(content)
     if not obj or not isinstance(obj, dict):
@@ -454,7 +457,6 @@ async def llm_translate_prompt_template(
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
 
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -483,20 +485,20 @@ async def llm_translate_prompt_template(
     }
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode_used = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(usage_cb, kind=kind, model=resp_model, data=data)
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
-    return (content or "").strip()
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text content")
+    return content.strip()
 
 
 def _openai_compat_chat_completions_url(base_url: str) -> str:
@@ -551,26 +553,7 @@ def _extract_usage(data: object) -> tuple[int, int, int]:
 
     Returns (prompt_tokens, completion_tokens, total_tokens); zeros if absent.
     """
-    if not isinstance(data, dict):
-        return 0, 0, 0
-    usage = data.get("usage")
-    if not isinstance(usage, dict):
-        return 0, 0, 0
-    try:
-        prompt_tokens = int(usage.get("prompt_tokens") or 0)
-    except Exception:
-        prompt_tokens = 0
-    try:
-        completion_tokens = int(usage.get("completion_tokens") or 0)
-    except Exception:
-        completion_tokens = 0
-    try:
-        total_tokens = int(usage.get("total_tokens") or 0)
-    except Exception:
-        total_tokens = 0
-    if total_tokens <= 0 and (prompt_tokens > 0 or completion_tokens > 0):
-        total_tokens = prompt_tokens + completion_tokens
-    return max(0, prompt_tokens), max(0, completion_tokens), max(0, total_tokens)
+    return extract_usage_tokens(data)
 
 
 def _emit_usage(
@@ -710,7 +693,6 @@ async def llm_propose_topic_setup(
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
 
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -741,19 +723,19 @@ async def llm_propose_topic_setup(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode_used = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(usage_cb, kind="propose_topic_setup", model=resp_model, topic=tn, data=data)
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text content")
 
     obj = _extract_first_json_object(content)
     if not obj or not isinstance(obj, dict):
@@ -829,7 +811,6 @@ async def llm_propose_profile_setup(
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
 
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -979,19 +960,19 @@ async def llm_propose_profile_setup(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode_used = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(usage_cb, kind="propose_profile_setup", model=resp_model, topic="profile", data=data)
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text content")
 
     obj = _extract_first_json_object(content)
     if not obj or not isinstance(obj, dict):
@@ -1080,8 +1061,6 @@ async def llm_update_profile_delta_from_feedback(
     base_url = _select_llm_base_url_for_kind(settings, kind=kind)
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
-
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -1135,19 +1114,19 @@ async def llm_update_profile_delta_from_feedback(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(usage_cb, kind="profile_delta_update", model=resp_model, topic="profile", data=data)
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text")
 
     obj = _extract_first_json_object(content)
     if not obj or not isinstance(obj, dict):
@@ -1186,8 +1165,6 @@ async def llm_update_prompt_delta_from_feedback(
     base_url = _select_llm_base_url_for_kind(settings, kind=kind)
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
-
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -1239,19 +1216,19 @@ async def llm_update_prompt_delta_from_feedback(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(usage_cb, kind=kind, model=resp_model, topic="prompts", data=data)
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text")
 
     obj = _extract_first_json_object(content)
     if not obj or not isinstance(obj, dict):
@@ -1308,7 +1285,6 @@ async def llm_gate_alert_candidate(
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
 
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -1349,9 +1325,13 @@ async def llm_gate_alert_candidate(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(
         usage_cb,
@@ -1361,13 +1341,9 @@ async def llm_gate_alert_candidate(
         data=data,
     )
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text")
 
     obj = _extract_first_json_object(content)
     if not obj or not isinstance(obj, dict):
@@ -1410,7 +1386,6 @@ async def llm_summarize_digest(
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
 
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -1475,9 +1450,13 @@ async def llm_summarize_digest(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(
         usage_cb,
@@ -1487,13 +1466,9 @@ async def llm_summarize_digest(
         data=data,
     )
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text")
 
     obj = _extract_first_json_object(content)
     if not obj or not isinstance(obj, dict):
@@ -1542,8 +1517,6 @@ async def llm_triage_topic_items(
     base_url = _select_llm_base_url_for_kind(settings, kind=kind)
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
-
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -1650,19 +1623,19 @@ async def llm_triage_topic_items(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(usage_cb, kind="triage_items", model=resp_model, topic=topic.name, data=data)
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text")
 
     obj = _extract_first_json_object(content)
     if not obj or not isinstance(obj, dict):
@@ -1734,7 +1707,6 @@ async def llm_curate_topic_items(
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
 
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -1840,9 +1812,13 @@ async def llm_curate_topic_items(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(
         usage_cb,
@@ -1852,13 +1828,9 @@ async def llm_curate_topic_items(
         data=data,
     )
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text")
 
     obj = _extract_first_json_object(content)
     if not obj or not isinstance(obj, dict):
@@ -1938,8 +1910,6 @@ async def llm_guess_feed_urls(
     base_url = _select_llm_base_url_for_kind(settings, kind=kind)
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
-
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -1965,9 +1935,13 @@ async def llm_guess_feed_urls(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(
         usage_cb,
@@ -1977,13 +1951,9 @@ async def llm_guess_feed_urls(
         data=data,
     )
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text")
 
     obj = _extract_first_json_object(content)
     if not obj or not isinstance(obj, dict):
@@ -2030,7 +2000,6 @@ async def llm_guess_api_endpoints(
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
 
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -2056,9 +2025,13 @@ async def llm_guess_api_endpoints(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(
         usage_cb,
@@ -2068,13 +2041,9 @@ async def llm_guess_api_endpoints(
         data=data,
     )
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text")
 
     obj = _extract_first_json_object(content)
     if not obj or not isinstance(obj, dict):
@@ -2135,8 +2104,6 @@ async def llm_decide_source_candidates(
     base_url = _select_llm_base_url_for_kind(settings, kind=kind)
     api_key = _select_llm_api_key_for_kind(settings, kind=kind)
     proxy = _select_llm_proxy_for_kind(settings, kind=kind)
-
-    endpoint = _openai_compat_chat_completions_url(base_url)
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -2201,9 +2168,13 @@ async def llm_decide_source_candidates(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _mode = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(
         usage_cb,
@@ -2213,13 +2184,9 @@ async def llm_decide_source_candidates(
         data=data,
     )
 
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError("LLM response missing choices")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not content or not isinstance(content, str):
-        raise RuntimeError("LLM response missing message.content")
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text")
 
     obj = _extract_first_json_object(content)
     if not obj or not isinstance(obj, dict):
