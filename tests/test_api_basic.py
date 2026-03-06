@@ -104,3 +104,45 @@ def test_api_topic_crud_and_admin(tmp_path):
     assert client.get("/management").status_code == 401
     r = client.get("/management?token=secret")
     assert r.status_code == 200
+
+
+def test_discourse_linux_do_source_auto_binds_profile(tmp_path):
+    db_path = Path(tmp_path) / "api.db"
+    settings = Settings(db_url=f"sqlite:///{db_path}", api_token="secret")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    headers = {"x-tracker-token": "secret"}
+    r = client.post(
+        "/topics",
+        headers=headers,
+        json={"name": "Profile", "query": "", "digest_cron": "0 9 * * *", "alert_keywords": ""},
+    )
+    assert r.status_code == 200
+
+    r = client.post(
+        "/sources/discourse",
+        headers=headers,
+        json={"base_url": "https://linux.do", "json_path": "/latest.json"},
+    )
+    assert r.status_code == 200
+    discourse_id = r.json()["id"]
+
+    r = client.get("/bindings", headers=headers)
+    assert r.status_code == 200
+    rows = [b for b in r.json() if b["source_id"] == discourse_id]
+    assert rows == [
+        {
+            "topic": "Profile",
+            "source_id": discourse_id,
+            "source_type": "discourse",
+            "source_url": "https://linux.do/latest.json",
+            "include_keywords": "",
+            "exclude_keywords": "",
+        }
+    ]
+
+    r = client.get("/sources", headers=headers)
+    assert r.status_code == 200
+    src = next(s for s in r.json() if s["id"] == discourse_id)
+    assert src["enabled"] is True

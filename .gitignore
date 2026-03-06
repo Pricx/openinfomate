@@ -22,3 +22,5 @@ tracker.db
 
 .tracker_locks/
 docs/tracker/plan/
+.codex/
+docs/ui/

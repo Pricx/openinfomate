@@ -45,6 +45,71 @@ class SyncSearchSourcesResult:
     rebound: int
 
 
+_AUTO_BIND_PROFILE_HOSTS = {"linux.do"}
+
+
+def _looks_like_profile_autobind_source(url: str) -> bool:
+    try:
+        host = ((urlsplit((url or "").strip()).hostname or "").strip().lower()).rstrip(".")
+    except Exception:
+        host = ""
+    if not host:
+        return False
+    return any(host == domain or host.endswith(f".{domain}") for domain in _AUTO_BIND_PROFILE_HOSTS)
+
+
+def _get_profile_topic(repo: Repo) -> Topic | None:
+    profile_topic_name = (repo.get_app_config("profile_topic_name") or "Profile").strip() or "Profile"
+    return repo.get_topic_by_name(profile_topic_name)
+
+
+def _set_binding_filters(
+    *,
+    session: Session,
+    repo: Repo,
+    topic: Topic,
+    source: Source,
+    include_keywords: str = "",
+    exclude_keywords: str = "",
+) -> TopicSource:
+    ts = repo.bind_topic_source(topic=topic, source=source)
+    changed = False
+    if ts.include_keywords != include_keywords:
+        ts.include_keywords = include_keywords
+        changed = True
+    if ts.exclude_keywords != exclude_keywords:
+        ts.exclude_keywords = exclude_keywords
+        changed = True
+    if changed:
+        session.commit()
+    return ts
+
+
+def _finalize_source_creation(*, session: Session, repo: Repo, source: Source, bind: SourceBindingSpec | None = None) -> Source:
+    explicit_topic: Topic | None = None
+    if bind:
+        explicit_topic = repo.get_topic_by_name(bind.topic)
+        if not explicit_topic:
+            raise ValueError(f"topic not found: {bind.topic}")
+        _set_binding_filters(
+            session=session,
+            repo=repo,
+            topic=explicit_topic,
+            source=source,
+            include_keywords=bind.include_keywords,
+            exclude_keywords=bind.exclude_keywords,
+        )
+
+    if _looks_like_profile_autobind_source(source.url):
+        profile_topic = _get_profile_topic(repo)
+        if profile_topic and (explicit_topic is None or int(explicit_topic.id) != int(profile_topic.id)):
+            _set_binding_filters(session=session, repo=repo, topic=profile_topic, source=source)
+        if not bool(getattr(source, "enabled", True)):
+            source.enabled = True
+            session.commit()
+    return source
+
+
 def sync_topic_search_sources(*, session: Session, topic_name: str) -> SyncSearchSourcesResult:
     """
     Sync bound HN/SearxNG search source queries to match the topic query.
@@ -136,15 +201,7 @@ def upsert_topic_ai_policy(*, session: Session, spec: TopicAiPolicySpec) -> None
 def create_rss_source(*, session: Session, url: str, bind: SourceBindingSpec | None = None) -> Source:
     repo = Repo(session)
     source = repo.add_source(type="rss", url=url)
-    if bind:
-        topic = repo.get_topic_by_name(bind.topic)
-        if not topic:
-            raise ValueError(f"topic not found: {bind.topic}")
-        ts = repo.bind_topic_source(topic=topic, source=source)
-        ts.include_keywords = bind.include_keywords
-        ts.exclude_keywords = bind.exclude_keywords
-        session.commit()
-    return source
+    return _finalize_source_creation(session=session, repo=repo, source=source, bind=bind)
 
 
 def create_rss_sources_bulk(
@@ -221,6 +278,18 @@ def create_rss_sources_bulk(
             session.add(ts)
             bound += 1
 
+    profile_topic = _get_profile_topic(repo)
+    auto_bound = False
+    for s in sources:
+        if not _looks_like_profile_autobind_source(s.url):
+            continue
+        if profile_topic is not None:
+            _set_binding_filters(session=session, repo=repo, topic=profile_topic, source=s)
+            auto_bound = True
+        if not bool(getattr(s, "enabled", True)):
+            s.enabled = True
+            auto_bound = True
+
     if tags is not None or notes is not None:
         for s in sources:
             if s.id is None:
@@ -231,6 +300,8 @@ def create_rss_sources_bulk(
             if notes is not None:
                 meta.notes = notes
 
+    if auto_bound:
+        session.flush()
     session.commit()
     return created, bound
 
@@ -247,15 +318,7 @@ def create_hn_search_source(
     q = normalize_search_query(query)
     url = build_hn_search_url(query=q, tags=tags, hits_per_page=hits_per_page)
     source = repo.add_source(type="hn_search", url=url)
-    if bind:
-        topic = repo.get_topic_by_name(bind.topic)
-        if not topic:
-            raise ValueError(f"topic not found: {bind.topic}")
-        ts = repo.bind_topic_source(topic=topic, source=source)
-        ts.include_keywords = bind.include_keywords
-        ts.exclude_keywords = bind.exclude_keywords
-        session.commit()
-    return source
+    return _finalize_source_creation(session=session, repo=repo, source=source, bind=bind)
 
 
 def create_searxng_search_source(
@@ -280,15 +343,7 @@ def create_searxng_search_source(
         results=results,
     )
     source = repo.add_source(type="searxng_search", url=url)
-    if bind:
-        topic = repo.get_topic_by_name(bind.topic)
-        if not topic:
-            raise ValueError(f"topic not found: {bind.topic}")
-        ts = repo.bind_topic_source(topic=topic, source=source)
-        ts.include_keywords = bind.include_keywords
-        ts.exclude_keywords = bind.exclude_keywords
-        session.commit()
-    return source
+    return _finalize_source_creation(session=session, repo=repo, source=source, bind=bind)
 
 
 def create_discourse_source(
@@ -301,15 +356,7 @@ def create_discourse_source(
     repo = Repo(session)
     url = build_discourse_json_url(base_url=base_url, json_path=json_path)
     source = repo.add_source(type="discourse", url=url)
-    if bind:
-        topic = repo.get_topic_by_name(bind.topic)
-        if not topic:
-            raise ValueError(f"topic not found: {bind.topic}")
-        ts = repo.bind_topic_source(topic=topic, source=source)
-        ts.include_keywords = bind.include_keywords
-        ts.exclude_keywords = bind.exclude_keywords
-        session.commit()
-    return source
+    return _finalize_source_creation(session=session, repo=repo, source=source, bind=bind)
 
 
 def create_llm_models_source(
@@ -328,15 +375,7 @@ def create_llm_models_source(
     if not u:
         raise ValueError("base_url is required")
     source = repo.add_source(type="llm_models", url=u)
-    if bind:
-        topic = repo.get_topic_by_name(bind.topic)
-        if not topic:
-            raise ValueError(f"topic not found: {bind.topic}")
-        ts = repo.bind_topic_source(topic=topic, source=source)
-        ts.include_keywords = bind.include_keywords
-        ts.exclude_keywords = bind.exclude_keywords
-        session.commit()
-    return source
+    return _finalize_source_creation(session=session, repo=repo, source=source, bind=bind)
 
 
 def create_html_list_source(
@@ -358,15 +397,7 @@ def create_html_list_source(
         max_items=max_items,
     )
     source = repo.add_source(type="html_list", url=url)
-    if bind:
-        topic = repo.get_topic_by_name(bind.topic)
-        if not topic:
-            raise ValueError(f"topic not found: {bind.topic}")
-        ts = repo.bind_topic_source(topic=topic, source=source)
-        ts.include_keywords = bind.include_keywords
-        ts.exclude_keywords = bind.exclude_keywords
-        session.commit()
-    return source
+    return _finalize_source_creation(session=session, repo=repo, source=source, bind=bind)
 
 
 def create_binding(
