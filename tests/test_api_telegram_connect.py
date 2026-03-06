@@ -4,6 +4,8 @@ import httpx
 from fastapi.testclient import TestClient
 
 from tracker.api import create_app
+from tracker.db import session_factory
+from tracker.repo import Repo
 from tracker.settings import Settings
 
 
@@ -66,3 +68,32 @@ def test_api_telegram_link_and_poll_connects(tmp_path, monkeypatch):
     # Privacy: once connected, do not allow generating a new connect link without disconnecting.
     resp3 = client.post("/telegram/link", headers=headers, json={})
     assert resp3.status_code == 409
+
+
+
+def test_api_telegram_link_force_rebind_replaces_existing_connection(tmp_path):
+    settings = Settings(
+        db_url=f"sqlite:///{tmp_path}/api-rebind.db",
+        api_token="secret",
+        telegram_bot_token="TEST",
+        telegram_bot_username="TrackerHotBot",
+    )
+    client = TestClient(create_app(settings))
+    headers = {"x-tracker-token": "secret"}
+
+    _engine, make_session = session_factory(settings)
+    with make_session() as session:
+        repo = Repo(session)
+        repo.set_app_config("telegram_chat_id", "123")
+        repo.set_app_config("telegram_connected_notified", "1")
+
+    resp = client.post("/telegram/link", headers=headers, json={"force_rebind": True})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["link"].startswith("https://t.me/")
+
+    _engine, make_session = session_factory(settings)
+    with make_session() as session:
+        repo = Repo(session)
+        assert (repo.get_app_config("telegram_chat_id") or "") == ""
+        assert (repo.get_app_config("telegram_setup_code") or "") == data["code"]

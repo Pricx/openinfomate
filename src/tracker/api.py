@@ -63,8 +63,19 @@ from tracker.llm import llm_plan_tracking_ai_setup, llm_propose_profile_setup, l
 from tracker.llm_usage import estimate_llm_cost_usd, make_llm_usage_recorder
 from tracker.i18n import LANG_COOKIE_NAME, SUPPORTED_LANGS, get_request_lang, normalize_lang, t as translate_text
 from tracker.envfile import parse_env_assignments
+from tracker.web.onboarding import ADVANCED_TOUR_DISMISSED_KEY, build_onboarding_state
 
 logger = logging.getLogger(__name__)
+
+
+def _build_onboarding_context(*, request: Request, repo: Repo, settings: Settings, page_id: str = "") -> dict[str, Any]:
+    token = request.query_params.get("token") if _token_auth_enabled(settings) else None
+    return build_onboarding_state(repo=repo, settings=settings, token=token, page_id=page_id)
+
+
+def _render_onboarding_banner(*, templates: Jinja2Templates, request: Request, onboarding: dict[str, Any], token: str | None, lang: str) -> str:
+    template = templates.get_template("_onboarding_banner.html")
+    return template.render(request=request, onboarding=onboarding, token=token, lang=lang)
 
 
 def _looks_like_loopback_host(host: str) -> bool:
@@ -407,6 +418,7 @@ class TelegramLinkCreate(BaseModel):
     """
 
     bot_username: str | None = None  # optional override; otherwise uses settings/known default
+    force_rebind: bool = False
 
 
 class TelegramPoll(BaseModel):
@@ -1574,7 +1586,12 @@ def create_app(settings: Settings) -> FastAPI:
         from tracker.telegram_connect import telegram_link as telegram_link_core
 
         try:
-            return telegram_link_core(repo=repo, settings=settings, bot_username_override=payload.bot_username)
+            return telegram_link_core(
+                repo=repo,
+                settings=settings,
+                bot_username_override=payload.bot_username,
+                force_rebind=bool(payload.force_rebind),
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -1594,6 +1611,37 @@ def create_app(settings: Settings) -> FastAPI:
         from tracker.telegram_connect import telegram_disconnect as telegram_disconnect_core
 
         return telegram_disconnect_core(repo=repo, settings=settings)
+
+    @app.get(
+        "/admin/onboarding/status",
+        response_class=JSONResponse,
+        dependencies=[Depends(auth_dep)],
+        include_in_schema=False,
+    )
+    def admin_onboarding_status(request: Request, session: Session = Depends(get_db)):
+        repo = Repo(session)
+        token = request.query_params.get("token") if _token_auth_enabled(settings) else None
+        lang = get_request_lang(request)
+        _seed_locale_defaults(repo=repo, request_lang=lang)
+        onboarding = _build_onboarding_context(request=request, repo=repo, settings=settings, page_id="admin")
+        html = _render_onboarding_banner(templates=templates, request=request, onboarding=onboarding, token=token, lang=lang)
+        return {"ok": True, "state": onboarding, "html": html}
+
+    @app.post(
+        "/admin/onboarding/dismiss-advanced-tour",
+        response_class=JSONResponse,
+        dependencies=[Depends(auth_dep)],
+        include_in_schema=False,
+    )
+    def admin_onboarding_dismiss_advanced_tour(request: Request, session: Session = Depends(get_db)):
+        repo = Repo(session)
+        repo.set_app_config(ADVANCED_TOUR_DISMISSED_KEY, "true")
+        token = request.query_params.get("token") if _token_auth_enabled(settings) else None
+        lang = get_request_lang(request)
+        _seed_locale_defaults(repo=repo, request_lang=lang)
+        onboarding = _build_onboarding_context(request=request, repo=repo, settings=settings, page_id="admin")
+        html = _render_onboarding_banner(templates=templates, request=request, onboarding=onboarding, token=token, lang=lang)
+        return {"ok": True, "state": onboarding, "html": html}
 
     # --- Admin (HTML)
     @app.get("/admin", response_class=HTMLResponse, dependencies=[Depends(auth_dep)])
@@ -2059,6 +2107,12 @@ def create_app(settings: Settings) -> FastAPI:
                     "llm_test_mini_fingerprint_current": llm_test_mini_fingerprint_current,
                     "llm_test_mini_ok": bool(llm_test_mini_ok),
                 },
+                "onboarding": _build_onboarding_context(
+                    request=request,
+                    repo=repo,
+                    settings=settings,
+                    page_id=f"admin:{section or 'overview'}",
+                ),
             },
             headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
         )
@@ -4761,6 +4815,7 @@ def create_app(settings: Settings) -> FastAPI:
                 "msg": msg,
                 "doctor_report": doctor_report,
                 "settings_snapshot": settings_snapshot,
+                "onboarding": _build_onboarding_context(request=request, repo=repo, settings=settings, page_id="setup_wizard"),
             },
         )
 
@@ -4851,6 +4906,7 @@ def create_app(settings: Settings) -> FastAPI:
                 "lang": lang,
                 "msg": msg,
                 "doctor_report": doctor_report,
+                "onboarding": _build_onboarding_context(request=request, repo=repo, settings=settings, page_id="setup_topic"),
                 # Prompt presets (static + operator-defined).
                 "topic_policy_presets": _merge_prompt_presets(
                     [asdict(p) for p in get_topic_policy_presets()],
@@ -4922,6 +4978,7 @@ def create_app(settings: Settings) -> FastAPI:
                 "lang": lang,
                 "msg": msg,
                 "doctor_report": doctor_report,
+                "onboarding": _build_onboarding_context(request=request, repo=repo, settings=settings, page_id="setup_profile"),
                 "profile_topic_name": profile_topic_name,
                 "profile_text": profile_text,
                 "profile_understanding": profile_understanding,

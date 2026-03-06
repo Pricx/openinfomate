@@ -90,6 +90,10 @@ class Settings(BaseSettings):
     # UI language is cookie-based; this is the server-side default used by background jobs.
     # Supported: en | zh
     output_language: str = "zh"
+    # Web UI appearance.
+    # When enabled, the admin/setup pages follow the browser/system light-dark scheme automatically.
+    # Manual theme toggle from the top bar will disable follow-system until re-enabled in Config Center.
+    ui_theme_follow_system: bool = True
 
     # Prompt templates (operator-configurable; DB-backed via dynamic config, optionally synced to `.env`).
     #

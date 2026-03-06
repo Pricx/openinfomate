@@ -21,6 +21,7 @@ def test_admin_settings_patch_updates_env_and_db(tmp_path):
         data={
             "output_language": "en",
             "cron_timezone": "Asia/Shanghai",
+            "ui_theme_follow_system": "false",
             # Default is True; set False to validate env+DB persistence.
             "llm_curation_enabled": "false",
         },
@@ -31,6 +32,7 @@ def test_admin_settings_patch_updates_env_and_db(tmp_path):
     text = env_path.read_text(encoding="utf-8")
     assert 'TRACKER_OUTPUT_LANGUAGE="en"' in text
     assert 'TRACKER_CRON_TIMEZONE="Asia/Shanghai"' in text
+    assert 'TRACKER_UI_THEME_FOLLOW_SYSTEM="false"' in text
     assert 'TRACKER_LLM_CURATION_ENABLED="false"' in text
 
     # Non-secret fields are also stored in DB app_config for dynamic overrides.
@@ -41,6 +43,7 @@ def test_admin_settings_patch_updates_env_and_db(tmp_path):
         repo = Repo(session)
         assert repo.get_app_config("output_language") == "en"
         assert repo.get_app_config("cron_timezone") == "Asia/Shanghai"
+        assert repo.get_app_config("ui_theme_follow_system") == "false"
         assert repo.get_app_config("llm_curation_enabled") == "false"
 
 

@@ -1,0 +1,55 @@
+{% if onboarding and onboarding.show_install_guide %}
+  {% set current_step = onboarding.current_step_id or "" %}
+  <div class="guide-banner guide-banner-install" data-onboarding-signature="{{ onboarding.signature }}" data-current-step="{{ current_step }}">
+    <div class="guide-banner-head">
+      <div>
+        <div class="guide-kicker">{{ t("Install Guide") }}</div>
+        <div class="guide-title">{{ t("Finish the required setup in order: Access → LLM → Profile + AI Setup → Push.") }}</div>
+      </div>
+      <div class="actions" style="justify-content:flex-end">
+        <a class="btn-primary" href="{{ onboarding.current_step_url }}">{{ t("Continue current step") }}</a>
+        <a class="btn-ghost" href="{{ onboarding.wizard_url }}">{{ t("Back to Setup Wizard") }}</a>
+      </div>
+    </div>
+    <div class="guide-step-row" style="margin-top:10px">
+      {% for step in onboarding.steps %}
+        <a class="badge {{ 'ok' if step.ok else 'warn' }}" href="{{ step.url }}">{{ loop.index }}. {% if step.id == 'access' %}{{ t("Access Control") }}{% elif step.id == 'llm' %}{{ t("LLM Providers") }}{% elif step.id == 'profile_ai' %}{{ t("Profile + AI Setup") }}{% elif step.id == 'push' %}{{ t("Push Center") }}{% endif %} · {{ t("status") }}={{ 'ok' if step.ok else 'missing' }}</a>
+      {% endfor %}
+    </div>
+    <div class="guide-detail" style="margin-top:12px">
+      {% if current_step == 'access' %}
+        <b>{{ t("Current step: Access Control") }}</b>
+        <div class="muted" style="margin-top:4px">{{ t("Set a Web Admin Basic username + password in Config → Access. This step is only complete when both fields are set.") }}</div>
+      {% elif current_step == 'llm' %}
+        <b>{{ t("Current step: LLM Providers") }}</b>
+        <div class="muted" style="margin-top:4px">{{ t("Fill in the reasoning provider first. If you configure a mini model, both reasoning and mini tests must pass before this step turns green.") }}</div>
+      {% elif current_step == 'profile_ai' %}
+        <b>{{ t("Current step: Profile + AI Setup") }}</b>
+        {% if not onboarding.profile_configured %}
+          <div class="muted" style="margin-top:4px">{{ t("Go to Profile Setup, paste your interests/bookmarks/notes, click AI Suggest, then save the profile.") }}</div>
+        {% elif not onboarding.ai_setup_applied %}
+          <div class="muted" style="margin-top:4px">{{ t("Your profile is saved. Next, open AI Setup, generate a plan, review it, and click Apply. This step is only complete after Apply succeeds.") }}</div>
+        {% endif %}
+      {% elif current_step == 'push' %}
+        <b>{{ t("Current step: Push Center") }}</b>
+        <div class="muted" style="margin-top:4px">{{ t("Open Push Center, paste a valid Telegram bot token, finish the Telegram binding link, or configure another push channel that can actually send messages.") }}</div>
+      {% endif %}
+    </div>
+  </div>
+{% elif onboarding and onboarding.show_advanced_tour %}
+  <div class="guide-banner guide-banner-advanced" data-onboarding-signature="{{ onboarding.signature }}" data-current-step="done">
+    <div class="guide-banner-head">
+      <div>
+        <div class="guide-kicker">{{ t("Advanced Setup Tour") }}</div>
+        <div class="guide-title">{{ t("Enter Advanced Setup Tour (Topics / Sources / Bindings)") }}</div>
+        <div class="muted" style="margin-top:4px">{{ t("Installation is complete. Continue with fine-grained review of topics, sources, and bindings. Close this guide once you no longer need it.") }}</div>
+      </div>
+      <div class="actions" style="justify-content:flex-end">
+        <a class="btn-ghost" href="{{ onboarding.topics_url }}">{{ t("Topics") }}</a>
+        <a class="btn-ghost" href="{{ onboarding.sources_url }}">{{ t("Sources") }}</a>
+        <a class="btn-ghost" href="{{ onboarding.bindings_url }}">{{ t("Bindings") }}</a>
+        <button type="button" class="btn-ghost" onclick="trackerDismissAdvancedTour()">{{ t("Close guide permanently") }}</button>
+      </div>
+    </div>
+  </div>
+{% endif %}

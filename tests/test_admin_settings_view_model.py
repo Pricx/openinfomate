@@ -41,3 +41,6 @@ def test_build_settings_view_source_and_secret_set(tmp_path):
         assert views["llm_api_key"]["secret"] is True
         assert views["llm_api_key"]["source"] == "env"
         assert views["llm_api_key"]["secret_is_set"] is True
+
+        assert views["ui_theme_follow_system"]["current_value"] is True
+        assert views["ui_theme_follow_system"]["current_value_str"] == "True"

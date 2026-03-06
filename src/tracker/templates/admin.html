@@ -58,7 +58,7 @@
 
     <div style="flex: 1 1 720px; min-width: 360px">
       <div class="row">
-        {% if doctor_report and section in ['overview', 'push', 'all'] %}
+        {% if doctor_report and section in ['overview', 'all'] %}
           <div class="card wide">
             <h2>{{ t("Doctor") }}</h2>
             <div class="muted">
@@ -915,6 +915,15 @@ TRACKER_EMAIL_TO=...{% endif %}
               <div class="muted">
                 {{ t("Connect a Telegram chat by clicking a /start link, then press Check Connection.") }}
               </div>
+              <details style="margin-top:10px">
+                <summary class="muted">{{ t("Telegram Bot quick tutorial") }}</summary>
+                <ol class="muted" style="margin:10px 0 0 18px; padding:0; line-height:1.7">
+                  <li>{{ t("Open Telegram → search @BotFather → send /newbot.") }}</li>
+                  <li>{{ t("Follow BotFather to set a bot name and username, then copy the token it returns.") }}</li>
+                  <li>{{ t("Paste the token here and click Save + Connect. OpenInfoMate will auto-test it and generate a binding link.") }}</li>
+                  <li>{{ t("After the dialog appears, you must click the Telegram link and press /start in Telegram to finish binding.") }}</li>
+                </ol>
+              </details>
 
               <div class="muted" style="margin-top:10px">{{ t("Bot token") }} ({{ t("required") }})</div>
               <div class="row" style="margin-top:6px; gap:10px; align-items:flex-end; flex-wrap:wrap">
@@ -946,6 +955,21 @@ TRACKER_EMAIL_TO=...{% endif %}
               </div>
               <div class="muted" id="telegramStatus" style="margin-top:6px"></div>
             </div>
+
+            <dialog id="dlgTelegramConnectReady" class="modal">
+              <div class="dialog-head">
+                <h3>{{ t("Finish Telegram binding") }}</h3>
+                <button type="button" class="btn-ghost" onclick="trackerCloseDialog('dlgTelegramConnectReady')">{{ t("Close") }}</button>
+              </div>
+              <div class="muted">{{ t("Telegram bot verified. Click the link below in Telegram to finish binding, then return here and press Check Connection.") }}</div>
+              <div style="margin-top:12px; word-break:break-all">
+                <a id="telegramConnectLinkAnchor" href="#" target="_blank" rel="noopener noreferrer"></a>
+              </div>
+              <div class="actions" style="margin-top:14px">
+                <button type="button" class="btn-primary" onclick="var a=document.getElementById('telegramConnectLinkAnchor'); if (a) a.click();">{{ t("Open Telegram link") }}</button>
+                <button type="button" onclick="trackerCloseDialog('dlgTelegramConnectReady')">{{ t("Close") }}</button>
+              </div>
+            </dialog>
           </div>
 
           <div class="card wide">
@@ -1103,6 +1127,8 @@ TRACKER_EMAIL_TO=...{% endif %}
                      data-cfg-env="{{ (v.env_key or '')|e }}"
                      data-cfg-kind="{{ kind }}"
                      data-cfg-secret="{{ '1' if secret else '0' }}"
+                     data-cfg-autosave-secret="{{ '1' if v.autosave_secret else '0' }}"
+                     data-cfg-secret-set="{{ '1' if v.secret_is_set else '0' }}"
                      data-cfg-initial="{{ initial|e }}"
                      data-cfg-restart="{{ '1' if v.restart_required else '0' }}">
                   <div class="cfg-left">
@@ -1113,7 +1139,7 @@ TRACKER_EMAIL_TO=...{% endif %}
                         <span class="badge warn">{{ t('restart required') }}</span>
                       {% endif %}
                       {% if secret %}
-                        <span class="badge {{ 'ok' if v.secret_is_set else 'warn' }}">{{ t('secret') }}={{ 'set' if v.secret_is_set else 'unset' }}</span>
+                        <span data-cfg-secret-badge-for="{{ field }}" class="badge {{ 'ok' if v.secret_is_set else 'warn' }}">{{ t('secret') }}={{ 'set' if v.secret_is_set else 'unset' }}</span>
                       {% endif %}
                     </div>
                     {% if f.description %}
@@ -1122,7 +1148,7 @@ TRACKER_EMAIL_TO=...{% endif %}
                     <div class="cfg-mini" style="margin-top:6px">
                       {{ t('Current') }}:
                       {% if secret %}
-                        <code>{{ 'set' if v.secret_is_set else 'unset' }}</code>
+                        <code data-cfg-secret-current-for="{{ field }}">{{ 'set' if v.secret_is_set else 'unset' }}</code>
                       {% else %}
                         <code>{{ (v.current_value_str or '-')|e }}</code>
                       {% endif %}
@@ -1252,7 +1278,7 @@ TRACKER_EMAIL_TO=...{% endif %}
 			                      <span class="badge {{ 'ok' if doctor_report and doctor_report.push_email_configured else 'warn' }}">{{ t('Email') }}</span>
 			                    </div>
                     <div class="muted" style="margin-top:8px">{{ t('Recommended order: Access → LLM Providers → Profile → Push → Message scheduling.') }}</div>
-                    <div class="muted" style="margin-top:8px">{{ t('Tip: secrets show a diff preview before saving. Hot fields are autosaved.') }}</div>
+                    <div class="muted" style="margin-top:8px">{{ t('Tip: LLM API keys autosave and immediately retrigger connectivity tests; other secrets still show a diff preview before saving.') }}</div>
                     <div class="actions" style="margin-top:10px; flex-wrap:wrap">
                       <button type="button" onclick="trackerTestLlm('reasoning')">{{ t('Test Reasoning LLM') }}</button>
                       <button type="button" onclick="trackerTestLlm('mini')">{{ t('Test Mini LLM') }}</button>
@@ -2004,6 +2030,7 @@ TRACKER_EMAIL_TO=...{% endif %}
 
         trackerShowToast('{{ t("Saved") }}', 'success', '{{ t("AI Setup") }}');
         try { await trackerAiSetupRefreshCandidates(); } catch (e) {}
+        try { await trackerOnboardingRefresh({ notify: true }); } catch (e2) {}
       } catch (e) {
         if (statusEl) statusEl.textContent = '{{ t("Autosave failed:") }} ' + String(e || '');
         trackerShowToast(String(e || 'error'), 'error', '{{ t("AI Setup") }}', 5200);
@@ -2320,11 +2347,10 @@ TRACKER_EMAIL_TO=...{% endif %}
     function trackerAiSetupHasUnappliedPlan() {
       try {
         const runIdEl = document.getElementById('aiSetupRunId');
-        const applyBtn = document.getElementById('aiSetupApplyBtn');
         const rid = parseInt(String(runIdEl ? (runIdEl.value || '') : ''), 10) || 0;
         if (!(rid > 0)) return false;
-        // Apply enabled implies status=planned.
-        return !!(applyBtn && !applyBtn.disabled);
+        const pending = parseInt(String(localStorage.getItem('tracker_ai_setup_unapplied_run_id') || ''), 10) || 0;
+        return pending > 0 && pending === rid;
       } catch (e) {
         return false;
       }
@@ -2717,6 +2743,7 @@ TRACKER_EMAIL_TO=...{% endif %}
         }
         const msg = (data && (data.message || data.detail)) ? String(data.message || data.detail) : '{{ t("Saved") }}';
         trackerShowToast(msg, 'success', 'LLM');
+        try { await trackerOnboardingRefresh({ notify: true }); } catch (e2) {}
       } catch (e) {
         trackerShowToast(String(e || 'error'), 'error', 'LLM');
       }
@@ -2821,6 +2848,7 @@ TRACKER_EMAIL_TO=...{% endif %}
           const out = await resp.json().catch(() => null);
           if (resp.ok && out && out.status === 'connected') {
             trackerShowToast('{{ t("Telegram connected") }}', 'success', '{{ t("Telegram") }}');
+            try { await trackerOnboardingRefresh({ notify: true }); } catch (e4) {}
             trackerTelegramStopAutoPoll();
           }
         } catch (e) {}
@@ -2854,35 +2882,54 @@ TRACKER_EMAIL_TO=...{% endif %}
       }
     }
 
+    function trackerTelegramShowConnectDialog(link) {
+      const href = String(link || '').trim();
+      if (!href) return;
+      const input = document.getElementById('telegramLink');
+      if (input) input.value = href;
+      const anchor = document.getElementById('telegramConnectLinkAnchor');
+      if (anchor) {
+        anchor.href = href;
+        anchor.textContent = href;
+      }
+      trackerOpenDialog('dlgTelegramConnectReady');
+    }
+
     async function trackerTelegramSaveTokenAndConnect() {
       const tok = trackerTelegramVal('f_telegram_token');
       if (!tok) {
         trackerShowToast('{{ t("Missing") }}: TRACKER_TELEGRAM_BOT_TOKEN', 'warning', '{{ t("Telegram") }}');
         return;
       }
-      const ok = confirm('{{ t("Save") }} TRACKER_TELEGRAM_BOT_TOKEN?\\n\\n- {{ t("Secrets are never echoed back.") }}');
-      if (!ok) return;
       try {
+        const statusEl = document.getElementById('telegramTokenStatus');
+        if (statusEl) statusEl.textContent = '{{ t("Saving…") }}';
         await _trackerPostForm('/admin/settings/patch', { telegram_bot_token: tok });
         trackerShowToast('{{ t("Saved") }}', 'success', '{{ t("Telegram") }}');
         await trackerTelegramRefreshStatus();
-        await trackerTelegramTestBotToken();
-        await trackerTelegramGenerateLink();
+        const tested = await trackerTelegramTestBotToken();
+        if (!tested) return;
+        await trackerTelegramGenerateLink(true);
+        try { await trackerOnboardingRefresh({ notify: true }); } catch (e2) {}
       } catch (e) {
         trackerShowToast(String(e || 'error'), 'error', '{{ t("Telegram") }}', 5200);
       }
     }
 
-    async function trackerTelegramGenerateLink() {
+    async function trackerTelegramGenerateLink(forceRebind) {
       try {
         const botUsername = trackerTelegramVal('f_telegram_username');
-        const data = await _trackerPostJson('/telegram/link', { bot_username: botUsername || null });
+        const data = await _trackerPostJson('/telegram/link', { bot_username: botUsername || null, force_rebind: !!forceRebind });
+        const link = (data && data.link) ? String(data.link) : '';
         const linkEl = document.getElementById('telegramLink');
-        if (linkEl && data && data.link) linkEl.value = String(data.link);
+        if (linkEl && link) linkEl.value = link;
+        if (link) trackerTelegramShowConnectDialog(link);
         trackerShowToast('{{ t("Telegram connect link generated.") }}', 'success', '{{ t("Telegram") }}');
         await trackerTelegramMaybeAutoPoll();
+        return data;
       } catch (e) {
         trackerShowToast(String(e || 'error'), 'error', '{{ t("Telegram") }}');
+        return null;
       }
     }
 
@@ -2898,6 +2945,7 @@ TRACKER_EMAIL_TO=...{% endif %}
           trackerShowToast('{{ t("Not connected yet. Click the link and press Check again.") }}', 'warning', '{{ t("Telegram") }}');
         }
         await trackerTelegramRefreshStatus();
+        try { await trackerOnboardingRefresh({ notify: true }); } catch (e2) {}
       } catch (e) {
         trackerShowToast(String(e || 'error'), 'error', '{{ t("Telegram") }}');
       }
@@ -2908,6 +2956,7 @@ TRACKER_EMAIL_TO=...{% endif %}
         await _trackerPostForm('/telegram/disconnect', {});
         trackerShowToast('{{ t("Telegram disconnected.") }}', 'success', '{{ t("Telegram") }}');
         await trackerTelegramRefreshStatus();
+        try { await trackerOnboardingRefresh({ notify: true }); } catch (e2) {}
       } catch (e) {
         trackerShowToast(String(e || 'error'), 'error', '{{ t("Telegram") }}');
       }
@@ -3084,10 +3133,18 @@ TRACKER_EMAIL_TO=...{% endif %}
       return _trackerCfgRowValue(row) !== String(row.dataset.cfgInitial || '');
     }
 
+	    function _trackerCfgRowIsAutosaveSecret(row) {
+	      try {
+	        return (row.dataset.cfgAutosaveSecret || '') === '1';
+	      } catch (e) {
+	        return false;
+	      }
+	    }
+
 	    function _trackerCfgRowIsHot(row) {
 	      try {
 	        const secret = (row.dataset.cfgSecret || '') === '1';
-	        return _trackerEnvWriteAllowed && (!secret);
+	        return _trackerEnvWriteAllowed && (!secret || _trackerCfgRowIsAutosaveSecret(row));
 	      } catch (e) {
 	        return false;
 	      }
@@ -3143,8 +3200,8 @@ TRACKER_EMAIL_TO=...{% endif %}
 	      try {
 	        const f = String(field || '').trim();
 	        if (!f) return;
-	        const reasonFields = new Set(['llm_base_url', 'llm_model', 'llm_model_reasoning', 'llm_extra_body_json']);
-	        const miniFields = new Set(['llm_mini_base_url', 'llm_model_mini', 'llm_mini_extra_body_json']);
+	        const reasonFields = new Set(['llm_base_url', 'llm_model', 'llm_model_reasoning', 'llm_extra_body_json', 'llm_api_key', 'llm_proxy']);
+	        const miniFields = new Set(['llm_mini_base_url', 'llm_model_mini', 'llm_mini_extra_body_json', 'llm_mini_api_key', 'llm_mini_proxy']);
 	        if (reasonFields.has(f)) {
 	          _trackerScheduleLlmTest('reasoning');
 	        } else if (miniFields.has(f)) {
@@ -3152,6 +3209,16 @@ TRACKER_EMAIL_TO=...{% endif %}
 	        }
 	      } catch (e) {}
 	    }
+
+    function _trackerMaybeApplyThemeSettingAfterSave(field, row) {
+      try {
+        const f = String(field || '').trim();
+        if (f !== 'ui_theme_follow_system') return;
+        if (typeof window.trackerSetThemeFollowSystem !== 'function') return;
+        const enabled = _trackerCfgRowValue(row) === 'true';
+        window.trackerSetThemeFollowSystem(enabled, { persist: false });
+      } catch (e) {}
+    }
 
 	    function trackerAutoTestLlmIfNeeded() {
 	      try {
@@ -3187,11 +3254,29 @@ TRACKER_EMAIL_TO=...{% endif %}
 	    function _trackerCfgRowIsCold(row) {
 	      try {
 	        const secret = (row.dataset.cfgSecret || '') === '1';
-	        return secret;
+	        return secret && !_trackerCfgRowIsAutosaveSecret(row);
 	      } catch (e) {
 	        return false;
 	      }
 	    }
+
+    function _trackerCfgSetSecretDisplay(row, isSet) {
+      try {
+        if (!row) return;
+        const field = row.dataset.cfgField || '';
+        if (!field) return;
+        const yes = !!isSet;
+        row.dataset.cfgSecretSet = yes ? '1' : '0';
+        const badge = row.querySelector('[data-cfg-secret-badge-for="' + field + '"]');
+        if (badge) {
+          badge.textContent = '{{ t("secret") }}=' + (yes ? 'set' : 'unset');
+          badge.classList.remove('ok', 'warn');
+          badge.classList.add(yes ? 'ok' : 'warn');
+        }
+        const current = row.querySelector('[data-cfg-secret-current-for="' + field + '"]');
+        if (current) current.textContent = yes ? 'set' : 'unset';
+      } catch (e) {}
+    }
 
     function _trackerCfgSetRowStatus(row, text) {
       try {
@@ -3274,11 +3359,23 @@ TRACKER_EMAIL_TO=...{% endif %}
 	        }
 
 		        // Commit the new baseline so the row becomes clean.
-		        row.dataset.cfgInitial = _trackerCfgRowValue(row);
+		        const secret = (row.dataset.cfgSecret || '') === '1';
+		        const autosaveSecret = _trackerCfgRowIsAutosaveSecret(row);
+		        const savedValue = _trackerCfgRowValue(row);
+		        if (secret && autosaveSecret) {
+		          const inp = row.querySelector('[data-cfg-input="' + field + '"]');
+		          if (inp) inp.value = '';
+		          row.dataset.cfgInitial = '';
+		          _trackerCfgSetSecretDisplay(row, String(savedValue || '').trim() !== '');
+		        } else {
+		          row.dataset.cfgInitial = _trackerCfgRowValue(row);
+		        }
 		        _trackerCfgMarkRow(row);
 		        const restart = (row.dataset.cfgRestart || '') === '1';
 		        _trackerCfgSetRowStatus(row, restart ? ('{{ t("Saved") }} · {{ t("restart required") }}') : '{{ t("Saved") }}');
 		        _trackerMaybeAutoTestLlmAfterSave(field);
+		        _trackerMaybeApplyThemeSettingAfterSave(field, row);
+		        try { await trackerOnboardingRefresh({ notify: true }); } catch (e2) {}
 		        return true;
 	      } catch (e) {
 	        _trackerCfgSetRowStatus(row, '{{ t("Autosave failed:") }} ' + String(e || ''));

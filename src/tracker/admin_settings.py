@@ -40,6 +40,7 @@ class SettingFieldDef:
     kind: InputKind = "text"
     options: list[tuple[str, str]] | None = None  # for select: (value, label)
     advanced: bool = False
+    autosave_secret: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,6 +59,7 @@ class SettingFieldView:
     current_value: Any
     current_value_str: str
     secret_is_set: bool
+    autosave_secret: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,6 +116,12 @@ def default_settings_sections(*, settings: Settings | None = None) -> list[Setti
                     label="cron_timezone",
                     description="Timezone used to interpret cron schedules (UTC offset like +8, or an IANA name).",
                     example="+8",
+                ),
+                SettingFieldDef(
+                    field="ui_theme_follow_system",
+                    label="Follow system theme",
+                    description="Automatically switch light/dark theme to match your browser or system appearance. If you toggle Theme manually from the top bar, this setting will be turned off until you enable it again here.",
+                    kind="toggle",
                 ),
             ],
         ),
@@ -265,7 +273,7 @@ def default_settings_sections(*, settings: Settings | None = None) -> list[Setti
                 SettingFieldDef(
                     field="llm_base_url",
                     label="Primary base URL",
-                    description="OpenAI-compatible base URL for the primary model/provider.",
+                    description="OpenAI-compatible base URL for the primary model/provider. `/v1` is optional: keep it if your provider gives it, or omit it and OpenInfoMate will add it automatically.",
                     example="http://127.0.0.1:8317/v1",
                 ),
                 SettingFieldDef(
@@ -274,7 +282,7 @@ def default_settings_sections(*, settings: Settings | None = None) -> list[Setti
                     description="Model name used for profile/topic planning and selection/curation.",
                     example="gpt-5.2",
                 ),
-                SettingFieldDef(field="llm_api_key", label="Primary API key", description="API key for the primary model/provider.", kind="password"),
+                SettingFieldDef(field="llm_api_key", label="Primary API key", description="API key for the primary model/provider.", kind="password", autosave_secret=True),
                 SettingFieldDef(
                     field="llm_extra_body_json",
                     label="Primary extra request body (optional)",
@@ -294,7 +302,7 @@ def default_settings_sections(*, settings: Settings | None = None) -> list[Setti
                     description="Aux model name used for triage/compression tasks. If unset, falls back to the primary model.",
                     example="gpt-5.1-mini",
                 ),
-                SettingFieldDef(field="llm_mini_api_key", label="Aux API key (optional)", description="API key for the aux model/provider (if set).", kind="password"),
+                SettingFieldDef(field="llm_mini_api_key", label="Aux API key (optional)", description="API key for the aux model/provider (if set).", kind="password", autosave_secret=True),
                 SettingFieldDef(
                     field="llm_mini_extra_body_json",
                     label="Aux extra request body (optional)",
@@ -383,7 +391,6 @@ def default_settings_sections(*, settings: Settings | None = None) -> list[Setti
                 SettingFieldDef(field="dingtalk_webhook_url", label="Webhook URL", description="DingTalk robot webhook URL.", kind="password"),
                 SettingFieldDef(field="dingtalk_secret", label="Secret", description="DingTalk sign secret (SEC...).", kind="password"),
                 SettingFieldDef(field="push_telegram_enabled", label="Telegram", description="Enable Telegram push.", kind="toggle"),
-                SettingFieldDef(field="telegram_bot_token", label="Bot token", description="Telegram bot token.", kind="password"),
                 SettingFieldDef(field="telegram_bot_username", label="Bot username", description="Optional @bot username (for /start links).", advanced=True),
                 SettingFieldDef(field="telegram_disable_preview", label="Disable link preview", description="Disable Telegram link previews.", kind="toggle", advanced=True),
                 SettingFieldDef(
@@ -520,6 +527,7 @@ def build_settings_view(
         desc = ""
         ex = ""
         options: list[tuple[str, str]] | None = None
+        autosave_secret = False
 
         # If the field is part of curated registry, use its richer metadata.
         for sec in sections:
@@ -531,6 +539,7 @@ def build_settings_view(
                 ex = f.example or ""
                 kind = f.kind
                 options = f.options
+                autosave_secret = bool(f.autosave_secret)
 
         env_key = env_key_for_field(field)
         secret = field in _ENV_ONLY_FIELDS or kind == "password"
@@ -586,6 +595,7 @@ def build_settings_view(
             current_value=current_value,
             current_value_str=current_value_str,
             secret_is_set=secret_is_set,
+            autosave_secret=bool(autosave_secret),
         )
 
     return {

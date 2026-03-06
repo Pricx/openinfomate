@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="{{ lang or 'en' }}">
+<html lang="{{ lang or 'en' }}" data-theme-follow-system="{{ '1' if (onboarding and onboarding.theme_follow_system) else '0' }}">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -69,6 +69,48 @@
       .brand { font-weight: 700; letter-spacing: 0.2px; }
       .brand a { color: var(--text); text-decoration: none; }
       .top-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      .guide-shell { margin: 14px 0 16px; }
+      .guide-banner {
+        border: 1px solid var(--card-border);
+        border-radius: 16px;
+        background: linear-gradient(135deg, rgba(37, 99, 235, 0.12), rgba(99, 102, 241, 0.08));
+        box-shadow: var(--shadow);
+        padding: 14px 16px;
+      }
+      .guide-banner-advanced {
+        background: linear-gradient(135deg, rgba(22, 163, 74, 0.14), rgba(37, 99, 235, 0.08));
+      }
+      .guide-banner-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 14px;
+        align-items: flex-start;
+        flex-wrap: wrap;
+      }
+      .guide-kicker {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--primary);
+        font-weight: 700;
+      }
+      .guide-title {
+        margin-top: 4px;
+        font-size: 15px;
+        font-weight: 700;
+      }
+      .guide-step-row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .guide-step-row .badge {
+        text-decoration: none;
+      }
+      .guide-detail {
+        border-top: 1px solid rgba(148, 163, 184, 0.22);
+        padding-top: 10px;
+      }
 
       h1 { margin: 6px 0 14px; font-size: 22px; }
       h2 { margin: 0 0 10px; font-size: 16px; }
@@ -220,8 +262,16 @@
     <script>
       (function() {
         try {
-          const pref = localStorage.getItem('tracker_theme');
-          if (pref === 'dark') document.documentElement.classList.add('dark');
+          const root = document.documentElement;
+          const prefersDark = () => !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          const followSystem = String(root.getAttribute('data-theme-follow-system') || '0') === '1';
+          window._trackerThemeFollowSystem = followSystem;
+          let theme = prefersDark() ? 'dark' : 'light';
+          if (!followSystem) {
+            const pref = String(localStorage.getItem('tracker_theme') || '').trim();
+            if (pref === 'dark' || pref === 'light') theme = pref;
+          }
+          root.classList.toggle('dark', theme === 'dark');
         } catch (e) {}
       })();
     </script>
@@ -250,6 +300,7 @@
       </div>
     </div>
     <div class="container">
+      <div id="trackerOnboardingMount" class="guide-shell">{% include "_onboarding_banner.html" %}</div>
       {% block content %}{% endblock %}
     </div>
 
@@ -280,11 +331,78 @@
 
     <div id="toast-container" aria-live="polite"></div>
     <script>
-      function trackerToggleTheme() {
-        const el = document.documentElement;
-        const isDark = el.classList.toggle('dark');
-        try { localStorage.setItem('tracker_theme', isDark ? 'dark' : 'light'); } catch (e) {}
+      function trackerSystemPrefersDark() {
+        try {
+          return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        } catch (e) {
+          return false;
+        }
       }
+
+      function trackerApplyTheme(theme) {
+        try {
+          const next = String(theme || '').trim().toLowerCase() === 'dark' ? 'dark' : 'light';
+          document.documentElement.classList.toggle('dark', next === 'dark');
+          return next;
+        } catch (e) {
+          return 'light';
+        }
+      }
+
+      async function trackerPersistThemeFollowSystem(enabled) {
+        try {
+          const url = '/admin/settings/patch{{ ("?token=" ~ token) if token else "" }}';
+          const fd = new FormData();
+          fd.append('ui_theme_follow_system', enabled ? 'true' : 'false');
+          await fetch(url, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'accept': 'application/json' },
+            body: fd,
+          });
+        } catch (e) {}
+      }
+
+      function trackerSetThemeFollowSystem(enabled, opts) {
+        const options = opts || {};
+        const follow = !!enabled;
+        window._trackerThemeFollowSystem = follow;
+        try { document.documentElement.setAttribute('data-theme-follow-system', follow ? '1' : '0'); } catch (e) {}
+        if (follow) {
+          try { localStorage.removeItem('tracker_theme'); } catch (e) {}
+          trackerApplyTheme(trackerSystemPrefersDark() ? 'dark' : 'light');
+        } else {
+          const current = document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+          try { localStorage.setItem('tracker_theme', current); } catch (e) {}
+        }
+        if (options.persist !== false) {
+          trackerPersistThemeFollowSystem(follow).catch(() => {});
+        }
+      }
+
+      function trackerToggleTheme() {
+        const next = document.documentElement.classList.contains('dark') ? 'light' : 'dark';
+        if (window._trackerThemeFollowSystem) {
+          trackerSetThemeFollowSystem(false);
+        }
+        const applied = trackerApplyTheme(next);
+        try { localStorage.setItem('tracker_theme', applied); } catch (e) {}
+      }
+
+      (function trackerInitThemeWatch() {
+        try {
+          if (!window.matchMedia) return;
+          const media = window.matchMedia('(prefers-color-scheme: dark)');
+          const handler = function(ev) {
+            try {
+              if (!window._trackerThemeFollowSystem) return;
+              trackerApplyTheme(ev && ev.matches ? 'dark' : 'light');
+            } catch (e2) {}
+          };
+          if (media.addEventListener) media.addEventListener('change', handler);
+          else if (media.addListener) media.addListener(handler);
+        } catch (e) {}
+      })();
 
       function trackerShowToast(message, type, title, durationMs) {
         const container = document.getElementById('toast-container');
@@ -420,6 +538,96 @@
         if (typeof dlg.close === 'function') dlg.close();
         else dlg.removeAttribute('open');
       }
+
+      const _trackerOnboardingStorageKey = 'openinfomate_onboarding_state_v1';
+      let _trackerOnboardingState = {{ onboarding|tojson if onboarding else 'null' }};
+
+      function _trackerOnboardingMount() {
+        return document.getElementById('trackerOnboardingMount');
+      }
+
+      function _trackerOnboardingLoadStored() {
+        try {
+          const raw = localStorage.getItem(_trackerOnboardingStorageKey);
+          return raw ? JSON.parse(raw) : null;
+        } catch (e) {
+          return null;
+        }
+      }
+
+      function _trackerOnboardingRemember(state) {
+        try {
+          if (!state) localStorage.removeItem(_trackerOnboardingStorageKey);
+          else localStorage.setItem(_trackerOnboardingStorageKey, JSON.stringify(state));
+        } catch (e) {}
+      }
+
+      function _trackerOnboardingMaybeNotify(prev, next) {
+        try {
+          if (!prev || !next) return;
+          if (!prev.profile_configured && next.profile_configured && !next.ai_setup_applied) {
+            trackerShowToast('{{ t("Profile saved. Next, open AI Setup and click Apply.") }}', 'success', '{{ t("Setup Wizard") }}', 5200);
+            return;
+          }
+          if (!prev.install_complete && next.install_complete) {
+            trackerShowToast('{{ t("Installation complete. Advanced setup tour is ready.") }}', 'success', '{{ t("Setup Wizard") }}', 6200);
+            return;
+          }
+          if (prev.current_step_id && prev.current_step_id !== next.current_step_id) {
+            trackerShowToast('{{ t("Setup progress updated. Return to Setup Wizard to continue.") }}', 'success', '{{ t("Setup Wizard") }}', 5200);
+          }
+        } catch (e) {}
+      }
+
+      function _trackerOnboardingApplyPayload(payload, opts) {
+        try {
+          const mount = _trackerOnboardingMount();
+          if (mount && payload && typeof payload.html === 'string') mount.innerHTML = payload.html;
+          const nextState = payload && payload.state ? payload.state : null;
+          if (opts && opts.notify) _trackerOnboardingMaybeNotify(_trackerOnboardingState, nextState);
+          _trackerOnboardingState = nextState;
+          _trackerOnboardingRemember(nextState);
+        } catch (e) {}
+      }
+
+      async function trackerOnboardingRefresh(opts) {
+        try {
+          const mount = _trackerOnboardingMount();
+          if (!mount && !_trackerOnboardingState) return null;
+          let url = '/admin/onboarding/status';
+          const tok = {{ token|tojson if token else 'null' }};
+          if (tok) url += '?token=' + encodeURIComponent(tok);
+          const resp = await fetch(url, { credentials: 'same-origin', headers: { 'accept': 'application/json' } });
+          const data = await resp.json().catch(() => null);
+          if (!resp.ok || !data) return null;
+          _trackerOnboardingApplyPayload(data, opts || {});
+          return data.state || null;
+        } catch (e) {
+          return null;
+        }
+      }
+
+      async function trackerDismissAdvancedTour() {
+        try {
+          let url = '/admin/onboarding/dismiss-advanced-tour';
+          const tok = {{ token|tojson if token else 'null' }};
+          if (tok) url += '?token=' + encodeURIComponent(tok);
+          const resp = await fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'accept': 'application/json' } });
+          const data = await resp.json().catch(() => null);
+          if (!resp.ok || !data) throw new Error((data && (data.message || data.detail || data.error)) ? String(data.message || data.detail || data.error) : ('HTTP ' + resp.status));
+          _trackerOnboardingApplyPayload(data, { notify: false });
+        } catch (e) {
+          trackerShowToast(String(e || 'error'), 'error', '{{ t("Setup Wizard") }}', 5200);
+        }
+      }
+
+      document.addEventListener('DOMContentLoaded', () => {
+        try {
+          const prev = _trackerOnboardingLoadStored();
+          if (prev && _trackerOnboardingState) _trackerOnboardingMaybeNotify(prev, _trackerOnboardingState);
+          _trackerOnboardingRemember(_trackerOnboardingState);
+        } catch (e) {}
+      });
     </script>
     {% block scripts %}{% endblock %}
   </body>

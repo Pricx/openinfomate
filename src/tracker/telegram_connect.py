@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import logging
 import re
 import secrets
 from typing import Any
@@ -13,6 +14,9 @@ import httpx
 from tracker.i18n import t as ui_t
 from tracker.repo import Repo
 from tracker.settings import Settings
+
+
+logger = logging.getLogger(__name__)
 
 
 _TG_HTTP_CLIENT: httpx.AsyncClient | None = None
@@ -221,7 +225,13 @@ def telegram_status(*, repo: Repo, settings: Settings) -> dict[str, Any]:
     }
 
 
-def telegram_link(*, repo: Repo, settings: Settings, bot_username_override: str | None = None) -> dict[str, Any]:
+def telegram_link(
+    *,
+    repo: Repo,
+    settings: Settings,
+    bot_username_override: str | None = None,
+    force_rebind: bool = False,
+) -> dict[str, Any]:
     try:
         from tracker.dynamic_config import effective_settings
 
@@ -230,7 +240,9 @@ def telegram_link(*, repo: Repo, settings: Settings, bot_username_override: str 
         pass
     existing = (repo.get_app_config("telegram_chat_id") or settings.telegram_chat_id or "").strip()
     if existing:
-        raise RuntimeError("Telegram is already connected. Disconnect first.")
+        if not force_rebind:
+            raise RuntimeError("Telegram is already connected. Disconnect first.")
+        telegram_disconnect(repo=repo, settings=settings)
 
     code = secrets.token_urlsafe(12).replace("-", "").replace("_", "")
     repo.set_app_config("telegram_setup_code", code)
@@ -319,6 +331,10 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                 timeout_seconds=poll_timeout,
                 client_timeout_seconds=settings.http_timeout_seconds,
             )
+            try:
+                repo.set_app_config("telegram_last_polled_at_utc", dt.datetime.utcnow().isoformat() + "Z")
+            except Exception:
+                pass
         except RuntimeError as exc:
             # If a webhook was configured, getUpdates returns a conflict error.
             msg = str(exc or "")
@@ -7933,7 +7949,8 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                 request_message_id=0,
                 query=json.dumps({"cutoff_utc": cutoff_iso}, ensure_ascii=False),
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning("telegram feedback enqueue skipped: %s", exc)
             pass
 
         return {"status": "connected", "chat_id": existing_chat_id}
