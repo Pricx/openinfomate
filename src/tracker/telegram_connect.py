@@ -2077,10 +2077,13 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
 
                 # Best-effort: stop the client spinner early.
                 try:
+                    ack_text = "OK"
+                    if data.startswith("br:rerun"):
+                        ack_text = "正在生成新一份参考消息…" if _out_lang() == "zh" else "Generating a new batch…"
                     await telegram_answer_callback_query(
                         bot_token=token,
                         callback_query_id=cq_id,
-                        text="OK",
+                        text=ack_text,
                         show_alert=False,
                         client_timeout_seconds=settings.http_timeout_seconds,
                     )
@@ -2331,7 +2334,7 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                 hours2 = 24
                             if hours2 <= 0:
                                 hours2 = 24
-                            suffix = "manual-" + dt.datetime.utcnow().strftime("%H%M%S")
+                            suffix = "manual-" + dt.datetime.utcnow().strftime("%H%M%S%f")
                             if topic_id > 0:
                                 res = await run_digest(
                                     session=repo.session,
@@ -2345,13 +2348,14 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                 if per and (per.idempotency_key and per.markdown):
                                     from tracker.push_dispatch import push_telegram_report_reader
 
-                                    await push_telegram_report_reader(
+                                    sent2 = await push_telegram_report_reader(
                                         repo=repo,
                                         settings=settings,
                                         idempotency_key=str(per.idempotency_key),
                                         markdown=str(per.markdown),
                                     )
-                                    sent2 = True
+                                    if sent2:
+                                        logger.info("telegram reader rerun sent: key=%s topic_id=%s", per.idempotency_key, topic_id)
                             else:
                                 res2 = await run_curated_info(
                                     session=repo.session,
@@ -2363,13 +2367,14 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                 if res2 and (res2.idempotency_key and res2.markdown):
                                     from tracker.push_dispatch import push_telegram_report_reader
 
-                                    await push_telegram_report_reader(
+                                    sent2 = await push_telegram_report_reader(
                                         repo=repo,
                                         settings=settings,
                                         idempotency_key=str(res2.idempotency_key),
                                         markdown=str(res2.markdown),
                                     )
-                                    sent2 = True
+                                    if sent2:
+                                        logger.info("telegram reader rerun sent: key=%s topic_id=0", res2.idempotency_key)
                         except Exception as exc:
                             sent2 = False
                             err = (str(exc) or exc.__class__.__name__).strip()
@@ -2380,9 +2385,9 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                             continue
                         if not sent2:
                             if out_lang == "zh":
-                                await _send_ack("⚠️ 再发一份失败：无结果")
+                                await _send_ack("⚠️ 再发一份失败：推送被跳过或结果为空，请稍后重试。")
                             else:
-                                await _send_ack("⚠️ New batch failed: empty result")
+                                await _send_ack("⚠️ New batch failed: push skipped or empty result; retry later.")
                         continue
 
                     try:

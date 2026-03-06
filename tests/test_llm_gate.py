@@ -152,3 +152,47 @@ def test_llm_gate_failure_falls_back_to_alert(db_session, monkeypatch):
     assert it
     assert it.decision == "alert"
     assert it.quality_score == 0
+
+
+
+def test_llm_gate_alert_budget_falls_back_to_digest(db_session, monkeypatch):
+    _repo, _topic, _source = _seed_one_alert_binding(db_session)
+
+    async def fake_fetch_entries_for_source(*, source, timeout_seconds: int = 20, cookie_header_cb=None):  # noqa: ANN001
+        return [
+            FetchedEntry(
+                url="https://example.com/a",
+                title="Breaking: something happened",
+                summary="snippet text",
+            )
+        ]
+
+    async def fake_gate(*, repo=None, settings, topic, title: str, url: str, content_text: str, usage_cb=None):  # noqa: ANN001
+        return LlmGateResult(decision="alert", reason="urgent")
+
+    pushed: list[dict] = []
+
+    async def fake_push_webhook_json(*, repo, settings, idempotency_key: str, payload: dict):
+        pushed.append(payload)
+        return True
+
+    monkeypatch.setattr("tracker.runner.fetch_entries_for_source", fake_fetch_entries_for_source)
+    monkeypatch.setattr("tracker.runner.llm_gate_alert_candidate", fake_gate)
+    monkeypatch.setattr("tracker.runner.push_webhook_json", fake_push_webhook_json)
+    monkeypatch.setattr("tracker.runner.try_consume_alert_budget", lambda **kwargs: False)
+
+    settings = Settings(
+        webhook_url="http://example.invalid/webhook",
+        llm_base_url="http://llm.local",
+        llm_model="dummy",
+    )
+
+    result = asyncio.run(run_tick(session=db_session, settings=settings, push=True))
+    assert result.total_created == 1
+    assert result.total_pushed_alerts == 0
+    assert pushed == []
+
+    it = db_session.scalar(select(ItemTopic))
+    assert it
+    assert it.decision == "digest"
+    assert "alert_suppressed_by_budget" in (it.reason or "")

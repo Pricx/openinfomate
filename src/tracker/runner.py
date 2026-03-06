@@ -390,6 +390,23 @@ def _format_alert_text(*, title: str, url: str, reason: str, lang: str = "en") -
     return "\n".join(lines).strip() + "\n"
 
 
+def _fallback_alert_to_digest(*, session: Session, repo: Repo, item_id: int, topic_id: int, reason: str, note: str) -> None:
+    """Keep a suppressed alert in the next digest instead of leaving it as an unsent alert."""
+    try:
+        it_row = repo.get_item_topic(item_id=int(item_id or 0), topic_id=int(topic_id or 0))
+    except Exception:
+        it_row = None
+    if not it_row:
+        return
+    base_reason = (reason or getattr(it_row, "reason", "") or "").strip()
+    extra = (note or "").strip()
+    if extra and extra not in base_reason:
+        base_reason = f"{base_reason}\n{extra}".strip() if base_reason else extra
+    it_row.decision = "digest"
+    it_row.reason = base_reason
+    session.commit()
+
+
 @dataclass(frozen=True)
 class TickSourceResult:
     topic_name: str
@@ -1350,6 +1367,15 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                             daily_cap=topic.alert_daily_cap,
                             cooldown_minutes=topic.alert_cooldown_minutes,
                         ):
+                            _fallback_alert_to_digest(
+                                session=session,
+                                repo=repo,
+                                item_id=d.item_id,
+                                topic_id=d.topic_id,
+                                reason=final_reason,
+                                note="delivery_note: alert_suppressed_by_budget (kept for digest)",
+                            )
+                            logger.info("alert suppressed by budget; downgraded to digest: item_id=%s topic_id=%s", d.item_id, d.topic_id)
                             continue
 
                     md = _format_alert_markdown(
@@ -1833,6 +1859,15 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                             daily_cap=topic.alert_daily_cap,
                             cooldown_minutes=topic.alert_cooldown_minutes,
                         ):
+                            _fallback_alert_to_digest(
+                                session=session,
+                                repo=repo,
+                                item_id=item_id,
+                                topic_id=topic_id,
+                                reason=it_row.reason,
+                                note="delivery_note: alert_suppressed_by_budget (kept for digest)",
+                            )
+                            logger.info("llm alert suppressed by budget; downgraded to digest: item_id=%s topic_id=%s", item_id, topic_id)
                             continue
 
                     md = _format_alert_markdown(
@@ -2220,6 +2255,15 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                                     daily_cap=topic.alert_daily_cap,
                                     cooldown_minutes=topic.alert_cooldown_minutes,
                                 ):
+                                    _fallback_alert_to_digest(
+                                        session=session,
+                                        repo=repo,
+                                        item_id=item_id,
+                                        topic_id=chosen_topic_id,
+                                        reason=it_row.reason,
+                                        note="delivery_note: alert_suppressed_by_budget (kept for digest)",
+                                    )
+                                    logger.info("priority-lane alert suppressed by budget; downgraded to digest: item_id=%s topic_id=%s", item_id, chosen_topic_id)
                                     continue
 
                             md = _format_alert_markdown(

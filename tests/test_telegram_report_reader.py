@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import datetime as dt
+
 import pytest
 
 from tracker.push_dispatch import push_telegram_report_reader
 from tracker.repo import Repo
+from tracker.runner import CuratedInfoResult
 from tracker.settings import Settings
 from tracker.telegram_connect import telegram_poll
 
@@ -241,3 +244,72 @@ async def test_telegram_digest_reader_per_item_feedback_buttons_record_feedback(
     assert int(evs[0].item_id or 0) == int(item.id)
     assert (evs[0].url or "").strip() == "https://example.com"
 
+
+
+
+@pytest.mark.asyncio
+async def test_telegram_report_reader_rerun_creates_new_batch(db_session, monkeypatch):
+    repo = Repo(db_session)
+    repo.set_app_config("telegram_chat_id", "123")
+    repo.set_app_config("telegram_connected_notified", "1")
+    repo.set_app_config("output_language", "zh")
+
+    report_key = "digest:0:2026-02-26:0900"
+    repo.upsert_report(kind="digest", idempotency_key=report_key, title="t", markdown=_SAMPLE_MD + "\n")
+    repo.record_telegram_messages(chat_id="123", idempotency_key=report_key, message_ids=[200], kind="digest")
+
+    batches = [
+        [
+            {
+                "update_id": 1,
+                "callback_query": {
+                    "id": "cq1",
+                    "from": {"id": 123},
+                    "data": "br:rerun:0",
+                    "message": {"message_id": 200, "chat": {"id": 123}},
+                },
+            }
+        ]
+    ]
+
+    async def fake_delete_webhook(*, bot_token: str, client_timeout_seconds: int) -> None:  # noqa: ARG001
+        return
+
+    async def fake_get_updates(*, bot_token: str, offset, timeout_seconds: int, client_timeout_seconds: int):  # noqa: ANN001, ARG001
+        return batches.pop(0) if batches else []
+
+    answered: list[str] = []
+
+    async def fake_answer_callback_query(*, bot_token: str, callback_query_id: str, text: str = "", show_alert: bool = False, client_timeout_seconds: int = 0):  # noqa: ANN001, ARG001
+        answered.append(text)
+        return
+
+    async def fake_run_curated_info(*, session, settings, hours: int, push: bool, key_suffix: str | None = None):  # noqa: ANN001, ARG001
+        return CuratedInfoResult(
+            since=dt.datetime.utcnow(),
+            pushed=0,
+            markdown=_SAMPLE_MD + "\n",
+            idempotency_key=f"digest:0:2026-02-26:{key_suffix}",
+        )
+
+    reruns: list[tuple[str, str]] = []
+
+    async def fake_push_report_reader(*, repo, settings, idempotency_key: str, markdown: str, disable_preview=None, replace_sent: bool = False):  # noqa: ANN001, ARG001
+        reruns.append((idempotency_key, markdown))
+        return True
+
+    monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
+    monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
+    monkeypatch.setattr("tracker.telegram_connect.telegram_answer_callback_query", fake_answer_callback_query)
+    monkeypatch.setattr("tracker.runner.run_curated_info", fake_run_curated_info)
+    monkeypatch.setattr("tracker.push_dispatch.push_telegram_report_reader", fake_push_report_reader)
+    monkeypatch.setattr("tracker.telegram_connect.push_telegram_report_reader", fake_push_report_reader, raising=False)
+
+    settings = Settings(telegram_bot_token="TEST")
+    await telegram_poll(repo=repo, settings=settings)
+
+    assert answered
+    assert any("生成" in (x or "") for x in answered)
+    assert reruns
+    assert reruns[0][0].startswith("digest:0:")
+    assert ":manual-" in reruns[0][0]
