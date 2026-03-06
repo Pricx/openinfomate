@@ -21,6 +21,7 @@ from tracker.connectors.discourse import build_discourse_json_url
 from tracker.connectors.hn_algolia import build_hn_search_url
 from tracker.connectors.html_list import build_html_list_url
 from tracker.connectors.searxng import build_searxng_search_url, normalize_searxng_base_url
+from tracker.integrations.source_binding_mcp import expand_source_binding_mcp_actions, has_source_binding_mcp_actions
 from tracker.repo import Repo
 from tracker.search_query import normalize_search_query
 
@@ -214,6 +215,9 @@ AllowedOp = Literal[
     "source.set_meta",
     "binding.remove",
     "binding.set_filters",
+    "mcp.source_binding.ensure",
+    "mcp.source.disable",
+    "mcp.binding.remove",
 ]
 
 
@@ -403,6 +407,110 @@ def validate_ai_setup_plan(obj: object) -> tuple[dict[str, Any], list[str]]:
                 if "exclude_keywords" in a:
                     clean["exclude_keywords"] = str(a.get("exclude_keywords") or "")
 
+
+        elif op == "mcp.source_binding.ensure":
+            source_type = _norm_text(a.get("source_type") or a.get("connector") or a.get("source_kind") or "auto")
+            intent = _norm_text(a.get("intent") or ("search" if _norm_text(a.get("query")) else "site_stream"))
+            topic = _norm_text(a.get("topic") or a.get("topic_name"))
+            site = _norm_text(a.get("site") or a.get("domain") or a.get("base_url"))
+            query = _norm_text(a.get("query"))
+            raw_url = _norm_text(a.get("url") or a.get("feed_url") or a.get("source_url"))
+            if not any([site, query, raw_url]):
+                raise ValueError(f"action[{idx}] missing site/query/url for mcp.source_binding.ensure")
+            clean["source_type"] = source_type or "auto"
+            clean["intent"] = intent or ("search" if query else "site_stream")
+            if topic:
+                clean["topic"] = topic
+            if site:
+                clean["site"] = site
+            if query:
+                clean["query"] = query
+            if raw_url:
+                clean["url"] = raw_url
+            if "json_path" in a:
+                clean["json_path"] = _norm_text(a.get("json_path") or "/latest.json") or "/latest.json"
+            if "time_range" in a:
+                clean["time_range"] = _norm_text(a.get("time_range") or "week") or "week"
+            if "results" in a:
+                vv = _norm_int(a.get("results"))
+                if vv is not None:
+                    clean["results"] = int(vv)
+            if "tags" in a:
+                clean["tags"] = str(a.get("tags") or "")
+            if "notes" in a:
+                clean["notes"] = str(a.get("notes") or "")
+            bind = a.get("bind")
+            if isinstance(bind, dict):
+                b_topic = _norm_text(bind.get("topic"))
+                if b_topic and "topic" not in clean:
+                    clean["topic"] = b_topic
+                clean["bind"] = {
+                    "topic": _norm_text(bind.get("topic") or clean.get("topic") or ""),
+                    "include_keywords": str(bind.get("include_keywords") or ""),
+                    "exclude_keywords": str(bind.get("exclude_keywords") or ""),
+                }
+            else:
+                bind_obj: dict[str, Any] = {}
+                if "topic" in clean:
+                    bind_obj["topic"] = str(clean.get("topic") or "")
+                if "include_keywords" in a:
+                    bind_obj["include_keywords"] = str(a.get("include_keywords") or "")
+                if "exclude_keywords" in a:
+                    bind_obj["exclude_keywords"] = str(a.get("exclude_keywords") or "")
+                if bind_obj:
+                    bind_obj.setdefault("include_keywords", "")
+                    bind_obj.setdefault("exclude_keywords", "")
+                    clean["bind"] = bind_obj
+
+        elif op == "mcp.source.disable":
+            source_type = _norm_text(a.get("source_type") or a.get("connector") or a.get("source_kind") or a.get("type") or "auto")
+            site = _norm_text(a.get("site") or a.get("domain") or a.get("base_url"))
+            query = _norm_text(a.get("query"))
+            raw_url = _norm_text(a.get("url") or a.get("feed_url") or a.get("source_url"))
+            if not any([site, query, raw_url]):
+                raise ValueError(f"action[{idx}] missing site/query/url for mcp.source.disable")
+            clean["source_type"] = source_type or "auto"
+            if site:
+                clean["site"] = site
+            if query:
+                clean["query"] = query
+            if raw_url:
+                clean["url"] = raw_url
+            if "json_path" in a:
+                clean["json_path"] = _norm_text(a.get("json_path") or "/latest.json") or "/latest.json"
+            if "time_range" in a:
+                clean["time_range"] = _norm_text(a.get("time_range") or "week") or "week"
+            if "results" in a:
+                vv = _norm_int(a.get("results"))
+                if vv is not None:
+                    clean["results"] = int(vv)
+
+        elif op == "mcp.binding.remove":
+            source_type = _norm_text(a.get("source_type") or a.get("connector") or a.get("source_kind") or "auto")
+            topic = _norm_text(a.get("topic") or a.get("topic_name"))
+            site = _norm_text(a.get("site") or a.get("domain") or a.get("base_url"))
+            query = _norm_text(a.get("query"))
+            raw_url = _norm_text(a.get("url") or a.get("feed_url") or a.get("source_url"))
+            if not any([topic, site, query, raw_url]):
+                raise ValueError(f"action[{idx}] missing locator for mcp.binding.remove")
+            clean["source_type"] = source_type or "auto"
+            if topic:
+                clean["topic"] = topic
+            if site:
+                clean["site"] = site
+            if query:
+                clean["query"] = query
+            if raw_url:
+                clean["url"] = raw_url
+            if "json_path" in a:
+                clean["json_path"] = _norm_text(a.get("json_path") or "/latest.json") or "/latest.json"
+            if "time_range" in a:
+                clean["time_range"] = _norm_text(a.get("time_range") or "week") or "week"
+            if "results" in a:
+                vv = _norm_int(a.get("results"))
+                if vv is not None:
+                    clean["results"] = int(vv)
+
         actions.append(clean)
 
     # Optional high-level summary/questions.
@@ -421,6 +529,41 @@ def validate_ai_setup_plan(obj: object) -> tuple[dict[str, Any], list[str]]:
     if summary:
         plan["summary"] = summary
     return plan, warnings
+
+
+def materialize_ai_setup_mcp_plan(
+    *,
+    snapshot_before: dict[str, Any],
+    plan: dict[str, Any],
+    searxng_base_url: str = "",
+    profile_topic_name: str = "Profile",
+) -> tuple[dict[str, Any], list[str]]:
+    """Expand high-level MCP source/binding actions into concrete tracking actions."""
+    warnings: list[str] = []
+    try:
+        base_plan, base_warnings = validate_ai_setup_plan(plan)
+        warnings.extend(base_warnings)
+    except Exception:
+        base_plan = {"actions": list((plan or {}).get("actions") or [])}
+
+    if not has_source_binding_mcp_actions(base_plan):
+        return base_plan, warnings
+
+    expanded_actions, more = expand_source_binding_mcp_actions(
+        snapshot_before=snapshot_before,
+        actions=list((base_plan.get("actions") or [])[:2000]),
+        searxng_base_url=searxng_base_url,
+        profile_topic_name=_norm_text(profile_topic_name) or "Profile",
+    )
+    warnings.extend([w for w in more if w])
+
+    out: dict[str, Any] = {"actions": expanded_actions}
+    if isinstance(base_plan.get("summary"), str) and base_plan.get("summary"):
+        out["summary"] = str(base_plan.get("summary") or "")
+
+    normalized, more_warnings = validate_ai_setup_plan(out)
+    warnings.extend([w for w in more_warnings if w])
+    return normalized, warnings
 
 
 def autofix_ai_setup_plan_for_source_expansion(
@@ -949,6 +1092,12 @@ def apply_plan_to_snapshot(*, snapshot: dict[str, Any], plan: dict[str, Any]) ->
     """
     Apply a validated plan to an exported snapshot (preview-only; no DB writes).
     """
+    if has_source_binding_mcp_actions(plan):
+        try:
+            plan, _warnings = materialize_ai_setup_mcp_plan(snapshot_before=snapshot or {}, plan=plan)
+        except Exception:
+            pass
+
     cur = copy.deepcopy(snapshot or {})
 
     topics = cur.get("topics")
@@ -1405,6 +1554,16 @@ def apply_plan_to_db(*, session: Session, plan: dict[str, Any]) -> list[str]:
     Returns a list of human-readable change notes (best-effort).
     """
     repo = Repo(session)
+    if has_source_binding_mcp_actions(plan):
+        try:
+            snapshot_before = export_tracking_snapshot(session=session)
+            plan, _warnings = materialize_ai_setup_mcp_plan(
+                snapshot_before=snapshot_before,
+                plan=plan,
+                profile_topic_name=(repo.get_app_config("profile_topic_name") or "Profile").strip() or "Profile",
+            )
+        except Exception:
+            pass
     notes: list[str] = []
 
     for a in plan.get("actions") or []:

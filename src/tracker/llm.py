@@ -10,6 +10,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
+from tracker.integrations.source_binding_mcp import source_binding_mcp_tool_catalog_text
 from tracker.models import Topic
 from tracker.repo import Repo
 from tracker.prompt_templates import resolve_prompt_best_effort
@@ -263,7 +264,12 @@ async def llm_plan_tracking_ai_setup(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    system = _tpl(repo, settings, "config_agent.tracking_ai_setup.plan.system")
+    system = _tpl(
+        repo,
+        settings,
+        "config_agent.tracking_ai_setup.plan.system",
+        {"tracking_mcp_tools": source_binding_mcp_tool_catalog_text(lang=("zh" if _contains_cjk(user_prompt) else "en"))},
+    )
     # NOTE: AI Setup inputs can be very long (profile dumps, bookmarks, notes).
     # Prefer transforming/structuring upstream (caller) instead of hard-truncating.
     # We still keep a high safety cap here to avoid exceeding provider context limits.
@@ -1296,7 +1302,6 @@ async def llm_gate_alert_candidate(
         settings,
         "llm.gate_alert.user",
         {
-            "profile_understanding": _truncate(profile_understanding, 1200),
             "topic_name": topic.name,
             "topic_query_keywords": topic.query,
             "topic_alert_keywords": topic.alert_keywords,
@@ -1516,13 +1521,6 @@ async def llm_triage_topic_items(
     extra_body = _load_llm_extra_body(settings, kind=kind)
 
     system = _tpl(repo, settings, "llm.triage_items.system")
-
-    profile_understanding = ""
-    try:
-        if repo is not None:
-            profile_understanding = (repo.get_app_config("profile_understanding") or "").strip()
-    except Exception:
-        profile_understanding = ""
 
     def _fmt_item(c: dict) -> str:
         try:

@@ -3820,7 +3820,16 @@ def create_app(settings: Settings) -> FastAPI:
                 warnings = list(warnings or [])
                 warnings.extend([w for w in input_warnings if w])
             try:
-                from tracker.config_agent import autofix_ai_setup_plan_for_source_expansion
+                from tracker.config_agent import autofix_ai_setup_plan_for_source_expansion, materialize_ai_setup_mcp_plan
+
+                plan, mcp_warnings = materialize_ai_setup_mcp_plan(
+                    snapshot_before=snap_before,
+                    plan=plan,
+                    searxng_base_url=str(getattr(eff, "searxng_base_url", "") or ""),
+                    profile_topic_name=profile_topic_name,
+                )
+                if mcp_warnings:
+                    warnings.extend([w for w in mcp_warnings if w])
 
                 plan2, more = autofix_ai_setup_plan_for_source_expansion(
                     snapshot_before=snap_before,
@@ -4021,9 +4030,15 @@ def create_app(settings: Settings) -> FastAPI:
             return JSONResponse(status_code=400, content={"ok": False, "error": "bad_plan_json", "message": str(exc)})
 
         try:
-            from tracker.config_agent import apply_plan_to_db, export_tracking_snapshot, validate_ai_setup_plan
+            from tracker.config_agent import apply_plan_to_db, export_tracking_snapshot, materialize_ai_setup_mcp_plan, validate_ai_setup_plan
 
             plan, warnings = validate_ai_setup_plan(obj)
+            plan, materialize_warnings = materialize_ai_setup_mcp_plan(
+                snapshot_before=(json.loads(row.snapshot_before_json or "{}") if (row.snapshot_before_json or "").strip() else {}),
+                plan=plan,
+                profile_topic_name=(repo.get_app_config("profile_topic_name") or "Profile").strip() or "Profile",
+            )
+            warnings.extend([w for w in materialize_warnings if w])
             notes = apply_plan_to_db(session=session, plan=plan)
             snap_after = export_tracking_snapshot(session=session)
         except Exception as exc:

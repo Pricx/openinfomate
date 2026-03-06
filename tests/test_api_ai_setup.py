@@ -87,3 +87,97 @@ def test_admin_ai_setup_apply_undo_and_baseline_restore(tmp_path):
         repo = Repo(session)
         t2 = repo.get_topic_by_name("T2")
         assert t2 and t2.enabled is False
+
+
+
+def test_admin_ai_setup_apply_materializes_mcp_source_binding_actions(tmp_path):
+    db_path = Path(tmp_path) / "api-mcp.db"
+    env_path = Path(tmp_path) / ".env"
+    settings = Settings(db_url=f"sqlite:///{db_path}", api_token="secret", env_path=str(env_path))
+    app = create_app(settings)
+    client = TestClient(app)
+
+    _engine, make_session = session_factory(settings)
+    with make_session() as session:
+        repo = Repo(session)
+        repo.add_topic(name="AI Agents", query="codex fast claude code", digest_cron="0 9 * * *")
+        before = export_tracking_snapshot(session=session)
+        plan = {
+            "actions": [
+                {
+                    "op": "mcp.source_binding.ensure",
+                    "intent": "search",
+                    "source_type": "searxng_search",
+                    "site": "linux.do",
+                    "query": "codex fast",
+                    "topic": "__auto__",
+                }
+            ]
+        }
+        run = repo.add_config_agent_run(
+            kind="tracking_ai_setup",
+            status="planned",
+            user_prompt="add codex fast search on linux.do",
+            plan_json=json.dumps(plan, ensure_ascii=False),
+            snapshot_before_json=json.dumps(before, ensure_ascii=False),
+            snapshot_preview_json="",
+            snapshot_after_json="",
+        )
+        run_id = int(run.id)
+
+    r = client.post("/admin/ai-setup/apply?token=secret", data={"run_id": str(run_id)})
+    assert r.status_code == 200
+    assert r.json().get("ok") is True
+
+    with make_session() as session:
+        repo = Repo(session)
+        sources = [s for s in repo.list_sources() if s.type == "searxng_search"]
+        assert len(sources) == 1
+        assert "site%3Alinux.do+codex+fast" in sources[0].url
+        assert any(b[0].name == "AI Agents" and b[1].url == sources[0].url for b in repo.list_topic_sources())
+
+
+
+def test_admin_ai_setup_plan_materializes_mcp_actions_in_preview(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "api-plan-mcp.db"
+    env_path = Path(tmp_path) / ".env"
+    settings = Settings(
+        db_url=f"sqlite:///{db_path}",
+        api_token="secret",
+        env_path=str(env_path),
+        llm_base_url="https://example.com/v1",
+        llm_api_key="sk-test",
+        llm_model_reasoning="test-model",
+    )
+
+    async def _fake_plan(**_kwargs):
+        return (
+            {
+                "actions": [
+                    {
+                        "op": "mcp.source_binding.ensure",
+                        "intent": "site_stream",
+                        "source_type": "discourse",
+                        "site": "linux.do",
+                        "topic": "__auto__",
+                    }
+                ]
+            },
+            [],
+        )
+
+    import tracker.api as tracker_api
+
+    monkeypatch.setattr(tracker_api, "llm_plan_tracking_ai_setup", _fake_plan)
+
+    app = create_app(settings)
+    client = TestClient(app)
+
+    r = client.post("/admin/ai-setup/plan?token=secret", data={"user_prompt": "我要加入 linux do 的 rss"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("ok") is True
+    ops = [a.get("op") for a in (body.get("plan") or {}).get("actions") or []]
+    assert "source.add_discourse" in ops
+    assert "(no source changes)" not in str(body.get("preview_markdown") or "")
+    assert "linux.do" in str(body.get("preview_markdown") or "")
