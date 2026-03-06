@@ -1291,13 +1291,6 @@ async def llm_gate_alert_candidate(
 
     system = _tpl(repo, settings, "llm.gate_alert.system")
 
-    profile_understanding = ""
-    try:
-        if repo is not None:
-            profile_understanding = (repo.get_app_config("profile_understanding") or "").strip()
-    except Exception:
-        profile_understanding = ""
-
     user = _tpl(
         repo,
         settings,
@@ -1600,7 +1593,6 @@ async def llm_triage_topic_items(
         settings,
         "llm.triage_items.user",
         {
-            "profile_understanding": _truncate(profile_understanding, 1200),
             "topic_name": topic.name,
             "topic_query_keywords": topic.query,
             "topic_alert_keywords": topic.alert_keywords,
@@ -1714,13 +1706,6 @@ async def llm_curate_topic_items(
 
     system = _tpl(repo, settings, "llm.curate_items.system")
 
-    profile_understanding = ""
-    try:
-        if repo is not None:
-            profile_understanding = (repo.get_app_config("profile_understanding") or "").strip()
-    except Exception:
-        profile_understanding = ""
-
     topic_policy_prompt_block = ""
     if policy_prompt and policy_prompt.strip():
         topic_policy_prompt_block = "\nTOPIC_POLICY_PROMPT:\n" + policy_prompt.strip()
@@ -1788,7 +1773,6 @@ async def llm_curate_topic_items(
         settings,
         "llm.curate_items.user",
         {
-            "profile_understanding": _truncate(profile_understanding, 1200),
             "topic_name": topic.name,
             "topic_query_keywords": topic.query,
             "topic_alert_keywords": topic.alert_keywords,

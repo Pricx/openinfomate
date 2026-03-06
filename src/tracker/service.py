@@ -514,7 +514,8 @@ async def _run_telegram_connect_poll_job(make_session, settings):
                     ):
                         return
                     await telegram_poll(repo=repo, settings=settings)
-                except Exception:
+                except Exception as exc:
+                    logger.warning("telegram poll job failed: %s", exc)
                     return
     except TimeoutError:
         return
@@ -571,7 +572,8 @@ async def _telegram_connect_long_poll_loop(make_session, settings):
             await asyncio.sleep(0.05)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            logger.warning("telegram long-poll loop failed: %s", exc)
             await asyncio.sleep(backoff_seconds)
             backoff_seconds = min(10.0, backoff_seconds * 2.0)
 
@@ -1370,6 +1372,46 @@ async def _sync_curated_job_from_digest_hours(
     curated_cron_map[job_id] = cron
 
 
+async def _install_digest_scheduler_jobs(
+    scheduler: AsyncIOScheduler,
+    make_session,
+    settings,
+    *,
+    misfire: int,
+) -> asyncio.Semaphore:
+    digest_sem = asyncio.Semaphore(max(1, settings.max_concurrent_digests))
+    if not settings.digest_scheduler_enabled:
+        return digest_sem
+
+    digest_cron_map: dict[str, str] = {}
+    curated_cron_map: dict[str, str] = {}
+
+    await _sync_digest_jobs(scheduler, make_session, settings, digest_cron_map, digest_sem)
+    scheduler.add_job(
+        _sync_digest_jobs,
+        "interval",
+        seconds=300,
+        args=[scheduler, make_session, settings, digest_cron_map, digest_sem],
+        id="digest:sync",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=misfire,
+    )
+
+    await _sync_curated_job_from_digest_hours(scheduler, make_session, settings, curated_cron_map, digest_sem)
+    scheduler.add_job(
+        _sync_curated_job_from_digest_hours,
+        "interval",
+        seconds=300,
+        args=[scheduler, make_session, settings, curated_cron_map, digest_sem],
+        id="curated:sync",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=misfire,
+    )
+    return digest_sem
+
+
 async def serve_forever() -> None:
     settings = get_settings()
     configure_logging(level=settings.log_level)
@@ -1532,20 +1574,12 @@ async def serve_forever() -> None:
         coalesce=True,
     )
 
-    curated_cron_map: dict[str, str] = {}
-    digest_sem = asyncio.Semaphore(max(1, settings.max_concurrent_digests))
-    if settings.digest_scheduler_enabled:
-        await _sync_curated_job_from_digest_hours(scheduler, make_session, settings, curated_cron_map, digest_sem)
-        scheduler.add_job(
-            _sync_curated_job_from_digest_hours,
-            "interval",
-            seconds=300,
-            args=[scheduler, make_session, settings, curated_cron_map, digest_sem],
-            id="curated:sync",
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=misfire,
-        )
+    await _install_digest_scheduler_jobs(
+        scheduler,
+        make_session,
+        settings,
+        misfire=misfire,
+    )
 
     scheduler.start()
 

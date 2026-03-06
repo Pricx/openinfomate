@@ -566,7 +566,8 @@ class Repo:
 
         Heuristic definition of "uncurated":
         - decision is still `candidate`, AND
-        - reason indicates it hasn't gone through LLM curation yet.
+        - reason indicates it hasn't gone through final digest curation yet,
+          including tick-stage provisional `digest_candidate` hints.
         """
         limit = max(1, min(500, int(limit)))
         exclude_ids = exclude_item_ids or set()
@@ -583,6 +584,7 @@ class Repo:
                     func.coalesce(Item.published_at, Item.created_at) >= since,
                     or_(
                         ItemTopic.reason == "llm curation candidate",
+                        ItemTopic.reason.like("%digest_candidate%"),
                         ItemTopic.reason.like("backfill:%"),
                     ),
                 )
