@@ -43,6 +43,7 @@ from tracker.llm import (
     llm_decide_source_candidates,
     llm_gate_alert_candidate,
     llm_guess_feed_urls,
+    llm_localize_item_titles,
     llm_triage_topic_items,
 )
 from tracker.llm_usage import make_llm_usage_recorder
@@ -338,6 +339,164 @@ def _local_day_iso(settings: Settings, *, when: dt.datetime | None = None) -> st
         return ref.date().isoformat()
     except Exception:
         return dt.datetime.utcnow().date().isoformat()
+
+
+_CJK_TEXT_RE = re.compile(r"[\u4e00-\u9fff]")
+_TITLE_PATH_HINT_RE = re.compile(r"(?:^|/)(?:readme|docs?|blob|tree|src|packages?|apps?|examples?)(?:/|$)", re.IGNORECASE)
+_TITLE_FILE_HINT_RE = re.compile(r"\.(?:md|rst|txt|json|ya?ml|toml|ini|cfg|py|ts|tsx|js|jsx|go|rs|java|kt|sh|ps1)(?:\b|\s)", re.IGNORECASE)
+
+
+def _contains_cjk_text(text: str) -> bool:
+    return bool(_CJK_TEXT_RE.search(text or ""))
+
+
+def _title_needs_translation(*, title: str, target_lang: str) -> bool:
+    t = (title or "").strip()
+    lang = (target_lang or "").strip().lower()
+    if not t:
+        return False
+    if lang.startswith("zh") or lang == "cn":
+        return not _contains_cjk_text(t)
+    if lang.startswith("en"):
+        return _contains_cjk_text(t)
+    return False
+
+
+def _looks_low_signal_title(title: str) -> bool:
+    t = " ".join((title or "").split())
+    low = t.lower()
+    if not t:
+        return True
+    if "..." in t or "…" in t:
+        return True
+    if low.startswith(("ask hn:", "show hn:", "tell hn:")):
+        return True
+    if t.count("/") >= 2 and (_TITLE_PATH_HINT_RE.search(t) or _TITLE_FILE_HINT_RE.search(t)):
+        return True
+    if low.endswith(" - github") and t.count("/") >= 1:
+        return True
+    if low.endswith(" · github") and t.count("/") >= 1:
+        return True
+    return False
+
+
+def _short_title_fallback(*, text: str, target_lang: str) -> str:
+    s = " ".join((text or "").split()).strip()
+    if not s:
+        return ""
+    limit = 54 if (target_lang or "").strip().lower().startswith("zh") or _contains_cjk_text(s) else 120
+    if len(s) <= limit:
+        return s
+    return s[:limit].rstrip() + "…"
+
+
+async def _localize_item_display_titles(
+    *,
+    repo: Repo,
+    settings: Settings,
+    entries: list[dict],
+    out_lang: str,
+    usage_cb=None,
+) -> dict[int, str]:
+    target_lang = (out_lang or "").strip().lower()
+    if target_lang not in {"zh", "en"}:
+        return {}
+
+    cookie_jar = parse_cookie_jar_json(getattr(settings, "cookie_jar_json", "") or "")
+
+    async def _cookie_header_cb(url: str) -> str | None:
+        static_cookie = cookie_header_for_url(url=url, cookie_jar=cookie_jar)
+        return static_cookie or None
+
+    candidates: list[dict] = []
+    fallback_titles: dict[int, str] = {}
+    fulltext_fetches = 0
+    max_fulltext_fetches = 3
+
+    for entry in entries:
+        try:
+            item_id = int(entry.get("item_id") or 0)
+        except Exception:
+            item_id = 0
+        if item_id <= 0:
+            continue
+        title = str(entry.get("title") or "").strip()
+        url = str(entry.get("url") or "").strip()
+        summary = str(entry.get("summary") or "").strip()
+        why = str(entry.get("why") or "").strip()
+        content_text = str(entry.get("content_text") or "").strip()
+        needs_translation = _title_needs_translation(title=title, target_lang=target_lang)
+        low_signal = _looks_low_signal_title(title)
+        if not (needs_translation or low_signal):
+            continue
+
+        snippet_parts: list[str] = []
+        if summary:
+            snippet_parts.append(summary)
+        if why:
+            snippet_parts.append(why)
+        if content_text:
+            snippet_parts.append(content_text)
+        else:
+            row = repo.get_item_content(item_id=item_id)
+            cached = (row.content_text if row and row.content_text else "").strip() if row else ""
+            if cached:
+                snippet_parts.append(cached)
+            elif low_signal and fulltext_fetches < max_fulltext_fetches and url.startswith(("http://", "https://")):
+                try:
+                    cookie = await _cookie_header_cb(url)
+                    text = await fetch_fulltext_for_url(
+                        url=url,
+                        timeout_seconds=min(12, int(settings.fulltext_timeout_seconds or settings.http_timeout_seconds or 12)),
+                        max_chars=min(6000, int(settings.fulltext_max_chars or 6000)),
+                        discourse_cookie=((settings.discourse_cookie or "").strip() or cookie or None),
+                        cookie_header=cookie,
+                    )
+                    text = (text or "").strip()
+                    if text:
+                        repo.upsert_item_content(item_id=item_id, url=url, content_text=text, error="")
+                        snippet_parts.append(text)
+                        fulltext_fetches += 1
+                except Exception as exc:
+                    logger.info("title fulltext fetch failed: item_id=%s url=%s err=%s", item_id, url, exc)
+
+        if summary and ((target_lang == "zh" and _contains_cjk_text(summary)) or (target_lang == "en" and not _contains_cjk_text(summary))):
+            fallback_titles[item_id] = _short_title_fallback(text=summary, target_lang=target_lang)
+
+        snippet = "\n\n".join([p.strip() for p in snippet_parts if (p or "").strip()])
+        if len(snippet) > 2400:
+            snippet = snippet[:2400].rstrip() + "…"
+        candidates.append(
+            {
+                "item_id": item_id,
+                "title": title,
+                "url": url,
+                "summary": summary,
+                "snippet": snippet,
+                "low_signal": low_signal,
+                "needs_translation": needs_translation,
+            }
+        )
+
+    localized: dict[int, str] = {}
+    if candidates:
+        try:
+            out = await llm_localize_item_titles(
+                repo=repo,
+                settings=settings,
+                target_lang=target_lang,
+                items=candidates,
+                usage_cb=usage_cb,
+            )
+            if out:
+                localized.update({int(k): str(v).strip() for k, v in out.items() if int(k) > 0 and str(v).strip()})
+        except Exception as exc:
+            logger.warning("title localization failed: %s", exc)
+
+    for item_id, fallback in fallback_titles.items():
+        if item_id not in localized and fallback:
+            localized[item_id] = fallback
+    return localized
 
 
 def _format_llm_curation_reason(*, summary: str, why: str, hint: str | None = None) -> str:
@@ -3919,6 +4078,7 @@ async def run_curated_info(
     except Exception:
         pass
     out_lang = _output_lang(repo=repo, settings=settings)
+    llm_usage_cb = make_llm_usage_recorder(session=session)
 
     # Window: based on the provided `now` (if any) and `hours`.
     ref = now
@@ -4038,6 +4198,7 @@ async def run_curated_info(
         if dec not in {"alert", "digest"}:
             dec = "digest"
 
+        summary, why = extract_llm_summary_why((getattr(it_row, "reason", "") or ""))
         entry = by_item_id.get(iid)
         if entry is None:
             entry = {
@@ -4047,6 +4208,9 @@ async def run_curated_info(
                 "ts": ts,
                 "decision": dec,
                 "topics": set(),
+                "summary": summary,
+                "why": why,
+                "content_text": (item.content_text or "").strip(),
             }
             by_item_id[iid] = entry
         # Merge topics and decision priority (alert beats digest).
@@ -4063,6 +4227,12 @@ async def run_curated_info(
                 entry["title"] = (item.title or "").strip()
             if url:
                 entry["url"] = url
+        if summary and not str(entry.get("summary") or "").strip():
+            entry["summary"] = summary
+        if why and not str(entry.get("why") or "").strip():
+            entry["why"] = why
+        if (item.content_text or "").strip() and not str(entry.get("content_text") or "").strip():
+            entry["content_text"] = (item.content_text or "").strip()
 
     def _norm_lang(v: str) -> str:
         raw = (v or "").strip()
@@ -4158,6 +4328,9 @@ async def run_curated_info(
                     existing["url"] = u
         except Exception:
             pass
+        for key2 in ("summary", "why", "content_text"):
+            if str(e.get(key2) or "").strip() and not str(existing.get(key2) or "").strip():
+                existing[key2] = e.get(key2, existing.get(key2, ""))
 
     items_all = list(by_url.values())
     items_all.sort(
@@ -4166,6 +4339,14 @@ async def run_curated_info(
             -int(e.get("ts") or 0),
             str(e.get("title") or ""),
         )
+    )
+
+    display_titles_by_item_id = await _localize_item_display_titles(
+        repo=repo,
+        settings=settings,
+        entries=items_all,
+        out_lang=out_lang,
+        usage_cb=llm_usage_cb,
     )
 
     total = len(items_all)
@@ -4192,7 +4373,8 @@ async def run_curated_info(
 
         refs: list[tuple[int, str, str]] = []
         for i, e in enumerate(items_all, start=1):
-            t = str(e.get("title") or "").strip()
+            item_id = int(e.get("item_id") or 0)
+            t = str(display_titles_by_item_id.get(item_id) or e.get("title") or "").strip()
             u = str(e.get("url") or "").strip()
             topics = sorted([x for x in (e.get("topics") or set()) if str(x or "").strip()])
             topics_tag = _topics_short(topics)

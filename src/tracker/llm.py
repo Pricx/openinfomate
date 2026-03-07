@@ -180,7 +180,7 @@ def _select_model_for_kind(settings: Settings, *, kind: str) -> str | None:
 
 
 def _kind_uses_mini_provider(kind: str) -> bool:
-    return (kind or "").strip().lower() in {"digest_summary", "triage_items", "prompt_template_translate"}
+    return (kind or "").strip().lower() in {"digest_summary", "triage_items", "prompt_template_translate", "localize_item_titles"}
 
 
 def _select_timeout_for_kind(settings: Settings, *, kind: str) -> float:  # noqa: ARG001
@@ -609,6 +609,122 @@ async def llm_translate_prompt_template(
         raise RuntimeError("LLM response missing text content")
     return content.strip()
 
+
+async def llm_localize_item_titles(
+    *,
+    repo: Repo | None = None,
+    settings: Settings,
+    target_lang: str,
+    items: list[dict[str, Any]],
+    usage_cb: UsageCallback | None = None,
+) -> dict[int, str] | None:
+    """
+    Translate / rewrite Curated Info item titles into the configured output language.
+
+    Uses the mini provider/model when available. Returns a partial or full mapping of
+    `item_id -> localized_title`, or None if LLM is not configured.
+    """
+    kind = "localize_item_titles"
+    model = _select_model_for_kind(settings, kind=kind)
+    if not (settings.llm_base_url and model and items):
+        return None
+    _ensure_non_codex_model(model)
+
+    base_url = _select_llm_base_url_for_kind(settings, kind=kind)
+    api_key = _select_llm_api_key_for_kind(settings, kind=kind)
+    proxy = _select_llm_proxy_for_kind(settings, kind=kind)
+
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    extra_body = _load_llm_extra_body(settings, kind=kind)
+
+    system = _tpl(repo, settings, "llm.localize_item_titles.system")
+
+    item_lines: list[str] = []
+    for idx, item in enumerate(items, start=1):
+        try:
+            item_id = int(item.get("item_id") or 0)
+        except Exception:
+            item_id = 0
+        if item_id <= 0:
+            continue
+        title = _truncate(str(item.get("title", "") or ""), 260)
+        url = str(item.get("url", "") or "").strip()
+        summary = _truncate(str(item.get("summary", "") or ""), 400)
+        snippet = _truncate(str(item.get("snippet", "") or ""), 2200)
+        low_signal = bool(item.get("low_signal"))
+        needs_translation = bool(item.get("needs_translation"))
+        item_lines.append(f"{idx}. item_id={item_id}")
+        item_lines.append(f"   title={title}")
+        if url:
+            item_lines.append(f"   url={url}")
+        item_lines.append(f"   low_signal={'yes' if low_signal else 'no'}")
+        item_lines.append(f"   needs_translation={'yes' if needs_translation else 'no'}")
+        if summary:
+            item_lines.append(f"   summary={summary}")
+        if snippet:
+            item_lines.append(f"   snippet={snippet}")
+
+    items_block = "\n".join(item_lines).strip()
+    if not items_block:
+        return None
+
+    user = _tpl(
+        repo,
+        settings,
+        "llm.localize_item_titles.user",
+        {
+            "target_lang": (target_lang or "").strip().lower(),
+            "items_block": items_block,
+        },
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0,
+        "max_tokens": 2200,
+    }
+    if extra_body:
+        payload.update(extra_body)
+
+    async with httpx.AsyncClient(timeout=_select_timeout_for_kind(settings, kind=kind), proxy=proxy) as client:
+        data, _mode_used = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
+    resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
+    _emit_usage(usage_cb, kind=kind, model=resp_model, data=data)
+
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text content")
+    obj = _extract_first_json_object(content)
+    if not obj or not isinstance(obj, dict):
+        raise RuntimeError("LLM did not return valid JSON object")
+
+    rows = obj.get("titles")
+    if not isinstance(rows, list):
+        return None
+    out: dict[int, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            item_id = int(row.get("item_id") or 0)
+        except Exception:
+            item_id = 0
+        title = str(row.get("title") or "").strip()
+        if item_id > 0 and title:
+            out[item_id] = title
+    return out or None
 
 def _openai_compat_chat_completions_url(base_url: str) -> str:
     base = (base_url or "").rstrip("/")

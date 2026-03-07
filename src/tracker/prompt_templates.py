@@ -224,6 +224,21 @@ def builtin_slots() -> list[PromptSlot]:
             placeholders=["source_lang", "target_lang", "updated_source_text", "previous_target_text"],
         ),
         PromptSlot(
+            id="llm.localize_item_titles.system",
+            title="Curated title localization: system",
+            description="Translate/rewrite low-information Curated Info item titles into the configured output language.",
+            output_format="json",
+            default_template_id="llm.localize_item_titles.system",
+        ),
+        PromptSlot(
+            id="llm.localize_item_titles.user",
+            title="Curated title localization: user",
+            description="Inputs for Curated Info title localization/rewrite.",
+            output_format="text",
+            default_template_id="llm.localize_item_titles.user",
+            placeholders=["target_lang", "items_block"],
+        ),
+        PromptSlot(
             id="llm.propose_profile_setup.fallback_ai_prompt",
             title="Profile bootstrap: fallback ai_prompt",
             description="Fallback LLM curation policy prompt used when onboarding JSON omits ai_prompt.",
@@ -680,6 +695,50 @@ def builtin_templates() -> dict[str, PromptTemplate]:
                 "<<<\n"
                 "{{previous_target_text}}\n"
                 ">>>\n"
+            ),
+        ),
+        "llm.localize_item_titles.system": PromptTemplate(
+            id="llm.localize_item_titles.system",
+            title="Curated title localization (system)",
+            text_zh=(
+                "你是 OpenInfoMate 的标题本地化器。\n"
+                "你将收到一批参考消息候选条目，每条包含：原始标题、URL、以及可能的 summary/snippet/fulltext。\n\n"
+                "任务：为每条条目生成一个适合推送展示的目标语言标题。\n\n"
+                "规则：\n"
+                "- 若原始标题不是目标语言，翻译成目标语言。\n"
+                "- 若原始标题信息量低（如 Ask HN/Show HN、仓库路径、文档路径、被截断的标题、只有文件名/栏目名），必须结合 summary/snippet/fulltext 改写成高信息量标题。\n"
+                "- 标题必须忠于提供的证据，不要脑补未给出的事实。\n"
+                "- 标题应简洁、可读、可独立理解；避免口号、标题党、营销腔。\n"
+                "- 若已有高信息量且已是目标语言，可基本保持原意，仅做轻微润色。\n"
+                "- 输出 STRICT JSON：{\"titles\":[{\"item_id\":123,\"title\":\"...\"}]}\n"
+                "- 只输出 JSON，不要 markdown，不要解释。\n"
+            ),
+            text_en=(
+                "You are OpenInfoMate's title localizer.\n"
+                "You will receive Curated Info items with original title, URL, and optional summary/snippet/fulltext evidence.\n\n"
+                "Task: produce a high-signal display title in the target language for each item.\n\n"
+                "Rules:\n"
+                "- If the original title is not in the target language, translate it.\n"
+                "- If the original title is low-information (Ask HN/Show HN, repo path, docs path, truncated title, filename-only, category-like label), rewrite it using the provided evidence.\n"
+                "- Stay faithful to the evidence; do not invent unsupported facts.\n"
+                "- Keep titles concise, readable, and understandable on their own; no clickbait or marketing tone.\n"
+                "- If the original title is already high-signal and already in the target language, keep the meaning and only lightly polish if needed.\n"
+                "- Output STRICT JSON only: {\"titles\":[{\"item_id\":123,\"title\":\"...\"}]}\n"
+                "- No markdown, no explanations, no code fences.\n"
+            ),
+        ),
+        "llm.localize_item_titles.user": PromptTemplate(
+            id="llm.localize_item_titles.user",
+            title="Curated title localization (user)",
+            text_zh=(
+                "target_lang={{target_lang}}\n\n"
+                "ITEMS:\n"
+                "{{items_block}}\n"
+            ),
+            text_en=(
+                "target_lang={{target_lang}}\n\n"
+                "ITEMS:\n"
+                "{{items_block}}\n"
             ),
         ),
         "llm.propose_profile_setup.fallback_ai_prompt": PromptTemplate(
