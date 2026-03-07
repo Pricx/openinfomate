@@ -463,7 +463,7 @@ def create_app(settings: Settings) -> FastAPI:
     templates.env.globals["t"] = _t
     templates.env.globals["supported_langs"] = SUPPORTED_LANGS
 
-    app = FastAPI(title="tracker", version="0.1.0")
+    app = FastAPI(title="tracker", version="0.2.0")
     # Expose build/version info in templates so operators can quickly verify
     # whether a remote admin UI is running the expected release.
     templates.env.globals["app_version"] = str(app.version or "").strip() or "unknown"

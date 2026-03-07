@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openinfomate"
-version = "0.1.0"
+version = "0.2.0"
 description = "OpenInfoMate is an AI-powered open information mate that builds your interest profile and curates feeds from RSS, meta search and other open sources."
 license = { text = "AGPL-3.0-or-later" }
 readme = "README.md"
