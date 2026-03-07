@@ -28,7 +28,7 @@ class FakeScheduler:
 
 
 @pytest.mark.asyncio
-async def test_install_digest_scheduler_jobs_registers_topic_and_curated_sync(monkeypatch):
+async def test_install_digest_scheduler_jobs_registers_digest_sync_and_curated_sync(monkeypatch):
     calls: list[str] = []
 
     async def fake_sync_digest_jobs(scheduler, make_session, settings, digest_cron_map, digest_sem):
@@ -74,3 +74,19 @@ async def test_install_digest_scheduler_jobs_skips_when_disabled():
 
     assert isinstance(digest_sem, asyncio.Semaphore)
     assert scheduler.jobs == {}
+
+
+
+def test_digest_scheduler_invariant_issues_catch_missing_progression_jobs():
+    scheduler = FakeScheduler()
+    scheduler.add_job(lambda: None, id="digest:sync")
+    scheduler.add_job(lambda: None, id="curated:sync")
+
+    issues = service_mod._digest_scheduler_invariant_issues(
+        scheduler,
+        digest_scheduler_enabled=True,
+        enabled_topic_count=2,
+    )
+
+    assert any("digest:curated" in issue for issue in issues)
+    assert any("per-topic digest progression jobs" in issue for issue in issues)

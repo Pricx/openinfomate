@@ -145,6 +145,11 @@ def doctor():
         f"last_health_report_at={report.last_health_report_at or 'none'} "
         f"last_push_sent_at={report.last_push_sent_at or 'none'}"
     )
+    console.print(
+        "- scheduler: "
+        f"last_digest_sync_at={report.last_digest_sync_at or 'none'} "
+        f"last_curated_sync_at={report.last_curated_sync_at or 'none'}"
+    )
     if report.push_missing_env:
         console.print("- push_env_missing:")
         for ch in ["dingtalk", "telegram", "email", "webhook"]:
@@ -2408,7 +2413,9 @@ def run_digest(
                 with make_session() as session:
                     suffix = None
                     if force:
-                        suffix = "manual-" + dt.datetime.utcnow().strftime("%H%M%S")
+                        from tracker.push_ops import make_manual_key_suffix
+
+                        suffix = make_manual_key_suffix()
                     result = await run_curated_info_core(session=session, settings=settings, hours=hours, push=push, key_suffix=suffix)
         except TimeoutError:
             console.print("[red]ERROR[/red] busy: another job is running (try again soon)")

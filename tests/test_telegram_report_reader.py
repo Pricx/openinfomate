@@ -313,3 +313,81 @@ async def test_telegram_report_reader_rerun_creates_new_batch(db_session, monkey
     assert reruns
     assert reruns[0][0].startswith("digest:0:")
     assert ":manual-" in reruns[0][0]
+
+
+@pytest.mark.asyncio
+async def test_telegram_report_reader_non_stale_edit_error_does_not_send_duplicate(db_session, monkeypatch):
+    repo = Repo(db_session)
+    repo.set_app_config("telegram_chat_id", "123")
+    repo.set_app_config("telegram_connected_notified", "1")
+    repo.set_app_config("output_language", "zh")
+
+    report_key = "digest:1:2026-02-26:0900"
+    repo.upsert_report(kind="digest", idempotency_key=report_key, title="t", markdown=_SAMPLE_MD + "\n")
+    repo.record_telegram_messages(chat_id="123", idempotency_key=report_key, message_ids=[200], kind="digest")
+
+    batches = [
+        [
+            {
+                "update_id": 1,
+                "callback_query": {
+                    "id": "cq1",
+                    "from": {"id": 123},
+                    "data": "br:refs:0",
+                    "message": {"message_id": 200, "chat": {"id": 123}},
+                },
+            }
+        ]
+    ]
+
+    async def fake_delete_webhook(*, bot_token: str, client_timeout_seconds: int) -> None:  # noqa: ARG001
+        return
+
+    async def fake_get_updates(*, bot_token: str, offset, timeout_seconds: int, client_timeout_seconds: int):  # noqa: ANN001, ARG001
+        return batches.pop(0) if batches else []
+
+    acks: list[str] = []
+
+    async def fake_answer_callback_query(*, bot_token: str, callback_query_id: str, text: str = "", show_alert: bool = False, client_timeout_seconds: int = 0):  # noqa: ANN001, ARG001
+        acks.append(text)
+        return
+
+    async def fake_edit_text(
+        self,
+        *,
+        chat_id: str,
+        message_id: int,
+        text: str,
+        parse_mode: str | None = None,
+        disable_preview: bool = True,  # noqa: ARG001
+        reply_markup: dict | None = None,
+    ) -> bool:
+        raise RuntimeError("telegram api timeout")
+
+    async def fake_send_raw_text(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        parse_mode: str | None = None,
+        disable_preview: bool = True,  # noqa: ARG001
+        reply_markup: dict | None = None,
+    ) -> int:
+        raise AssertionError("send_raw_text should not be used for non-stale edit errors")
+
+    async def fake_send_text(self, *, chat_id: str, text: str, disable_preview: bool = True, parse_mode: str | None = None, reply_markup: dict | None = None):  # noqa: ANN001, ARG001
+        acks.append(text)
+        return [301]
+
+    monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
+    monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
+    monkeypatch.setattr("tracker.telegram_connect.telegram_answer_callback_query", fake_answer_callback_query)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.edit_text", fake_edit_text)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
+
+    settings = Settings(telegram_bot_token="TEST")
+    await telegram_poll(repo=repo, settings=settings)
+
+    assert acks
+    assert any("Reader 操作失败" in (text or "") for text in acks)

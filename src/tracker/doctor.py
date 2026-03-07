@@ -34,6 +34,8 @@ class DoctorReport:
     last_health_report_at: str | None = None
     last_push_attempt_at: str | None = None
     last_push_sent_at: str | None = None
+    last_digest_sync_at: str | None = None
+    last_curated_sync_at: str | None = None
     next_health_report_at: str | None = None
     next_discover_sources_at: str | None = None
 
@@ -145,6 +147,8 @@ def build_doctor_report(
     last_health_report_at = _iso(activity.last_health_report_at) if activity else None
     last_push_attempt_at = _iso(activity.last_push_attempt_at) if activity else None
     last_push_sent_at = _iso(activity.last_push_sent_at) if activity else None
+    last_digest_sync_at = _iso(activity.last_digest_sync_at) if activity else None
+    last_curated_sync_at = _iso(activity.last_curated_sync_at) if activity else None
 
     if stats.get("sources_total", 0) > 0 and activity:
         if activity.last_tick_at is None:
@@ -163,6 +167,35 @@ def build_doctor_report(
             recs.append("Push attempts exist but no successful pushes yet. Check `tracker push list --status failed`.")
         else:
             pass
+
+    if activity and bool(getattr(settings, 'digest_scheduler_enabled', False)):
+        now_utc = dt.datetime.utcnow()
+        stale_after = dt.timedelta(minutes=15)
+        if activity.last_digest_sync_at is None or activity.last_curated_sync_at is None:
+            recs.append(
+                'Digest pipeline scheduler heartbeat is missing. Keep both per-topic digest progression and cross-topic curated sync installed; otherwise candidate items can stall before Curated Info.'
+            )
+        else:
+            if now_utc - activity.last_digest_sync_at > stale_after:
+                mins = int((now_utc - activity.last_digest_sync_at).total_seconds() // 60)
+                recs.append(
+                    f'Digest progression scheduler heartbeat is stale (~{mins} minutes). Check digest:sync job installation before candidate backlog dries up Curated Info.'
+                )
+            if now_utc - activity.last_curated_sync_at > stale_after:
+                mins = int((now_utc - activity.last_curated_sync_at).total_seconds() // 60)
+                recs.append(
+                    f'Curated sync heartbeat is stale (~{mins} minutes). Cross-topic Curated Info may stop running.'
+                )
+        if activity.digest_sync_enabled_topics > 0 and activity.digest_sync_scheduled_topics <= 0:
+            recs.append(
+                'Enabled topics exist but zero per-topic digest progression jobs are scheduled. Candidate -> digest promotion can stall completely.'
+            )
+        elif activity.digest_sync_enabled_topics > 0 and activity.digest_sync_scheduled_topics < activity.digest_sync_enabled_topics:
+            recs.append(
+                f'Only {activity.digest_sync_scheduled_topics}/{activity.digest_sync_enabled_topics} enabled topics currently have per-topic digest progression jobs.'
+            )
+        if not activity.curated_sync_job_present:
+            recs.append('Cross-topic Curated Info job heartbeat reports missing runtime job `digest:curated`.')
 
     def _next_cron(cron_expr: str) -> str | None:
         raw = (cron_expr or "").strip()
@@ -200,6 +233,8 @@ def build_doctor_report(
         last_health_report_at=last_health_report_at,
         last_push_attempt_at=last_push_attempt_at,
         last_push_sent_at=last_push_sent_at,
+        last_digest_sync_at=last_digest_sync_at,
+        last_curated_sync_at=last_curated_sync_at,
         next_health_report_at=_next_cron(getattr(settings, "health_report_cron", "") or ""),
         next_discover_sources_at=_next_cron(getattr(settings, "discover_sources_cron", "") or ""),
     )

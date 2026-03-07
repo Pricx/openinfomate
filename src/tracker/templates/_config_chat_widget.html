@@ -1,0 +1,34 @@
+{% if config_chat %}
+  <div id="trackerConfigChatRoot" class="cfg-chat-root" data-enabled="{{ '1' if config_chat.enabled else '0' }}" data-section="{{ config_chat.section }}">
+    <button id="trackerConfigChatLauncher" type="button" class="cfg-chat-launcher" aria-expanded="false" aria-controls="trackerConfigChatPanel">
+      <span class="cfg-chat-launcher-icon">🧠</span>
+      <span>{{ config_chat.launcher_label }}</span>
+    </button>
+    <section id="trackerConfigChatPanel" class="cfg-chat-panel" hidden aria-hidden="true">
+      <div class="cfg-chat-head">
+        <div>
+          <div class="cfg-chat-kicker">{{ config_chat.section_title }}</div>
+          <div class="cfg-chat-title">{{ config_chat.panel_title }}</div>
+        </div>
+        <div class="actions" style="gap:6px">
+          <span id="trackerConfigChatStatus" class="muted"></span>
+          <button id="trackerConfigChatCloseBtn" type="button" class="btn-ghost cfg-chat-close" aria-label="Close smart config">×</button>
+        </div>
+      </div>
+      <div id="trackerConfigChatMessages" class="cfg-chat-messages"></div>
+      <div id="trackerConfigChatActions" class="cfg-chat-actions"></div>
+      <form id="trackerConfigChatForm" class="cfg-chat-form" onsubmit="trackerConfigChatSend(event)">
+        <textarea id="trackerConfigChatInput" rows="3" placeholder="{{ config_chat.input_placeholder }}"></textarea>
+        <div class="cfg-chat-foot">
+          <div class="muted" id="trackerConfigChatGuide">{{ config_chat.guide_message }}</div>
+          <div class="actions">
+            <button id="trackerConfigChatSendBtn" type="submit" class="btn-primary">{{ config_chat.send_label }}</button>
+          </div>
+        </div>
+      </form>
+    </section>
+  </div>
+  <script>
+    window._trackerConfigChatBootstrap = {{ config_chat|tojson }};
+  </script>
+{% endif %}

@@ -181,3 +181,101 @@ def test_admin_ai_setup_plan_materializes_mcp_actions_in_preview(tmp_path, monke
     assert "source.add_discourse" in ops
     assert "(no source changes)" not in str(body.get("preview_markdown") or "")
     assert "linux.do" in str(body.get("preview_markdown") or "")
+
+
+def test_admin_ai_setup_apply_returns_error_when_run_finalize_persist_fails(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "api-finalize-fail.db"
+    env_path = Path(tmp_path) / ".env"
+    settings = Settings(db_url=f"sqlite:///{db_path}", api_token="secret", env_path=str(env_path))
+    app = create_app(settings)
+    client = TestClient(app)
+
+    _engine, make_session = session_factory(settings)
+    with make_session() as session:
+        repo = Repo(session)
+        before = export_tracking_snapshot(session=session)
+        plan = {
+            "actions": [
+                {"op": "topic.upsert", "name": "T1", "query": "codex fast", "enabled": True},
+            ]
+        }
+        run = repo.add_config_agent_run(
+            kind="tracking_ai_setup",
+            status="planned",
+            user_prompt="add a topic",
+            plan_json=json.dumps(plan, ensure_ascii=False),
+            snapshot_before_json=json.dumps(before, ensure_ascii=False),
+            snapshot_preview_json="",
+            snapshot_after_json="",
+        )
+        run_id = int(run.id)
+
+    orig_update = Repo.update_config_agent_run
+
+    def fake_update(self, run_id: int, *, status=None, snapshot_after_json=None, error=None):
+        if status == "applied":
+            raise RuntimeError("finalize boom")
+        return orig_update(self, run_id, status=status, snapshot_after_json=snapshot_after_json, error=error)
+
+    monkeypatch.setattr(Repo, "update_config_agent_run", fake_update)
+
+    r = client.post("/admin/ai-setup/apply?token=secret", data={"run_id": str(run_id)})
+    assert r.status_code == 500
+    body = r.json()
+    assert body.get("ok") is False
+    assert body.get("error") == "apply_finalize_failed"
+    assert "plan applied" in str(body.get("message") or "")
+
+    with make_session() as session:
+        repo = Repo(session)
+        assert repo.get_topic_by_name("T1") is not None
+        row = repo.get_config_agent_run(run_id)
+        assert row is not None
+        assert row.status == "planned"
+        assert row.snapshot_after_json == ""
+
+
+def test_admin_ai_setup_plan_returns_error_when_run_persist_fails(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "api-plan-persist-fail.db"
+    env_path = Path(tmp_path) / ".env"
+    settings = Settings(
+        db_url=f"sqlite:///{db_path}",
+        api_token="secret",
+        env_path=str(env_path),
+        llm_base_url="https://example.com/v1",
+        llm_api_key="sk-test",
+        llm_model_reasoning="test-model",
+    )
+
+    async def _fake_plan(**_kwargs):
+        return (
+            {
+                "actions": [
+                    {"op": "topic.upsert", "name": "AI Agents", "query": "codex fast", "enabled": True},
+                ]
+            },
+            [],
+        )
+
+    import tracker.api as tracker_api
+
+    monkeypatch.setattr(tracker_api, "llm_plan_tracking_ai_setup", _fake_plan)
+
+    orig_add = Repo.add_config_agent_run
+
+    def fake_add(self, **kwargs):
+        if kwargs.get("status") == "planned":
+            raise RuntimeError("persist boom")
+        return orig_add(self, **kwargs)
+
+    monkeypatch.setattr(Repo, "add_config_agent_run", fake_add)
+
+    app = create_app(settings)
+    client = TestClient(app)
+
+    r = client.post("/admin/ai-setup/plan?token=secret", data={"user_prompt": "我要加入 linux do 的 rss"})
+    assert r.status_code == 500
+    body = r.json()
+    assert body.get("ok") is False
+    assert body.get("error") == "plan_persist_failed"
+    assert "AI Agents" in str(body.get("preview_markdown") or "")

@@ -64,6 +64,8 @@ from tracker.llm_usage import estimate_llm_cost_usd, make_llm_usage_recorder
 from tracker.i18n import LANG_COOKIE_NAME, SUPPORTED_LANGS, get_request_lang, normalize_lang, t as translate_text
 from tracker.envfile import parse_env_assignments
 from tracker.web.onboarding import ADVANCED_TOUR_DISMISSED_KEY, build_onboarding_state
+from tracker.web.config_chat import build_config_chat_bootstrap, build_web_config_chat_history_text, build_web_config_chat_page_context
+from tracker.config_agent_core import apply_config_agent_plan, plan_config_agent_request, validate_config_agent_plan
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,10 @@ def _build_onboarding_context(*, request: Request, repo: Repo, settings: Setting
 def _render_onboarding_banner(*, templates: Jinja2Templates, request: Request, onboarding: dict[str, Any], token: str | None, lang: str) -> str:
     template = templates.get_template("_onboarding_banner.html")
     return template.render(request=request, onboarding=onboarding, token=token, lang=lang)
+
+
+def _build_config_chat_context(*, onboarding: dict[str, Any], section: str, lang: str) -> dict[str, Any]:
+    return build_config_chat_bootstrap(onboarding=onboarding, section=section, lang=lang)
 
 
 def _looks_like_loopback_host(host: str) -> bool:
@@ -1323,7 +1329,9 @@ def create_app(settings: Settings) -> FastAPI:
     ) -> dict:
         suffix = None
         if push and force:
-            suffix = "manual-" + dt.datetime.utcnow().strftime("%H%M%S")
+            from tracker.push_ops import make_manual_key_suffix
+
+            suffix = make_manual_key_suffix()
         result = await run_curated_info(session=session, settings=settings, hours=hours, push=push, key_suffix=suffix)
         return {
             "since": result.since.isoformat(),
@@ -1994,6 +2002,14 @@ def create_app(settings: Settings) -> FastAPI:
             and llm_test_mini_last_fingerprint == llm_test_mini_fingerprint_current
         )
 
+        onboarding = _build_onboarding_context(
+            request=request,
+            repo=repo,
+            settings=settings,
+            page_id=f"admin:{section or 'overview'}",
+        )
+        config_chat = _build_config_chat_context(onboarding=onboarding, section=section, lang=lang)
+
         return templates.TemplateResponse(
             request,
             "admin.html",
@@ -2107,12 +2123,8 @@ def create_app(settings: Settings) -> FastAPI:
                     "llm_test_mini_fingerprint_current": llm_test_mini_fingerprint_current,
                     "llm_test_mini_ok": bool(llm_test_mini_ok),
                 },
-                "onboarding": _build_onboarding_context(
-                    request=request,
-                    repo=repo,
-                    settings=settings,
-                    page_id=f"admin:{section or 'overview'}",
-                ),
+                "onboarding": onboarding,
+                "config_chat": config_chat,
             },
             headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
         )
@@ -3099,6 +3111,130 @@ def create_app(settings: Settings) -> FastAPI:
             return _redir(request, msg=f"restart queued: {', '.join(res.units)}")
         return _redir(request, msg=f"restart failed: {res.message}. {restart_hint_text(lang=lang, units=res.units)}")
 
+    # --- Config Agent Core (natural language config; web + telegram share the same planner)
+    @app.post(
+        "/admin/config-agent/plan",
+        dependencies=[Depends(auth_dep)],
+        include_in_schema=False,
+    )
+    async def admin_config_agent_plan(
+        request: Request,
+        user_prompt: str = Form(...),
+        conversation_json: str = Form(""),
+        page_id: str = Form(""),
+        page_section: str = Form(""),
+        session: Session = Depends(get_db),
+    ):
+        repo = Repo(session)
+        want = (user_prompt or "").strip()
+        if not want:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "missing_user_prompt"})
+        onboarding = _build_onboarding_context(
+            request=request,
+            repo=repo,
+            settings=settings,
+            page_id=(page_id or f"admin:{(page_section or 'overview').strip().lower() or 'overview'}"),
+        )
+        history_text = build_web_config_chat_history_text(conversation_json)
+        page_context_text = build_web_config_chat_page_context(
+            page_id=(page_id or onboarding.get("page_id") or "admin:overview"),
+            section=(page_section or (str(onboarding.get("page_id") or "").split(":", 1)[-1]) or "overview"),
+            onboarding=onboarding,
+        )
+        try:
+            result = await plan_config_agent_request(
+                repo=repo,
+                settings=settings,
+                user_prompt=want,
+                actor=_audit_actor(request),
+                client_host=(request.client.host if request.client else ""),
+                conversation_history_text=history_text,
+                page_context_text=page_context_text,
+            )
+        except Exception as exc:
+            return JSONResponse(status_code=500, content={"ok": False, "error": "config_agent_plan_failed", "message": str(exc)})
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "run_id": int(result.run_id),
+                "plan": result.plan,
+                "warnings": result.warnings,
+                "preview_markdown": result.preview_markdown,
+            },
+        )
+
+    @app.get(
+        "/admin/config-agent/bootstrap",
+        dependencies=[Depends(auth_dep)],
+        include_in_schema=False,
+    )
+    def admin_config_agent_bootstrap(
+        request: Request,
+        page_section: str = "overview",
+        page_id: str = "",
+        session: Session = Depends(get_db),
+    ):
+        repo = Repo(session)
+        section = ((page_section or "overview").strip().lower() or "overview")
+        onboarding = _build_onboarding_context(
+            request=request,
+            repo=repo,
+            settings=settings,
+            page_id=(page_id or f"admin:{section}"),
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "config_chat": _build_config_chat_context(onboarding=onboarding, section=section, lang=get_request_lang(request)),
+            },
+        )
+
+    @app.post(
+        "/admin/config-agent/apply",
+        dependencies=[Depends(auth_dep)],
+        include_in_schema=False,
+    )
+    async def admin_config_agent_apply(
+        request: Request,
+        run_id: int = Form(...),
+        session: Session = Depends(get_db),
+    ):
+        repo = Repo(session)
+        row = repo.get_config_agent_run(int(run_id))
+        if not row or (row.kind or "").strip() != "config_agent_core":
+            return JSONResponse(status_code=404, content={"ok": False, "error": "not_found", "message": "run not found"})
+        if (row.status or "").strip() == "applied":
+            return JSONResponse(status_code=200, content={"ok": True, "run_id": int(row.id), "notes": [], "message": "already applied"})
+        if not (row.plan_json or "").strip():
+            return JSONResponse(status_code=400, content={"ok": False, "error": "missing_plan", "message": "missing plan_json"})
+        try:
+            obj = json.loads(row.plan_json or "")
+            plan, warnings = validate_config_agent_plan(obj)
+        except Exception as exc:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "bad_plan_json", "message": str(exc)})
+
+        try:
+            result = await apply_config_agent_plan(session=session, settings=settings, plan=plan, run_id=int(row.id))
+        except Exception as exc:
+            try:
+                repo.update_config_agent_run(int(row.id), status="failed", error=str(exc)[:2000])
+            except Exception as mark_exc:
+                logger.warning("config agent apply failure status persist failed: run_id=%s err=%s", int(row.id), mark_exc)
+            return JSONResponse(status_code=500, content={"ok": False, "error": "config_agent_apply_failed", "message": str(exc)})
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "run_id": int(row.id),
+                "notes": result.notes,
+                "warnings": warnings,
+                "restart_required": bool(result.restart_required),
+            },
+        )
+
     # --- Tracking → AI Setup (natural language config; auditable; bounded)
 
     @app.post(
@@ -3883,8 +4019,19 @@ def create_app(settings: Settings) -> FastAPI:
                 snapshot_after_json="",
                 error="",
             )
-        except Exception:
-            run = None
+        except Exception as exc:
+            logger.warning("ai setup plan persist failed: err=%s", exc)
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "ok": False,
+                    "error": "plan_persist_failed",
+                    "message": str(exc),
+                    "plan": plan,
+                    "warnings": warnings,
+                    "preview_markdown": preview_md,
+                },
+            )
 
         # UX: start discovering candidate sources as soon as a plan is generated.
         #
@@ -4043,19 +4190,31 @@ def create_app(settings: Settings) -> FastAPI:
             snap_after = export_tracking_snapshot(session=session)
         except Exception as exc:
             try:
-                row.status = "failed"
-                row.error = str(exc)[:2000]
-                session.commit()
-            except Exception:
-                pass
+                repo.update_config_agent_run(int(row.id), status="failed", error=str(exc)[:2000])
+            except Exception as mark_exc:
+                logger.warning("ai setup apply failure status persist failed: run_id=%s err=%s", int(row.id), mark_exc)
             return JSONResponse(status_code=500, content={"ok": False, "error": "apply_failed", "message": str(exc)})
 
         try:
-            row.status = "applied"
-            row.snapshot_after_json = json.dumps(snap_after, ensure_ascii=False)
-            session.commit()
-        except Exception:
-            pass
+            repo.update_config_agent_run(
+                int(row.id),
+                status="applied",
+                snapshot_after_json=json.dumps(snap_after, ensure_ascii=False),
+                error="",
+            )
+        except Exception as exc:
+            logger.warning("ai setup apply finalize persist failed: run_id=%s err=%s", int(row.id), exc)
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "ok": False,
+                    "error": "apply_finalize_failed",
+                    "message": f"plan applied but failed to finalize run metadata: {exc}",
+                    "run_id": int(row.id),
+                    "notes": notes,
+                    "warnings": warnings,
+                },
+            )
 
         # Default UX: Smart Config implies LLM curation for touched topics (mode=llm).
         try:
@@ -6018,7 +6177,9 @@ def create_app(settings: Settings) -> FastAPI:
     ):
         suffix = None
         if push and force:
-            suffix = "manual-" + dt.datetime.utcnow().strftime("%H%M%S")
+            from tracker.push_ops import make_manual_key_suffix
+
+            suffix = make_manual_key_suffix()
         try:
             with job_lock(name="jobs", timeout_seconds=0.0):
                 result = asyncio.run(run_curated_info(session=session, settings=settings, hours=hours, push=push, key_suffix=suffix))

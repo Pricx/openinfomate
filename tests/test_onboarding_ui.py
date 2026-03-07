@@ -116,3 +116,29 @@ def test_advanced_tour_can_be_dismissed_permanently(tmp_path):
     resp2 = client.get("/admin?token=secret&section=overview")
     assert resp2.status_code == 200
     assert "Advanced Setup Tour" not in resp2.text
+
+def test_admin_renders_floating_config_chat_widget(tmp_path):
+    client, settings = _client(
+        tmp_path,
+        admin_password="pw",
+        llm_base_url="https://example.com/v1",
+        llm_model_reasoning="gpt-4.1",
+        llm_api_key="secret",
+    )
+    _engine, make_session = session_factory(settings)
+    with make_session() as session:
+        repo = Repo(session)
+        repo.set_app_config("llm_test_reasoning_last_ok", "true")
+        repo.set_app_config("llm_test_reasoning_last_fingerprint", f"{settings.llm_base_url}|{settings.llm_model_reasoning}")
+
+    resp = client.get("/admin?token=secret&section=overview")
+
+    assert resp.status_code == 200
+    assert 'trackerConfigChatLauncher' in resp.text
+    assert 'trackerConfigChatInput' in resp.text
+    assert 'trackerConfigChatPanel' in resp.text
+    assert 'aria-hidden="true"' in resp.text
+    assert '.cfg-chat-panel[hidden] { display: none !important; }' in resp.text
+    assert 'conversation_json' in resp.text
+    assert 'Smart Config' in resp.text or '智能配置' in resp.text
+

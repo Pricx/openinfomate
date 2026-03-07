@@ -15,6 +15,7 @@ from tracker.dynamic_config import (
 )
 from tracker.envfile import parse_env_assignments
 from tracker.repo import Repo
+from tracker.settings import Settings
 
 
 def test_parse_settings_env_block_accepts_known_keys_and_normalizes():
@@ -133,3 +134,27 @@ def test_export_settings_env_block_excludes_secrets_by_default(db_session, tmp_p
     block = export_settings_env_block(repo=repo, settings=settings, env_path=env_path)
     assert "TRACKER_OUTPUT_LANGUAGE" in block
     assert "TRACKER_TELEGRAM_BOT_TOKEN" not in block
+
+
+
+def test_effective_settings_reloads_env_only_after_apply_updates_even_when_mtime_is_restored(db_session, tmp_path: Path):
+    repo = Repo(db_session)
+    env_path = tmp_path / ".env"
+    env_path.write_text('TRACKER_TELEGRAM_BOT_TOKEN="old1"\n', encoding="utf-8")
+    fixed_ts = 1_700_000_000
+    os.utime(env_path, (fixed_ts, fixed_ts))
+
+    settings = Settings(db_url="sqlite:///:memory:", env_path=str(env_path))
+    eff_before = effective_settings(repo=repo, settings=settings)
+    assert eff_before.telegram_bot_token == "old1"
+
+    apply_env_block_updates(
+        repo=repo,
+        settings=settings,
+        env_path=env_path,
+        env_updates={"TRACKER_TELEGRAM_BOT_TOKEN": "new2"},
+    )
+    os.utime(env_path, (fixed_ts, fixed_ts))
+
+    eff_after = effective_settings(repo=repo, settings=settings)
+    assert eff_after.telegram_bot_token == "new2"

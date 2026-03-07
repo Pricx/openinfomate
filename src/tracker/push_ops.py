@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -24,12 +25,31 @@ class PushRetryResult:
     results: list[tuple[str, str]]  # (channel, status)
 
 
+def make_manual_key_suffix(prefix: str = "manual") -> str:
+    raw = (prefix or "manual").strip() or "manual"
+    safe = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "-" for ch in raw).strip("-_") or "manual"
+    stamp = dt.datetime.utcnow().strftime("%H%M%S%f")
+    # Add a tiny monotonic tail so repeated force-runs in the same microsecond still diverge.
+    tail = f"{time.time_ns() % 1000:03d}"
+    return f"{safe}-{stamp}{tail}"
+
+
 def _parse_key(idempotency_key: str) -> tuple[str, list[str]]:
     raw = (idempotency_key or "").strip()
     if not raw:
         raise ValueError("empty idempotency_key")
     parts = raw.split(":")
     return parts[0], parts
+
+
+def _effective_push_settings(*, repo: Repo, settings: Settings) -> Settings:
+    """Resolve runtime-effective settings for operator push/test/retry flows."""
+    try:
+        from tracker.dynamic_config import effective_settings
+
+        return effective_settings(repo=repo, settings=settings)
+    except Exception:
+        return settings
 
 
 async def retry_failed_pushes(
@@ -46,6 +66,7 @@ async def retry_failed_pushes(
     - Respects `settings.push_max_attempts` via `Repo.reserve_push_attempt`.
     """
     repo = Repo(session)
+    settings = _effective_push_settings(repo=repo, settings=settings)
     max_keys = max(1, min(200, int(max_keys)))
 
     rows = repo.list_pushes(status="failed", limit=max(50, max_keys * 10))
@@ -91,6 +112,7 @@ async def push_test(
         raise ValueError("invalid only (expected dingtalk|email|telegram|webhook)")
 
     repo = Repo(session)
+    settings = _effective_push_settings(repo=repo, settings=settings)
     ts = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
     md = (
@@ -213,6 +235,7 @@ async def retry_push_key(
         raise ValueError("invalid only (expected dingtalk|email|telegram|webhook)")
 
     repo = Repo(session)
+    settings = _effective_push_settings(repo=repo, settings=settings)
     prefix, parts = _parse_key(idempotency_key)
 
     title = ""

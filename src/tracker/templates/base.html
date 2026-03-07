@@ -258,6 +258,143 @@
       .toast.success .toast-dot { background: rgba(22, 163, 74, 0.85); }
       .toast.error .toast-dot { background: rgba(220, 38, 38, 0.85); }
       .toast.warning .toast-dot { background: rgba(217, 119, 6, 0.85); }
+
+      .cfg-chat-root {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        z-index: 9000;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 12px;
+      }
+      .cfg-chat-launcher {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 16px;
+        border-radius: 999px;
+        background: linear-gradient(135deg, rgba(37, 99, 235, 0.96), rgba(99, 102, 241, 0.96));
+        color: #fff;
+        box-shadow: 0 16px 40px rgba(37, 99, 235, 0.32);
+      }
+      .cfg-chat-launcher:hover { filter: brightness(1.04); }
+      .cfg-chat-launcher-icon { font-size: 18px; }
+      .cfg-chat-panel {
+        width: min(420px, calc(100vw - 24px));
+        max-height: min(78vh, 760px);
+        display: flex;
+        flex-direction: column;
+        border: 1px solid var(--card-border);
+        border-radius: 20px;
+        background: var(--card);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(18px);
+        -webkit-backdrop-filter: blur(18px);
+        overflow: hidden;
+      }
+      .cfg-chat-panel[hidden] { display: none !important; }
+      .cfg-chat-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 16px;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.20);
+      }
+      .cfg-chat-head .actions {
+        position: relative;
+        z-index: 2;
+      }
+      .cfg-chat-close {
+        cursor: pointer;
+        position: relative;
+        z-index: 3;
+        pointer-events: auto;
+      }
+      .cfg-chat-kicker {
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+      .cfg-chat-title { font-weight: 700; margin-top: 4px; }
+      .cfg-chat-messages {
+        flex: 1 1 auto;
+        overflow: auto;
+        padding: 14px 14px 0;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .cfg-chat-msg {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        max-width: 92%;
+      }
+      .cfg-chat-msg.user { margin-left: auto; align-items: flex-end; }
+      .cfg-chat-msg.assistant, .cfg-chat-msg.system { margin-right: auto; }
+      .cfg-chat-bubble {
+        padding: 12px 14px;
+        border-radius: 16px;
+        border: 1px solid var(--card-border);
+        background: rgba(148, 163, 184, 0.10);
+        white-space: pre-wrap;
+        word-break: break-word;
+        line-height: 1.45;
+        font-size: 13px;
+      }
+      .cfg-chat-msg.user .cfg-chat-bubble {
+        background: rgba(37, 99, 235, 0.14);
+        border-color: rgba(37, 99, 235, 0.25);
+      }
+      .cfg-chat-preview {
+        margin-top: 6px;
+        padding: 10px 12px;
+        border-radius: 14px;
+        border: 1px dashed rgba(148, 163, 184, 0.45);
+        background: rgba(15, 23, 42, 0.05);
+        font-size: 12px;
+        max-height: 220px;
+        overflow: auto;
+      }
+      html.dark .cfg-chat-preview { background: rgba(15, 23, 42, 0.28); }
+      .cfg-chat-meta { font-size: 11px; color: var(--muted); }
+      .cfg-chat-msg-actions, .cfg-chat-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .cfg-chat-chip {
+        border: 1px solid var(--card-border);
+        background: rgba(148, 163, 184, 0.10);
+        color: var(--text);
+        border-radius: 999px;
+        padding: 8px 12px;
+        font-size: 12px;
+      }
+      .cfg-chat-form {
+        border-top: 1px solid rgba(148, 163, 184, 0.20);
+        padding: 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .cfg-chat-form textarea { min-height: 82px; max-height: 180px; resize: vertical; }
+      .cfg-chat-foot {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      @media (max-width: 720px) {
+        .cfg-chat-root { right: 12px; left: 12px; bottom: 12px; align-items: stretch; }
+        .cfg-chat-launcher { justify-content: center; width: 100%; }
+        .cfg-chat-panel { width: 100%; }
+        .cfg-chat-foot { flex-direction: column; align-items: stretch; }
+      }
     </style>
     <script>
       (function() {

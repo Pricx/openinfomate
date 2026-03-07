@@ -2080,6 +2080,10 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                     ack_text = "OK"
                     if data.startswith("br:rerun"):
                         ack_text = "正在生成新一份参考消息…" if _out_lang() == "zh" else "Generating a new batch…"
+                    elif data.startswith("cfgag:apply"):
+                        ack_text = "正在应用智能配置…" if _out_lang() == "zh" else "Applying config…"
+                    elif data.startswith("cfgag:cancel"):
+                        ack_text = "已取消" if _out_lang() == "zh" else "Canceled"
                     await telegram_answer_callback_query(
                         bot_token=token,
                         callback_query_id=cq_id,
@@ -2089,6 +2093,42 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                     )
                 except Exception:
                     pass
+
+                if data.startswith("cfgag:"):
+                    parts = [p for p in data.split(":") if p]
+                    action = (parts[1] if len(parts) >= 2 else "").strip().lower()
+                    try:
+                        task_id = int((parts[2] if len(parts) >= 3 else "0") or 0)
+                    except Exception:
+                        task_id = 0
+                    if task_id <= 0:
+                        continue
+                    try:
+                        from tracker.models import TelegramTask
+
+                        row = repo.session.get(TelegramTask, int(task_id))
+                    except Exception:
+                        row = None
+                    if not row or (row.kind or "").strip() != "config_agent":
+                        continue
+
+                    if action == "apply":
+                        status = (row.status or "").strip()
+                        if status not in {"awaiting", "failed"}:
+                            continue
+                        row.status = "pending_apply"
+                        row.provider = "apply"
+                        row.started_at = None
+                        row.finished_at = None
+                        row.error = ""
+                        repo.session.commit()
+                        continue
+
+                    if action == "cancel":
+                        repo.mark_telegram_task_canceled(int(task_id), reason="user_canceled")
+                        continue
+
+                    continue
 
                 # --- Source expansion (candidates): batch actions + discovery toggle
                 if data.startswith("cands:"):
@@ -2334,7 +2374,9 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                 hours2 = 24
                             if hours2 <= 0:
                                 hours2 = 24
-                            suffix = "manual-" + dt.datetime.utcnow().strftime("%H%M%S%f")
+                            from tracker.push_ops import make_manual_key_suffix
+
+                            suffix = make_manual_key_suffix()
                             if topic_id > 0:
                                 res = await run_digest(
                                     session=repo.session,
@@ -2604,8 +2646,12 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                 disable_preview=True,
                                 reply_markup=kb,
                             )
-                        except Exception:
-                            # Fallback: send a new reader message if the original message isn't editable.
+                        except Exception as exc:
+                            from tracker.push.telegram import is_stale_telegram_edit_error
+
+                            if not is_stale_telegram_edit_error(exc):
+                                raise
+                            # Fallback only when the original reader message is genuinely stale/non-editable.
                             mid2 = await p.send_raw_text(
                                 chat_id=existing_chat_id,
                                 text=text_html,
@@ -2615,15 +2661,21 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                             )
                             if int(mid2 or 0) > 0:
                                 try:
-                                    repo.record_telegram_messages(
+                                    repo.ensure_telegram_messages_recorded(
                                         chat_id=existing_chat_id,
                                         idempotency_key=report_key,
                                         message_ids=[int(mid2)],
                                         kind="digest",
                                         item_id=None,
                                     )
-                                except Exception:
-                                    pass
+                                except Exception as map_exc:
+                                    logger.warning(
+                                        "telegram reader fallback mapping persist failed: key=%s chat_id=%s mid=%s err=%s",
+                                        report_key,
+                                        existing_chat_id,
+                                        int(mid2),
+                                        map_exc,
+                                    )
                         continue
                     except Exception as exc:
                         # Best-effort fallback: send a new message when edit fails (e.g. not editable).
@@ -6771,6 +6823,47 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                     await _send_with_markup(text=text2, reply_markup=kb2)
                     continue
 
+                t_cfgag = repo.get_telegram_task_by_prompt_message(
+                    chat_id=existing_chat_id,
+                    prompt_message_id=reply_mid,
+                    kind="config_agent",
+                )
+                if t_cfgag:
+                    if (t_cfgag.status or "").strip() != "awaiting":
+                        continue
+                    raw = (text or "").strip()
+                    low = raw.lower().strip()
+                    if raw in {"0"} or low in {"cancel", "取消"}:
+                        repo.mark_telegram_task_canceled(int(t_cfgag.id), reason="user_canceled")
+                        if _out_lang() == "zh":
+                            await _send_ack("✅ 已取消本次智能配置")
+                        else:
+                            await _send_ack("✅ Config request canceled")
+                        continue
+
+                    merged_prompt = (t_cfgag.query or "").strip()
+                    if merged_prompt:
+                        merged_prompt = merged_prompt + "\n\n补充/修订：\n" + raw
+                    else:
+                        merged_prompt = raw
+                    placeholder_mid = -int(dt.datetime.utcnow().timestamp() * 1_000_000)
+                    repo.mark_telegram_task_canceled(int(t_cfgag.id), reason="superseded_by_reply")
+                    repo.cancel_telegram_tasks(chat_id=existing_chat_id, kind="config_agent", status="pending", reason="superseded_by_reply")
+                    repo.create_telegram_task(
+                        chat_id=existing_chat_id,
+                        user_id=uid,
+                        kind="config_agent",
+                        status="pending",
+                        prompt_message_id=placeholder_mid,
+                        request_message_id=(msg_id if msg_id > 0 else 0),
+                        query=merged_prompt,
+                    )
+                    if _out_lang() == "zh":
+                        await _send_ack("⏳ 已加入智能配置修订队列…")
+                    else:
+                        await _send_ack("⏳ Queued config refinement…")
+                    continue
+
             target_item_id = 0
             if reply_mid > 0:
                 tm = repo.get_telegram_message(chat_id=existing_chat_id, message_id=reply_mid)
@@ -7544,6 +7637,25 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                 value_int = max(1, min(365, days))
 
             if kind not in {"like", "dislike", "rate", "mute", "unmute"}:
+                if reply_mid <= 0 and not cmd and not s.startswith("/"):
+                    placeholder_mid = -int(dt.datetime.utcnow().timestamp() * 1_000_000)
+                    repo.cancel_telegram_tasks(chat_id=existing_chat_id, kind="config_agent", status="pending", reason="superseded")
+                    repo.cancel_telegram_tasks(chat_id=existing_chat_id, kind="config_agent", status="awaiting", reason="superseded")
+                    repo.create_telegram_task(
+                        chat_id=existing_chat_id,
+                        user_id=uid,
+                        kind="config_agent",
+                        status="pending",
+                        prompt_message_id=placeholder_mid,
+                        request_message_id=(msg_id if msg_id > 0 else 0),
+                        query=s,
+                    )
+                    if _out_lang() == "zh":
+                        await _send_ack("⏳ 已加入智能配置队列…")
+                    else:
+                        await _send_ack("⏳ Queued for config planning…")
+                    continue
+
                 # Free-form reply comment: when the operator replies to a pushed message with
                 # natural language feedback (not a reaction/command), capture it as a "comment"
                 # event and offer an interactive action menu. This keeps profile updates

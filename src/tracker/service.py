@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -17,9 +18,20 @@ from tracker.repo import Repo
 from tracker.runner import run_digest, run_discover_sources, run_health_report, run_tick
 from tracker.push_ops import retry_failed_pushes
 from tracker.settings import get_settings
+from tracker.config_agent_core import apply_config_agent_plan, plan_config_agent_request
 from tracker.timezones import resolve_cron_timezone
 
 logger = logging.getLogger(__name__)
+
+_TELEGRAM_TASK_STALE_SECONDS = 30 * 60
+
+
+def _service_job_lock_name(kind: str, *, topic_id: int | None = None) -> str:
+    raw = (kind or "job").strip().lower().replace(" ", "_")
+    raw = "".join(ch if (ch.isalnum() or ch in {"_", ".", "-"}) else "_" for ch in raw) or "job"
+    if topic_id is not None:
+        return f"svc.{raw}.{int(topic_id)}"
+    return f"svc.{raw}"
 
 
 def _cron_timezone(settings) -> dt.tzinfo:
@@ -42,6 +54,98 @@ def _misfire_grace_seconds(settings) -> int | None:
     return v if v > 0 else None
 
 
+def _scheduler_job_ids(scheduler: AsyncIOScheduler) -> set[str]:
+    try:
+        return {str(getattr(job, 'id', '') or '') for job in scheduler.get_jobs()}
+    except Exception:
+        try:
+            return {str(job_id) for job_id in getattr(scheduler, 'jobs', {}).keys()}
+        except Exception:
+            return set()
+
+
+def _record_scheduler_heartbeat(make_session, *, lane: str, extra: dict[str, Any] | None = None) -> None:
+    prefix = f"service.scheduler.{(lane or '').strip()}"
+    if not prefix.strip('.'):
+        return
+    updates: dict[str, str] = {f"{prefix}.last_ok_at": dt.datetime.utcnow().replace(microsecond=0).isoformat()}
+    for key, value in (extra or {}).items():
+        clean_key = str(key or '').strip()
+        if not clean_key:
+            continue
+        if isinstance(value, bool):
+            updates[f"{prefix}.{clean_key}"] = '1' if value else '0'
+        elif value is None:
+            updates[f"{prefix}.{clean_key}"] = ''
+        else:
+            updates[f"{prefix}.{clean_key}"] = str(value)
+    try:
+        with make_session() as session:
+            Repo(session).set_app_config_many(updates)
+    except Exception as exc:
+        logger.debug('scheduler heartbeat write failed: lane=%s err=%s', lane, exc)
+
+
+def _count_enabled_topics(make_session) -> int:
+    try:
+        with make_session() as session:
+            return sum(1 for topic in Repo(session).list_topics() if topic.enabled)
+    except Exception:
+        return 0
+
+
+def _digest_scheduler_invariant_issues(
+    scheduler: AsyncIOScheduler,
+    *,
+    digest_scheduler_enabled: bool,
+    enabled_topic_count: int,
+) -> list[str]:
+    if not digest_scheduler_enabled:
+        return []
+
+    job_ids = _scheduler_job_ids(scheduler)
+    issues: list[str] = []
+    for job_id, label in (
+        ('digest:sync', 'digest scheduler sync job'),
+        ('curated:sync', 'curated scheduler sync job'),
+        ('digest:curated', 'cross-topic Curated Info job'),
+    ):
+        if job_id not in job_ids:
+            issues.append(f'missing {label} ({job_id})')
+
+    per_topic_jobs = {
+        job_id
+        for job_id in job_ids
+        if job_id.startswith('digest:') and job_id not in {'digest:sync', 'digest:curated'}
+    }
+    if enabled_topic_count > 0:
+        if not per_topic_jobs:
+            issues.append(
+                'enabled topics exist but no per-topic digest progression jobs are installed; '
+                'candidate -> digest promotion can stall and Curated Info will dry up'
+            )
+        elif len(per_topic_jobs) < enabled_topic_count:
+            issues.append(
+                f'only {len(per_topic_jobs)}/{enabled_topic_count} per-topic digest progression jobs are installed'
+            )
+    return issues
+
+
+def _log_digest_scheduler_invariants(
+    scheduler: AsyncIOScheduler,
+    *,
+    settings,
+    enabled_topic_count: int,
+) -> None:
+    issues = _digest_scheduler_invariant_issues(
+        scheduler,
+        digest_scheduler_enabled=bool(getattr(settings, 'digest_scheduler_enabled', False)),
+        enabled_topic_count=max(0, int(enabled_topic_count or 0)),
+    )
+    if issues:
+        logger.error('digest pipeline invariant violated: %s', '; '.join(issues))
+
+
 def _norm_output_language(raw: str) -> str:
     s = (raw or "").strip().lower()
     raw2 = (raw or "").strip()
@@ -52,6 +156,25 @@ def _norm_output_language(raw: str) -> str:
     if s in {"en", "en-us", "english", "英文"} or s.startswith("en"):
         return "en"
     return "en"
+
+
+def _effective_runtime_settings(make_session, settings):
+    """
+    Best-effort runtime settings resolver for long-lived background workers.
+
+    Important for Telegram/LLM jobs: Web Admin may update `.env` or DB-backed config
+    after the service has already started, so these workers must not gate on the stale
+    process-start Settings snapshot.
+    """
+    try:
+        with make_session() as session:
+            repo = Repo(session)
+            from tracker.dynamic_config import effective_settings
+
+            return effective_settings(repo=repo, settings=settings)
+    except Exception as exc:
+        logger.debug("runtime settings fallback to startup snapshot: %s", exc)
+        return settings
 
 
 async def _maybe_notify_source_candidates_batch(make_session, settings) -> None:
@@ -261,7 +384,7 @@ def _last_fire_time_within(*, trigger: CronTrigger, now: dt.datetime, lookback_s
 
 async def _run_tick_job(make_session, settings):
     try:
-        async with job_lock_async(name="jobs", timeout_seconds=300):
+        async with job_lock_async(name=_service_job_lock_name("tick"), timeout_seconds=300):
             with make_session() as session:
                 await run_tick(session=session, settings=settings, push=True)
     except TimeoutError as exc:
@@ -277,7 +400,7 @@ async def _run_config_sync_job(make_session, settings) -> None:
     - manual `.env` edits can be reflected into DB-backed overrides
     """
     try:
-        async with job_lock_async(name="jobs", timeout_seconds=5):
+        async with job_lock_async(name=_service_job_lock_name("config_sync"), timeout_seconds=5):
             with make_session() as session:
                 repo = Repo(session)
                 from pathlib import Path
@@ -299,7 +422,7 @@ async def _run_config_sync_job(make_session, settings) -> None:
 
 async def _run_health_job(make_session, settings):
     try:
-        async with job_lock_async(name="jobs", timeout_seconds=300):
+        async with job_lock_async(name=_service_job_lock_name("health"), timeout_seconds=300):
             with make_session() as session:
                 await run_health_report(session=session, settings=settings, push=True)
     except TimeoutError as exc:
@@ -308,7 +431,7 @@ async def _run_health_job(make_session, settings):
 
 async def _run_backup_job(settings) -> None:
     try:
-        async with job_lock_async(name="jobs", timeout_seconds=300):
+        async with job_lock_async(name=_service_job_lock_name("backup"), timeout_seconds=300):
             out = run_backup(settings=settings)
             if out:
                 logger.info("backup ok: %s", out)
@@ -320,7 +443,7 @@ async def _run_backup_job(settings) -> None:
 
 async def _run_prune_job(settings) -> None:
     try:
-        async with job_lock_async(name="jobs", timeout_seconds=300):
+        async with job_lock_async(name=_service_job_lock_name("prune"), timeout_seconds=300):
             res = run_prune_ignored(settings=settings)
             logger.info("prune ignored: %s", res)
     except TimeoutError as exc:
@@ -332,7 +455,7 @@ async def _run_prune_job(settings) -> None:
 async def _run_discover_sources_job(make_session, settings):
     ok = False
     try:
-        async with job_lock_async(name="jobs", timeout_seconds=300):
+        async with job_lock_async(name=_service_job_lock_name("discover_sources"), timeout_seconds=300):
             with make_session() as session:
                 await run_discover_sources(session=session, settings=settings)
                 ok = True
@@ -341,7 +464,7 @@ async def _run_discover_sources_job(make_session, settings):
     except Exception as exc:
         logger.warning("discover-sources failed: %s", exc)
 
-    # Notify outside the global `jobs` lock (push can take network time).
+    # Notify outside the discover-sources lock (push can take network time).
     if ok:
         try:
             await _maybe_notify_source_candidates_batch(make_session, settings)
@@ -354,11 +477,11 @@ async def _run_ai_setup_discover_queue_job(make_session, settings):
     Background helper for Web Admin "AI Setup".
 
     When an operator clicks Apply during a busy period, the API enqueues a discover-sources job
-    instead of running it synchronously. This worker drains that queue when the global `jobs`
+    instead of running it synchronously. This worker drains that queue when the shared discover-sources
     lock is available, so candidates eventually appear without manual retries.
     """
     try:
-        # Fast-path: avoid taking the global `jobs` lock if there's no queue.
+        # Fast-path: avoid taking the discover-sources lock if there's no queue.
         with make_session() as session:
             repo = Repo(session)
             if not (repo.get_app_config("tracking_ai_setup_discover_queue_json") or "").strip():
@@ -368,7 +491,7 @@ async def _run_ai_setup_discover_queue_job(make_session, settings):
 
     ok_for_notify = False
     try:
-        async with job_lock_async(name="jobs", timeout_seconds=0.0):
+        async with job_lock_async(name=_service_job_lock_name("discover_sources"), timeout_seconds=0.0):
             with make_session() as session:
                 repo = Repo(session)
                 try:
@@ -451,8 +574,8 @@ async def _run_source_candidates_notify_job(make_session, settings) -> None:
     """
     Periodic notifier for the SourceCandidate review queue.
 
-    Important: do NOT take the global `jobs` lock here, otherwise notifications would be delayed
-    while discover-sources is running (the whole point is to keep operators informed mid-run).
+    Important: do NOT take the discover-sources lock here, otherwise notifications would be delayed
+    while discovery is running (the whole point is to keep operators informed mid-run).
     """
     try:
         await _maybe_notify_source_candidates_batch(make_session, settings)
@@ -462,7 +585,7 @@ async def _run_source_candidates_notify_job(make_session, settings) -> None:
 
 async def _run_push_retry_job(make_session, settings):
     try:
-        async with job_lock_async(name="jobs", timeout_seconds=300):
+        async with job_lock_async(name=_service_job_lock_name("push_retry"), timeout_seconds=300):
             with make_session() as session:
                 await retry_failed_pushes(
                     session=session,
@@ -479,6 +602,7 @@ async def _run_telegram_connect_poll_job(make_session, settings):
 
     This avoids needing to manually hit the "Poll" button in /setup/push.
     """
+    settings = _effective_runtime_settings(make_session, settings)
     if not (getattr(settings, "telegram_bot_token", None) or ""):
         return
     try:
@@ -488,15 +612,6 @@ async def _run_telegram_connect_poll_job(make_session, settings):
             with make_session() as session:
                 repo = Repo(session)
                 try:
-                    # Apply DB-backed dynamic overrides for non-secret Settings fields so Web Admin
-                    # changes take effect without requiring a restart.
-                    try:
-                        from tracker.dynamic_config import effective_settings
-
-                        settings = effective_settings(repo=repo, settings=settings)
-                    except Exception:
-                        pass
-
                     poll_seconds = int(getattr(settings, "telegram_connect_poll_seconds", 0) or 0)
                     if poll_seconds <= 0:
                         return
@@ -532,8 +647,9 @@ async def _telegram_connect_long_poll_loop(make_session, settings):
     backoff_seconds = 1.0
     while True:
         try:
+            settings_eff = _effective_runtime_settings(make_session, settings)
             # Fast-path disable/unconfigured checks (avoid busy-loop).
-            if not (getattr(settings, "telegram_bot_token", None) or ""):
+            if not (getattr(settings_eff, "telegram_bot_token", None) or ""):
                 await asyncio.sleep(2.0)
                 continue
 
@@ -541,12 +657,7 @@ async def _telegram_connect_long_poll_loop(make_session, settings):
             try:
                 with make_session() as session:
                     repo = Repo(session)
-                    try:
-                        from tracker.dynamic_config import effective_settings
-
-                        eff = effective_settings(repo=repo, settings=settings)
-                    except Exception:
-                        eff = settings
+                    eff = settings_eff
 
                     poll_seconds = int(getattr(eff, "telegram_connect_poll_seconds", 0) or 0)
                     if poll_seconds <= 0:
@@ -566,7 +677,7 @@ async def _telegram_connect_long_poll_loop(make_session, settings):
 
             # `_run_telegram_connect_poll_job` applies dynamic overrides and blocks on getUpdates
             # (long-poll) when enabled and connected.
-            await _run_telegram_connect_poll_job(make_session, settings)
+            await _run_telegram_connect_poll_job(make_session, settings_eff)
             backoff_seconds = 1.0
             # Small yield: if the poll returns immediately (e.g., lock contention), avoid a tight loop.
             await asyncio.sleep(0.05)
@@ -586,6 +697,7 @@ async def _run_telegram_profile_delta_worker_job(make_session, settings):
     - Profile delta updates use a reasoning model; this worker runs the LLM call outside `jobs`.
     - Output must be confirmable (avoid profile drift): the worker sends a proposal with inline buttons.
     """
+    settings = _effective_runtime_settings(make_session, settings)
     if not (getattr(settings, "telegram_bot_token", None) or ""):
         return
     if not (
@@ -602,7 +714,7 @@ async def _run_telegram_profile_delta_worker_job(make_session, settings):
                 async with job_lock_async(name="jobs", timeout_seconds=5):
                     with make_session() as session:
                         repo = Repo(session)
-                        task = repo.claim_next_pending_telegram_task(kind="profile_delta", status="pending", mark_running=True)
+                        task = repo.claim_next_pending_telegram_task(kind="profile_delta", status="pending", mark_running=True, stale_running_seconds=_TELEGRAM_TASK_STALE_SECONDS)
                         if not task:
                             return
                         task_id = int(task.id)
@@ -869,6 +981,251 @@ async def _run_telegram_profile_delta_worker_job(make_session, settings):
         return
 
 
+async def _run_telegram_config_agent_worker_job(make_session, settings):
+    """Background worker for Telegram natural-language config-agent requests."""
+    settings = _effective_runtime_settings(make_session, settings)
+    if not (getattr(settings, "telegram_bot_token", None) or ""):
+        return
+
+    async def _mark_failed(task_id: int, *, error: str) -> None:
+        try:
+            async with job_lock_async(name="jobs", timeout_seconds=30):
+                with make_session() as session:
+                    Repo(session).mark_telegram_task_failed(task_id, error=(error or "")[:4000])
+        except Exception:
+            pass
+
+    async def _notify_chat(*, chat_id: str, text: str) -> None:
+        if not chat_id or not text:
+            return
+        try:
+            from tracker.push.telegram import TelegramPusher
+
+            p = TelegramPusher(
+                settings.telegram_bot_token,
+                timeout_seconds=int(getattr(settings, "http_timeout_seconds", 20) or 20),
+            )
+            await p.send_text(chat_id=chat_id, text=text, disable_preview=True)
+        except Exception:
+            pass
+
+    async def _claim_task(*, status: str, provider: str | None = None, stale_provider: str | None = None) -> dict[str, Any] | None:
+        try:
+            async with job_lock_async(name="jobs", timeout_seconds=5):
+                with make_session() as session:
+                    repo = Repo(session)
+                    task = repo.claim_next_pending_telegram_task(
+                        kind="config_agent",
+                        status=status,
+                        mark_running=True,
+                        stale_running_seconds=_TELEGRAM_TASK_STALE_SECONDS,
+                        provider=provider,
+                        stale_provider=stale_provider,
+                    )
+                    if not task:
+                        return None
+                    return {
+                        "task_id": int(task.id),
+                        "chat_id": (task.chat_id or "").strip(),
+                        "query": (task.query or "").strip(),
+                        "intent": (task.intent or "").strip(),
+                        "out_lang": _norm_output_language(
+                            (repo.get_app_config("output_language") or getattr(settings, "output_language", "") or "").strip()
+                        ),
+                    }
+        except TimeoutError:
+            return None
+
+    async def _process_plan_task(payload: dict[str, Any]) -> None:
+        task_id = int(payload.get("task_id") or 0)
+        chat_id = str(payload.get("chat_id") or "").strip()
+        user_prompt = str(payload.get("query") or "").strip()
+        out_lang = str(payload.get("out_lang") or "zh").strip() or "zh"
+        if task_id <= 0 or not chat_id or not user_prompt:
+            if task_id > 0:
+                await _mark_failed(task_id, error="invalid task payload")
+            return
+
+        try:
+            with make_session() as session:
+                repo = Repo(session)
+                result = await plan_config_agent_request(
+                    repo=repo,
+                    settings=settings,
+                    user_prompt=user_prompt,
+                    actor="telegram",
+                    client_host="telegram",
+                )
+        except Exception as exc:
+            err = str(exc) or exc.__class__.__name__
+            await _mark_failed(task_id, error=err)
+            await _notify_chat(
+                chat_id=chat_id,
+                text=(f"⚠️ 智能配置计划生成失败：{err}" if out_lang == "zh" else f"⚠️ Config planning failed: {err}"),
+            )
+            return
+
+        preview = str(result.preview_markdown or "").strip()
+        if len(preview) > 3400:
+            preview = preview[:3400].rstrip() + "…"
+        is_zh = out_lang == "zh"
+        plan = result.plan if isinstance(result.plan, dict) else {}
+        actions = list(plan.get("actions") or [])
+        questions = [str(q or "").strip() for q in (plan.get("questions") or []) if str(q or "").strip()]
+        assistant_reply = str(plan.get("assistant_reply") or "").strip()
+        summary = str(plan.get("summary") or "").strip()
+        has_actions = bool(actions)
+
+        if has_actions:
+            text_out = (
+                "🧠 智能配置计划已生成\n\n" + preview + "\n\n可直接点按钮应用，或直接回复这条消息继续补充/修订。"
+                if is_zh
+                else "🧠 Config plan generated\n\n" + preview + "\n\nTap Apply to execute, or reply to this message to refine it."
+            )
+            kb = {
+                "inline_keyboard": [
+                    [
+                        {"text": ("✅ 应用" if is_zh else "✅ Apply"), "callback_data": f"cfgag:apply:{task_id}"},
+                        {"text": ("❌ 取消" if is_zh else "❌ Cancel"), "callback_data": f"cfgag:cancel:{task_id}"},
+                    ]
+                ]
+            }
+
+            try:
+                from tracker.push.telegram import TelegramPusher
+
+                p = TelegramPusher(
+                    settings.telegram_bot_token,
+                    timeout_seconds=int(getattr(settings, "http_timeout_seconds", 20) or 20),
+                )
+                prompt_mid = int(await p.send_raw_text(chat_id=chat_id, text=text_out, disable_preview=True, reply_markup=kb) or 0)
+            except Exception as exc:
+                await _mark_failed(task_id, error=f"telegram send failed: {exc}")
+                return
+
+            try:
+                async with job_lock_async(name="jobs", timeout_seconds=60):
+                    with make_session() as session:
+                        repo = Repo(session)
+                        from tracker.models import TelegramTask
+
+                        row = repo.session.get(TelegramTask, task_id)
+                        if not row:
+                            return
+                        row.status = "awaiting"
+                        if prompt_mid > 0:
+                            row.prompt_message_id = prompt_mid
+                        row.intent = json.dumps({"run_id": int(result.run_id), "warnings": list(result.warnings or [])}, ensure_ascii=False)
+                        row.error = ""
+                        repo.session.commit()
+            except Exception as exc:
+                await _mark_failed(task_id, error=f"task finalize failed: {exc}")
+            return
+
+        lines: list[str] = []
+        lines.append(assistant_reply or summary or ("我可以直接回答配置问题，也可以继续帮你改配置。" if is_zh else "I can answer config questions and keep helping you change config."))
+        if questions:
+            lines.append("\n".join([f"- {q}" for q in questions[:5]]))
+        if result.warnings:
+            lines.append("\n".join([f"⚠️ {w}" for w in list(result.warnings or [])[:4]]))
+        text_out = "\n\n".join([line for line in lines if str(line or "").strip()]).strip()
+
+        try:
+            from tracker.push.telegram import TelegramPusher
+
+            p = TelegramPusher(
+                settings.telegram_bot_token,
+                timeout_seconds=int(getattr(settings, "http_timeout_seconds", 20) or 20),
+            )
+            await p.send_text(chat_id=chat_id, text=text_out, disable_preview=True)
+        except Exception as exc:
+            await _mark_failed(task_id, error=f"telegram send failed: {exc}")
+            return
+
+        try:
+            async with job_lock_async(name="jobs", timeout_seconds=60):
+                with make_session() as session:
+                    Repo(session).mark_telegram_task_done(task_id, result_key="config_agent_reply")
+        except Exception as exc:
+            await _mark_failed(task_id, error=f"task finalize failed: {exc}")
+
+    async def _process_apply_task(payload: dict[str, Any]) -> None:
+        task_id = int(payload.get("task_id") or 0)
+        chat_id = str(payload.get("chat_id") or "").strip()
+        payload_text = str(payload.get("intent") or "").strip()
+        out_lang = str(payload.get("out_lang") or "zh").strip() or "zh"
+        try:
+            payload_obj = json.loads(payload_text or "{}")
+        except Exception:
+            payload_obj = {}
+        run_id = int(payload_obj.get("run_id") or 0) if isinstance(payload_obj, dict) else 0
+        if run_id <= 0:
+            await _mark_failed(task_id, error="missing run_id")
+            return
+
+        try:
+            with make_session() as session:
+                repo = Repo(session)
+                row = repo.get_config_agent_run(run_id)
+                if not row or (row.kind or "").strip() != "config_agent_core":
+                    raise RuntimeError("config agent run not found")
+                obj = json.loads(row.plan_json or "{}")
+                result = await apply_config_agent_plan(session=session, settings=settings, plan=obj, run_id=run_id)
+        except Exception as exc:
+            await _mark_failed(task_id, error=str(exc))
+            try:
+                from tracker.push.telegram import TelegramPusher
+
+                p = TelegramPusher(
+                    settings.telegram_bot_token,
+                    timeout_seconds=int(getattr(settings, "http_timeout_seconds", 20) or 20),
+                )
+                msg = f"⚠️ 智能配置应用失败：{exc}" if out_lang == "zh" else f"⚠️ Config apply failed: {exc}"
+                await p.send_text(chat_id=chat_id, text=msg, disable_preview=True)
+            except Exception:
+                pass
+            return
+
+        try:
+            async with job_lock_async(name="jobs", timeout_seconds=30):
+                with make_session() as session:
+                    Repo(session).mark_telegram_task_done(task_id, result_key=f"config_agent_applied:{run_id}")
+        except Exception:
+            pass
+
+        try:
+            from tracker.push.telegram import TelegramPusher
+
+            p = TelegramPusher(
+                settings.telegram_bot_token,
+                timeout_seconds=int(getattr(settings, "http_timeout_seconds", 20) or 20),
+            )
+            note_text = "\n".join([f"- {n}" for n in (result.notes or [])[:10]])
+            if out_lang == "zh":
+                tail = "\n⚠️ 部分设置需要重启后生效。" if result.restart_required else ""
+                msg = f"✅ 智能配置已应用（run_id={run_id}）" + ("\n" + note_text if note_text else "") + tail
+            else:
+                tail = "\n⚠️ Some settings require restart to fully apply." if result.restart_required else ""
+                msg = f"✅ Config applied (run_id={run_id})" + ("\n" + note_text if note_text else "") + tail
+            await p.send_text(chat_id=chat_id, text=msg, disable_preview=True)
+        except Exception:
+            pass
+
+    try:
+        async with job_lock_async(name="telegram_config_agent_worker", timeout_seconds=1):
+            plan_task = await _claim_task(status="pending", provider="", stale_provider="")
+            if plan_task:
+                await _process_plan_task(plan_task)
+                return
+
+            apply_task = await _claim_task(status="pending_apply", stale_provider="apply")
+            if apply_task:
+                await _process_apply_task(apply_task)
+                return
+    except TimeoutError:
+        return
+
+
 async def _run_telegram_prompt_delta_worker_job(make_session, settings):
     """
     Background worker for Telegram-driven, feedback-based Prompt delta updates.
@@ -877,6 +1234,7 @@ async def _run_telegram_prompt_delta_worker_job(make_session, settings):
     - Update `research.engine.synth.operator_delta` (small, auditable tail appended to synthesis prompt).
     - Only runs when a `telegram_tasks(kind="prompt_delta")` task exists (explicit operator intent).
     """
+    settings = _effective_runtime_settings(make_session, settings)
     if not (getattr(settings, "telegram_bot_token", None) or ""):
         return
     if not (
@@ -892,7 +1250,7 @@ async def _run_telegram_prompt_delta_worker_job(make_session, settings):
                 async with job_lock_async(name="jobs", timeout_seconds=5):
                     with make_session() as session:
                         repo = Repo(session)
-                        task = repo.claim_next_pending_telegram_task(kind="prompt_delta", status="pending", mark_running=True)
+                        task = repo.claim_next_pending_telegram_task(kind="prompt_delta", status="pending", mark_running=True, stale_running_seconds=_TELEGRAM_TASK_STALE_SECONDS)
                         if not task:
                             return
                         task_id = int(task.id)
@@ -1190,7 +1548,7 @@ async def _run_curated_job(make_session, settings, digest_sem: asyncio.Semaphore
             eff_settings = settings
 
         try:
-            async with job_lock_async(name="jobs", timeout_seconds=300):
+            async with job_lock_async(name=_service_job_lock_name("curated"), timeout_seconds=300):
                 with make_session() as session:
                     # Guard against stringy values like "0" coming from dynamic config.
                     hours = 24
@@ -1212,7 +1570,7 @@ async def _run_curated_job(make_session, settings, digest_sem: asyncio.Semaphore
             logger.warning("job lock busy (curated skipped): %s", exc)
 
 
-async def _run_digest_job(make_session, settings, topic_id: int):
+async def _run_digest_job(make_session, settings, topic_id: int, *, push_override: bool | None = None):
     # Digest window/push settings should honor DB-backed overrides without restart,
     # so compute an effective Settings snapshot per run.
     eff_settings = settings
@@ -1226,7 +1584,7 @@ async def _run_digest_job(make_session, settings, topic_id: int):
         eff_settings = settings
 
     try:
-        async with job_lock_async(name="jobs", timeout_seconds=300):
+        async with job_lock_async(name=_service_job_lock_name("digest", topic_id=topic_id), timeout_seconds=300):
             with make_session() as session:
                 # Guard against stringy values like "0" coming from dynamic config.
                 hours = 24
@@ -1236,20 +1594,23 @@ async def _run_digest_job(make_session, settings, topic_id: int):
                     hours = 24
                 if hours <= 0:
                     hours = 24
+                push_enabled = bool(getattr(eff_settings, "digest_push_enabled", True))
+                if push_override is not None:
+                    push_enabled = bool(push_override)
                 await run_digest(
                     session=session,
                     settings=eff_settings,
                     hours=hours,
-                    push=bool(getattr(eff_settings, "digest_push_enabled", True)),
+                    push=push_enabled,
                     topic_ids=[topic_id],
                 )
     except TimeoutError as exc:
         logger.warning("job lock busy (digest skipped): %s", exc)
 
 
-async def _run_digest_job_limited(make_session, settings, topic_id: int, digest_sem: asyncio.Semaphore):
+async def _run_digest_job_limited(make_session, settings, topic_id: int, digest_sem: asyncio.Semaphore, push_override: bool | None = None):
     async with digest_sem:
-        await _run_digest_job(make_session, settings, topic_id)
+        await _run_digest_job(make_session, settings, topic_id, push_override=push_override)
 
 
 async def _sync_digest_jobs(
@@ -1291,13 +1652,29 @@ async def _sync_digest_jobs(
         scheduler.add_job(
             _run_digest_job_limited,
             trigger=trigger,
-            args=[make_session, settings, topic_id, digest_sem],
+            args=[make_session, settings, topic_id, digest_sem, False],
             id=job_id,
             max_instances=1,
             coalesce=True,
             misfire_grace_time=misfire,
         )
         digest_cron_map[job_id] = cron
+
+    enabled_topic_count = len(desired)
+    _record_scheduler_heartbeat(
+        make_session,
+        lane='digest_sync',
+        extra={
+            'enabled_topics': enabled_topic_count,
+            'scheduled_topics': len(digest_cron_map),
+        },
+    )
+    if enabled_topic_count > 0 and len(digest_cron_map) < enabled_topic_count:
+        logger.error(
+            'digest scheduler installed only %s/%s per-topic jobs; candidate -> digest promotion may stall',
+            len(digest_cron_map),
+            enabled_topic_count,
+        )
 
 
 def _curated_cron_for_hours(hours: int) -> str:
@@ -1352,6 +1729,13 @@ async def _sync_curated_job_from_digest_hours(
 
     job_id = "digest:curated"
     if curated_cron_map.get(job_id) == cron and scheduler.get_job(job_id):
+        _record_scheduler_heartbeat(
+            make_session,
+            lane='curated_sync',
+            extra={'job_present': True, 'hours': hours, 'cron': cron},
+        )
+        enabled_topic_count = _count_enabled_topics(make_session)
+        _log_digest_scheduler_invariants(scheduler, settings=settings, enabled_topic_count=enabled_topic_count)
         return
     if scheduler.get_job(job_id):
         scheduler.remove_job(job_id)
@@ -1359,6 +1743,11 @@ async def _sync_curated_job_from_digest_hours(
         trigger = CronTrigger.from_crontab(cron, timezone=tz)
     except Exception:
         curated_cron_map.pop(job_id, None)
+        _record_scheduler_heartbeat(
+            make_session,
+            lane='curated_sync',
+            extra={'job_present': False, 'hours': hours, 'cron': cron},
+        )
         return
     scheduler.add_job(
         _run_curated_job,
@@ -1370,6 +1759,13 @@ async def _sync_curated_job_from_digest_hours(
         misfire_grace_time=misfire,
     )
     curated_cron_map[job_id] = cron
+    _record_scheduler_heartbeat(
+        make_session,
+        lane='curated_sync',
+        extra={'job_present': True, 'hours': hours, 'cron': cron},
+    )
+    enabled_topic_count = _count_enabled_topics(make_session)
+    _log_digest_scheduler_invariants(scheduler, settings=settings, enabled_topic_count=enabled_topic_count)
 
 
 async def _install_digest_scheduler_jobs(
@@ -1386,6 +1782,9 @@ async def _install_digest_scheduler_jobs(
     digest_cron_map: dict[str, str] = {}
     curated_cron_map: dict[str, str] = {}
 
+    # Keep the per-topic digest scheduler alive so candidate -> digest promotion continues,
+    # but force scheduled digest runs to be curation-only (push=False). Otherwise Curated Info
+    # dries up after tick, yet enabling push here would reintroduce noisy per-topic TG batches.
     await _sync_digest_jobs(scheduler, make_session, settings, digest_cron_map, digest_sem)
     scheduler.add_job(
         _sync_digest_jobs,
@@ -1398,6 +1797,7 @@ async def _install_digest_scheduler_jobs(
         misfire_grace_time=misfire,
     )
 
+    # Scheduled Curated Info remains ONE cross-topic aggregated batch.
     await _sync_curated_job_from_digest_hours(scheduler, make_session, settings, curated_cron_map, digest_sem)
     scheduler.add_job(
         _sync_curated_job_from_digest_hours,
@@ -1409,6 +1809,9 @@ async def _install_digest_scheduler_jobs(
         coalesce=True,
         misfire_grace_time=misfire,
     )
+
+    enabled_topic_count = _count_enabled_topics(make_session)
+    _log_digest_scheduler_invariants(scheduler, settings=settings, enabled_topic_count=enabled_topic_count)
     return digest_sem
 
 
@@ -1558,6 +1961,15 @@ async def serve_forever() -> None:
         seconds=10,
         args=[make_session, settings],
         id="telegram:prompt_delta_worker",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        _run_telegram_config_agent_worker_job,
+        "interval",
+        seconds=5,
+        args=[make_session, settings],
+        id="telegram:config_agent_worker",
         max_instances=1,
         coalesce=True,
     )

@@ -65,3 +65,47 @@ def test_retry_failed_pushes_skips_unsupported_keys(tmp_path):
 
         out = asyncio.run(retry_failed_pushes(session=session, settings=settings, max_keys=10))
         assert out == []
+
+
+
+def test_make_manual_key_suffix_is_unique():
+    from tracker.push_ops import make_manual_key_suffix
+
+    s1 = make_manual_key_suffix()
+    s2 = make_manual_key_suffix()
+
+    assert s1.startswith("manual-")
+    assert s2.startswith("manual-")
+    assert s1 != s2
+
+
+def test_push_test_uses_runtime_env_telegram_token(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    env_path.write_text('TRACKER_TELEGRAM_BOT_TOKEN=\"ENVTEST\"\n', encoding="utf-8")
+    settings = Settings(db_url=f"sqlite:///{tmp_path}/push-test.db", env_path=str(env_path))
+
+    engine, make_session = session_factory(settings)
+    from tracker.models import Base
+
+    Base.metadata.create_all(engine)
+
+    seen: dict[str, str] = {}
+
+    async def fake_push_telegram_text(*, repo, settings, idempotency_key: str, text: str, disable_preview=True, replace_sent=False):  # noqa: ANN001, ARG001
+        seen["token"] = str(settings.telegram_bot_token or "")
+        seen["key"] = idempotency_key
+        return True
+
+    monkeypatch.setattr("tracker.push_ops.push_telegram_text", fake_push_telegram_text)
+
+    with make_session() as session:
+        repo = Repo(session)
+        repo.set_app_config("telegram_chat_id", "123")
+
+        from tracker.push_ops import push_test
+
+        out = asyncio.run(push_test(session=session, settings=settings, only="telegram"))
+
+    assert out == [("telegram", "sent")]
+    assert seen["token"] == "ENVTEST"
+    assert seen["key"].startswith("push_test:telegram:")

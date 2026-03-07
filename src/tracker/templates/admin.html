@@ -1716,6 +1716,8 @@ TRACKER_EMAIL_TO=...{% endif %}
 	      <button type="button" class="btn-danger" onclick="trackerAiSetupApplyThenLeave()">{{ t("Apply") }}</button>
 	    </div>
 	  </dialog>
+
+	  {% include "_config_chat_widget.html" %}
 	{% endblock %}
 
 {% block scripts %}
@@ -1892,6 +1894,412 @@ TRACKER_EMAIL_TO=...{% endif %}
 	        return data;
 	      });
 	    }
+
+    const _trackerConfigChat = {
+      bootstrap: (window._trackerConfigChatBootstrap || null),
+      messages: [],
+      pendingRunId: 0,
+      open: false,
+      loading: false,
+    };
+
+    function trackerConfigChatStorageKey() {
+      try {
+        const base = (_trackerConfigChat.bootstrap && _trackerConfigChat.bootstrap.storage_key) ? String(_trackerConfigChat.bootstrap.storage_key) : 'tracker_web_config_chat_v1';
+        return base + ':' + window.location.host;
+      } catch (e) {
+        return 'tracker_web_config_chat_v1';
+      }
+    }
+
+    function trackerConfigChatSetStatus(text) {
+      try {
+        const el = document.getElementById('trackerConfigChatStatus');
+        if (el) el.textContent = String(text || '');
+      } catch (e) {}
+    }
+
+    function trackerConfigChatGuideText(bootstrap) {
+      const parts = [];
+      if (bootstrap && bootstrap.intro_message) parts.push(String(bootstrap.intro_message));
+      if (bootstrap && bootstrap.guide_message) parts.push(String(bootstrap.guide_message));
+      return parts.join('\n\n').trim();
+    }
+
+    function trackerConfigChatSeedMessage(bootstrap) {
+      const text = trackerConfigChatGuideText(bootstrap);
+      if (!text) return null;
+      const actions = [];
+      try {
+        (Array.isArray(bootstrap && bootstrap.manual_actions) ? bootstrap.manual_actions : []).forEach((action) => actions.push(action));
+        (Array.isArray(bootstrap && bootstrap.starter_actions) ? bootstrap.starter_actions : []).forEach((action) => actions.push(action));
+      } catch (e) {}
+      return { id: 'seed-' + String(Date.now()), role: 'assistant', text, actions };
+    }
+
+    function trackerConfigChatPersist() {
+      try {
+        const payload = {
+          messages: (_trackerConfigChat.messages || []).slice(-40),
+          pendingRunId: Number(_trackerConfigChat.pendingRunId || 0) || 0,
+        };
+        localStorage.setItem(trackerConfigChatStorageKey(), JSON.stringify(payload));
+      } catch (e) {}
+    }
+
+    function trackerConfigChatLoad() {
+      try {
+        const raw = localStorage.getItem(trackerConfigChatStorageKey()) || '';
+        if (!raw) return false;
+        const obj = JSON.parse(raw);
+        const msgs = Array.isArray(obj && obj.messages) ? obj.messages : [];
+        _trackerConfigChat.messages = msgs.filter((msg) => msg && typeof msg === 'object').slice(-40);
+        _trackerConfigChat.pendingRunId = parseInt(String(obj && obj.pendingRunId || '0'), 10) || 0;
+        return _trackerConfigChat.messages.length > 0;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function trackerConfigChatReset() {
+      _trackerConfigChat.messages = [];
+      _trackerConfigChat.pendingRunId = 0;
+      const seed = trackerConfigChatSeedMessage(_trackerConfigChat.bootstrap);
+      if (seed) _trackerConfigChat.messages.push(seed);
+      trackerConfigChatPersist();
+      trackerConfigChatRender();
+    }
+
+    function trackerConfigChatEnsureSeed() {
+      if ((_trackerConfigChat.messages || []).length > 0) return;
+      const seed = trackerConfigChatSeedMessage(_trackerConfigChat.bootstrap);
+      if (seed) _trackerConfigChat.messages.push(seed);
+      trackerConfigChatPersist();
+    }
+
+    function trackerConfigChatPushMessage(msg) {
+      if (!msg || typeof msg !== 'object') return;
+      const out = Object.assign({ id: 'msg-' + String(Date.now()) + '-' + String(Math.random()).slice(2), role: 'assistant', text: '' }, msg || {});
+      _trackerConfigChat.messages.push(out);
+      if (_trackerConfigChat.messages.length > 40) _trackerConfigChat.messages = _trackerConfigChat.messages.slice(-40);
+      trackerConfigChatPersist();
+      trackerConfigChatRender();
+    }
+
+    function trackerConfigChatCurrentInput() {
+      const el = document.getElementById('trackerConfigChatInput');
+      return el ? String(el.value || '').trim() : '';
+    }
+
+    function trackerConfigChatClearInput() {
+      const el = document.getElementById('trackerConfigChatInput');
+      if (el) el.value = '';
+    }
+
+    function trackerConfigChatRenderActions(container, actions, messageId) {
+      if (!container) return;
+      container.innerHTML = '';
+      (Array.isArray(actions) ? actions : []).forEach((action, idx) => {
+        try {
+          const kind = String((action && action.kind) || 'prompt');
+          const label = String((action && action.label) || '').trim();
+          if (!label) return;
+          if (kind === 'link') {
+            const a = document.createElement('a');
+            a.className = 'cfg-chat-chip';
+            a.textContent = label;
+            a.href = String(action.href || '#');
+            container.appendChild(a);
+            return;
+          }
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'cfg-chat-chip';
+          btn.textContent = label;
+          if (kind === 'prompt') {
+            btn.addEventListener('click', () => trackerConfigChatUsePrompt(String(action.prompt || '')));
+          } else if (kind === 'apply') {
+            btn.classList.add('btn-primary');
+            btn.addEventListener('click', () => trackerConfigChatApply(Number(action.run_id || 0), messageId));
+          } else if (kind === 'discard') {
+            btn.addEventListener('click', () => trackerConfigChatDiscard(Number(action.run_id || 0), messageId));
+          }
+          container.appendChild(btn);
+        } catch (e) {}
+      });
+    }
+
+    function trackerConfigChatRender() {
+      try {
+        const list = document.getElementById('trackerConfigChatMessages');
+        const actions = document.getElementById('trackerConfigChatActions');
+        const guide = document.getElementById('trackerConfigChatGuide');
+        if (guide && _trackerConfigChat.bootstrap) guide.textContent = String(_trackerConfigChat.bootstrap.guide_message || '');
+        if (!list) return;
+        list.innerHTML = '';
+        (_trackerConfigChat.messages || []).forEach((msg) => {
+          const role = String(msg.role || 'assistant');
+          const wrap = document.createElement('div');
+          wrap.className = 'cfg-chat-msg ' + role;
+          const bubble = document.createElement('div');
+          bubble.className = 'cfg-chat-bubble';
+          bubble.textContent = String(msg.text || '');
+          wrap.appendChild(bubble);
+          if (msg.preview_markdown) {
+            const pre = document.createElement('pre');
+            pre.className = 'cfg-chat-preview';
+            pre.textContent = String(msg.preview_markdown || '');
+            wrap.appendChild(pre);
+          }
+          const metaParts = [];
+          if (msg.run_id) metaParts.push('run #' + String(msg.run_id));
+          if (msg.meta) metaParts.push(String(msg.meta));
+          if (metaParts.length > 0) {
+            const meta = document.createElement('div');
+            meta.className = 'cfg-chat-meta';
+            meta.textContent = metaParts.join(' · ');
+            wrap.appendChild(meta);
+          }
+          if (Array.isArray(msg.actions) && msg.actions.length > 0) {
+            const btnRow = document.createElement('div');
+            btnRow.className = 'cfg-chat-msg-actions';
+            trackerConfigChatRenderActions(btnRow, msg.actions, String(msg.id || ''));
+            wrap.appendChild(btnRow);
+          }
+          list.appendChild(wrap);
+        });
+        const latest = (_trackerConfigChat.messages || []).slice(-1)[0];
+        if (actions) trackerConfigChatRenderActions(actions, latest && latest.footer_actions ? latest.footer_actions : [], latest ? String(latest.id || '') : '');
+        try { list.scrollTop = list.scrollHeight; } catch (e) {}
+      } catch (e) {}
+    }
+
+    function trackerConfigChatPlanHasActions(plan) {
+      return !!(plan && Array.isArray(plan.actions) && plan.actions.length > 0);
+    }
+
+    function trackerConfigChatComposeReplyText(bootstrap, data) {
+      const warns = Array.isArray(data && data.warnings) ? data.warnings : [];
+      const plan = (data && data.plan && typeof data.plan === 'object') ? data.plan : {};
+      const questions = Array.isArray(plan.questions) ? plan.questions : [];
+      const assistantReply = String(plan.assistant_reply || '').trim();
+      const summary = String(plan.summary || '').trim();
+      const hasActions = trackerConfigChatPlanHasActions(plan);
+      let text = assistantReply || summary;
+      if (!text) {
+        text = hasActions
+          ? (String(bootstrap.lang || 'en') === 'zh'
+              ? '我已经生成了一份可审阅的配置计划。确认无误后点“应用”；如果要改，继续回复我就行。'
+              : 'I drafted a reviewable config plan. Apply it if it looks right, or keep replying to refine it.')
+          : (String(bootstrap.lang || 'en') === 'zh'
+              ? '我可以直接回答配置问题，也可以帮你改 Profile、Topics、Sources、Bindings 和安全设置。你可以继续直接说需求。'
+              : 'I can answer config questions and also change Profile, Topics, Sources, Bindings, and safe settings. Just keep telling me what you want.');
+      }
+      if (questions.length > 0) {
+        text += '\n\n' + questions.map((q) => '- ' + String(q || '')).join('\n');
+      }
+      if (warns.length > 0) {
+        text += '\n\n' + warns.slice(0, 4).map((w) => '⚠️ ' + String(w || '')).join('\n');
+      }
+      return text.trim();
+    }
+
+    function trackerConfigChatToggle(forceOpen) {
+      try {
+        const panel = document.getElementById('trackerConfigChatPanel');
+        const launcher = document.getElementById('trackerConfigChatLauncher');
+        if (!panel || !launcher) return;
+        const next = (typeof forceOpen === 'boolean') ? !!forceOpen : !!panel.hidden;
+        panel.hidden = !next;
+        panel.setAttribute('aria-hidden', next ? 'false' : 'true');
+        launcher.setAttribute('aria-expanded', next ? 'true' : 'false');
+        _trackerConfigChat.open = next;
+        if (next) {
+          const input = document.getElementById('trackerConfigChatInput');
+          if (input) input.focus();
+        }
+      } catch (e) {}
+    }
+
+    function trackerConfigChatUsePrompt(prompt) {
+      try {
+        const text = String(prompt || '').trim();
+        if (!text) return;
+        const input = document.getElementById('trackerConfigChatInput');
+        if (input) input.value = text;
+        trackerConfigChatToggle(true);
+      } catch (e) {}
+    }
+
+    function trackerConfigChatPlannerHistory() {
+      try {
+        return (_trackerConfigChat.messages || [])
+          .filter((msg) => msg && typeof msg === 'object')
+          .filter((msg) => ['user', 'assistant', 'system'].includes(String(msg.role || 'assistant')) && String(msg.text || '').trim())
+          .slice(-10)
+          .map((msg) => ({ role: String(msg.role || 'assistant'), text: String(msg.text || '').trim() }));
+      } catch (e) {
+        return [];
+      }
+    }
+
+    async function trackerConfigChatRefreshBootstrap() {
+      try {
+        const section = (_trackerConfigChat.bootstrap && _trackerConfigChat.bootstrap.section) ? String(_trackerConfigChat.bootstrap.section) : '{{ section }}';
+        const pageId = (_trackerConfigChat.bootstrap && _trackerConfigChat.bootstrap.page_id) ? String(_trackerConfigChat.bootstrap.page_id) : ('admin:' + section);
+        const data = await _trackerGetJson('/admin/config-agent/bootstrap?page_section=' + encodeURIComponent(section) + '&page_id=' + encodeURIComponent(pageId));
+        if (data && data.ok && data.config_chat) _trackerConfigChat.bootstrap = data.config_chat;
+        const guide = document.getElementById('trackerConfigChatGuide');
+        if (guide && _trackerConfigChat.bootstrap) guide.textContent = String(_trackerConfigChat.bootstrap.guide_message || '');
+        return _trackerConfigChat.bootstrap;
+      } catch (e) {
+        return _trackerConfigChat.bootstrap;
+      }
+    }
+
+    function trackerConfigChatBlockedNotice() {
+      const bootstrap = _trackerConfigChat.bootstrap || {};
+      return {
+        id: 'blocked-' + String(Date.now()),
+        role: 'assistant',
+        text: trackerConfigChatGuideText(bootstrap),
+        actions: ([]).concat(Array.isArray(bootstrap.manual_actions) ? bootstrap.manual_actions : []),
+      };
+    }
+
+    async function trackerConfigChatSend(event) {
+      try { if (event && event.preventDefault) event.preventDefault(); } catch (e) {}
+      const bootstrap = _trackerConfigChat.bootstrap || {};
+      const want = trackerConfigChatCurrentInput();
+      if (!want) return;
+      if (!bootstrap.enabled) {
+        trackerConfigChatPushMessage({ role: 'user', text: want });
+        trackerConfigChatPushMessage(trackerConfigChatBlockedNotice());
+        trackerConfigChatClearInput();
+        trackerConfigChatToggle(true);
+        return;
+      }
+      if (_trackerConfigChat.loading) return;
+      _trackerConfigChat.loading = true;
+      trackerConfigChatSetStatus(String(bootstrap.thinking_label || 'Planning…'));
+      const sendBtn = document.getElementById('trackerConfigChatSendBtn');
+      if (sendBtn) sendBtn.disabled = true;
+      const history = trackerConfigChatPlannerHistory();
+      trackerConfigChatPushMessage({ role: 'user', text: want });
+      trackerConfigChatClearInput();
+      try {
+        const data = await _trackerPostForm('/admin/config-agent/plan', {
+          user_prompt: want,
+          conversation_json: JSON.stringify(history),
+          page_id: String(bootstrap.page_id || ('admin:' + String(bootstrap.section || 'overview'))),
+          page_section: String(bootstrap.section || 'overview'),
+        });
+        if (!data || !data.ok) throw new Error((data && (data.message || data.error)) ? String(data.message || data.error) : 'bad response');
+        const plan = (data && data.plan && typeof data.plan === 'object') ? data.plan : {};
+        const hasActions = trackerConfigChatPlanHasActions(plan);
+        const rid = hasActions ? (parseInt(String(data.run_id || '0'), 10) || 0) : 0;
+        _trackerConfigChat.pendingRunId = rid > 0 ? rid : 0;
+        trackerConfigChatPushMessage({
+          role: 'assistant',
+          text: trackerConfigChatComposeReplyText(bootstrap, data),
+          run_id: rid,
+          preview_markdown: hasActions ? String(data.preview_markdown || '') : '',
+          actions: rid > 0
+            ? [
+                { kind: 'apply', label: String(bootstrap.apply_label || 'Apply'), run_id: rid },
+                { kind: 'discard', label: String(bootstrap.discard_label || 'Discard'), run_id: rid },
+              ]
+            : [],
+        });
+      } catch (e) {
+        trackerConfigChatPushMessage({ role: 'assistant', text: String(e || 'error') });
+        trackerShowToast(String(e || 'error'), 'error', String(bootstrap.panel_title || 'Smart Config'), 5200);
+      } finally {
+        _trackerConfigChat.loading = false;
+        trackerConfigChatSetStatus('');
+        if (sendBtn) sendBtn.disabled = false;
+      }
+    }
+
+    function trackerConfigChatUpdateRunMessage(runId, updater) {
+      const rid = parseInt(String(runId || '0'), 10) || 0;
+      if (!(rid > 0)) return;
+      _trackerConfigChat.messages = (_trackerConfigChat.messages || []).map((msg) => {
+        if ((parseInt(String(msg && msg.run_id || '0'), 10) || 0) !== rid) return msg;
+        return Object.assign({}, msg, (typeof updater === 'function') ? updater(msg) : {});
+      });
+      trackerConfigChatPersist();
+      trackerConfigChatRender();
+    }
+
+    function trackerConfigChatDiscard(runId, messageId) {
+      const rid = parseInt(String(runId || '0'), 10) || 0;
+      if (!(rid > 0)) return;
+      if ((_trackerConfigChat.pendingRunId || 0) === rid) _trackerConfigChat.pendingRunId = 0;
+      trackerConfigChatUpdateRunMessage(rid, (msg) => ({ actions: [], meta: String((msg && msg.meta) || '') ? String(msg.meta) : '{{ t("Discarded") }}' }));
+    }
+
+    async function trackerConfigChatApply(runId, messageId) {
+      const rid = parseInt(String(runId || '0'), 10) || 0;
+      const bootstrap = _trackerConfigChat.bootstrap || {};
+      if (!(rid > 0) || _trackerConfigChat.loading) return;
+      _trackerConfigChat.loading = true;
+      trackerConfigChatSetStatus(String(bootstrap.applying_label || 'Applying…'));
+      try {
+        const data = await _trackerPostForm('/admin/config-agent/apply', { run_id: String(rid) });
+        if (!data || !data.ok) throw new Error((data && (data.message || data.error)) ? String(data.message || data.error) : 'bad response');
+        trackerConfigChatUpdateRunMessage(rid, () => ({ actions: [], meta: '{{ t("Saved") }}' }));
+        _trackerConfigChat.pendingRunId = 0;
+        try { await trackerOnboardingRefresh({ notify: true }); } catch (e2) {}
+        await trackerConfigChatRefreshBootstrap();
+        const notes = Array.isArray(data.notes) ? data.notes : [];
+        const lines = [];
+        lines.push(String(bootstrap.lang || 'en') === 'zh' ? '已应用这份配置计划。' : 'Applied this config plan.');
+        if (notes.length > 0) lines.push(notes.slice(0, 8).map((n) => '- ' + String(n || '')).join('\n'));
+        const nextSeed = trackerConfigChatSeedMessage(_trackerConfigChat.bootstrap);
+        if (nextSeed && nextSeed.text) lines.push(String(nextSeed.text));
+        trackerConfigChatPushMessage({
+          role: 'assistant',
+          text: lines.join('\n\n'),
+          actions: nextSeed && Array.isArray(nextSeed.actions) ? nextSeed.actions : [],
+        });
+      } catch (e) {
+        trackerConfigChatPushMessage({ role: 'assistant', text: String(e || 'error') });
+        trackerShowToast(String(e || 'error'), 'error', String(bootstrap.panel_title || 'Smart Config'), 5200);
+      } finally {
+        _trackerConfigChat.loading = false;
+        trackerConfigChatSetStatus('');
+      }
+    }
+
+    function trackerConfigChatHandleKeydown(event) {
+      try {
+        if (!event) return;
+        if (event.key !== 'Enter') return;
+        if (event.shiftKey) return;
+        event.preventDefault();
+        trackerConfigChatSend(event);
+      } catch (e) {}
+    }
+
+    function trackerConfigChatInit() {
+      try {
+        if (!document.getElementById('trackerConfigChatRoot')) return;
+        trackerConfigChatLoad();
+        trackerConfigChatEnsureSeed();
+        trackerConfigChatRender();
+        window.trackerConfigChatToggle = trackerConfigChatToggle;
+        const launcher = document.getElementById('trackerConfigChatLauncher');
+        if (launcher) launcher.addEventListener('click', () => trackerConfigChatToggle());
+        const closeBtn = document.getElementById('trackerConfigChatCloseBtn');
+        if (closeBtn) closeBtn.addEventListener('click', () => trackerConfigChatToggle(false));
+        const input = document.getElementById('trackerConfigChatInput');
+        if (input) input.addEventListener('keydown', trackerConfigChatHandleKeydown);
+        if (_trackerConfigChat.bootstrap && _trackerConfigChat.bootstrap.auto_open && (_trackerConfigChat.messages || []).length <= 1) {
+          trackerConfigChatToggle(true);
+        }
+      } catch (e) {}
+    }
 
 	    async function trackerAiSetupPlan() {
 	      const promptEl = document.getElementById('aiSetupPrompt');
@@ -4331,6 +4739,7 @@ TRACKER_EMAIL_TO=...{% endif %}
 
 				    document.addEventListener('DOMContentLoaded', () => {
 		      trackerSourceTypeChanged();
+		      try { trackerConfigChatInit(); } catch (e0) {}
 		      trackerTopicPresetChanged();
 			      trackerPromptsInit();
 			      trackerCfgInit();

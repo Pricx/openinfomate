@@ -47,6 +47,34 @@ class ActivitySnapshot:
     last_health_report_at: dt.datetime | None
     last_push_attempt_at: dt.datetime | None
     last_push_sent_at: dt.datetime | None
+    last_digest_sync_at: dt.datetime | None = None
+    last_curated_sync_at: dt.datetime | None = None
+    digest_sync_enabled_topics: int = 0
+    digest_sync_scheduled_topics: int = 0
+    curated_sync_job_present: bool = False
+
+
+def _parse_app_config_datetime(value: str | None) -> dt.datetime | None:
+    raw = (value or '').strip()
+    if not raw:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace('Z', '+00:00'))
+    except Exception:
+        return None
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _parse_app_config_int(value: str | None) -> int:
+    raw = (value or '').strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except Exception:
+        return 0
 
 
 class Repo:
@@ -167,12 +195,22 @@ class Repo:
         last_health_report_at = self.session.scalar(select(func.max(Report.updated_at)).where(Report.kind == "health"))
         last_push_attempt_at = self.session.scalar(select(func.max(PushLog.created_at)))
         last_push_sent_at = self.session.scalar(select(func.max(PushLog.sent_at)).where(PushLog.sent_at.is_not(None)))
+        last_digest_sync_at = _parse_app_config_datetime(self.get_app_config('service.scheduler.digest_sync.last_ok_at'))
+        last_curated_sync_at = _parse_app_config_datetime(self.get_app_config('service.scheduler.curated_sync.last_ok_at'))
+        digest_sync_enabled_topics = _parse_app_config_int(self.get_app_config('service.scheduler.digest_sync.enabled_topics'))
+        digest_sync_scheduled_topics = _parse_app_config_int(self.get_app_config('service.scheduler.digest_sync.scheduled_topics'))
+        curated_sync_job_present = _parse_app_config_int(self.get_app_config('service.scheduler.curated_sync.job_present')) > 0
         return ActivitySnapshot(
             last_tick_at=last_tick_at,
             last_digest_report_at=last_digest_report_at,
             last_health_report_at=last_health_report_at,
             last_push_attempt_at=last_push_attempt_at,
             last_push_sent_at=last_push_sent_at,
+            last_digest_sync_at=last_digest_sync_at,
+            last_curated_sync_at=last_curated_sync_at,
+            digest_sync_enabled_topics=digest_sync_enabled_topics,
+            digest_sync_scheduled_topics=digest_sync_scheduled_topics,
+            curated_sync_job_present=curated_sync_job_present,
         )
 
     # --- sources
@@ -980,6 +1018,16 @@ class Repo:
             > 0
         )
 
+    def any_push_sent(self, *, idempotency_key: str) -> bool:
+        return (
+            self.session.scalar(
+                select(func.count())
+                .select_from(PushLog)
+                .where(and_(PushLog.idempotency_key == idempotency_key, PushLog.status == "sent"))
+            )
+            > 0
+        )
+
     def any_push_sent_with_prefix(self, *, idempotency_prefix: str) -> bool:
         """
         Best-effort cross-topic dedupe helper.
@@ -1537,6 +1585,30 @@ class Repo:
                 inserted = 0
         return inserted
 
+    def ensure_telegram_messages_recorded(
+        self,
+        *,
+        chat_id: str,
+        idempotency_key: str,
+        message_ids: list[int],
+        kind: str = "",
+        item_id: int | None = None,
+    ) -> list[int]:
+        mids = [int(m) for m in (message_ids or []) if int(m or 0) > 0]
+        if not mids:
+            raise ValueError("no telegram message ids to record")
+        self.record_telegram_messages(
+            chat_id=chat_id,
+            idempotency_key=idempotency_key,
+            message_ids=mids,
+            kind=kind,
+            item_id=item_id,
+        )
+        missing = [mid for mid in mids if self.get_telegram_message(chat_id=chat_id, message_id=mid) is None]
+        if missing:
+            raise RuntimeError(f"telegram message mapping missing for ids={missing}")
+        return mids
+
     def get_telegram_message(self, *, chat_id: str, message_id: int) -> TelegramMessage | None:
         cid = (chat_id or "").strip()
         mid = int(message_id or 0)
@@ -1668,20 +1740,41 @@ class Repo:
         url: str = "",
         query: str,
     ) -> TelegramTask:
-        row = TelegramTask(
-            chat_id=(chat_id or "").strip(),
-            user_id=(user_id or "").strip(),
-            kind=(kind or "").strip(),
-            status=(status or "").strip(),
-            prompt_message_id=int(prompt_message_id or 0),
-            request_message_id=int(request_message_id or 0),
-            item_id=(int(item_id) if item_id is not None else None),
-            url=str(url or ""),
-            query=str(query or ""),
-        )
-        self.session.add(row)
-        self.session.commit()
-        return row
+        cid = (chat_id or "").strip()
+        prompt_mid = int(prompt_message_id or 0)
+        # `prompt_message_id` is unique per chat. Many background workflows queue with a
+        # temporary negative placeholder before the real Telegram message exists, so make
+        # placeholder creation retry-safe instead of failing the whole workflow on collision.
+        retryable_placeholder = prompt_mid <= 0
+        if retryable_placeholder and prompt_mid == 0:
+            prompt_mid = -int(dt.datetime.utcnow().timestamp() * 1_000_000)
+
+        last_exc: IntegrityError | None = None
+        for attempt in range(5):
+            current_prompt_mid = prompt_mid - attempt if retryable_placeholder else prompt_mid
+            row = TelegramTask(
+                chat_id=cid,
+                user_id=(user_id or "").strip(),
+                kind=(kind or "").strip(),
+                status=(status or "").strip(),
+                prompt_message_id=int(current_prompt_mid),
+                request_message_id=int(request_message_id or 0),
+                item_id=(int(item_id) if item_id is not None else None),
+                url=str(url or ""),
+                query=str(query or ""),
+            )
+            self.session.add(row)
+            try:
+                self.session.commit()
+                return row
+            except IntegrityError as exc:
+                self.session.rollback()
+                last_exc = exc
+                if not retryable_placeholder or attempt >= 4:
+                    raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("telegram task creation failed")
 
     def mark_telegram_task_choice(
         self,
@@ -1701,6 +1794,10 @@ class Repo:
         if provider:
             row.provider = (provider or "").strip()
         row.status = "pending"
+        row.result_key = ""
+        row.error = ""
+        row.started_at = None
+        row.finished_at = None
         self.session.commit()
         return row
 
@@ -1710,23 +1807,41 @@ class Repo:
         kind: str,
         status: str = "pending",
         mark_running: bool = True,
+        stale_running_seconds: int = 0,
+        provider: str | None = None,
+        stale_provider: str | None = None,
     ) -> TelegramTask | None:
         k = (kind or "").strip()
         st = (status or "").strip() or "pending"
         if not k:
             return None
-        stmt = (
-            select(TelegramTask)
-            .where(and_(TelegramTask.kind == k, TelegramTask.status == st))
-            .order_by(TelegramTask.created_at.asc(), TelegramTask.id.asc())
-            .limit(1)
-        )
+
+        now = dt.datetime.utcnow()
+        pending_filters = [TelegramTask.kind == k, TelegramTask.status == st]
+        if provider is not None:
+            pending_filters.append(TelegramTask.provider == (provider or "").strip())
+        stmt = select(TelegramTask).where(and_(*pending_filters)).order_by(TelegramTask.created_at.asc(), TelegramTask.id.asc()).limit(1)
         row = self.session.scalar(stmt)
+
+        stale_seconds = max(0, int(stale_running_seconds or 0))
+        if row is None and stale_seconds > 0:
+            cutoff = now - dt.timedelta(seconds=stale_seconds)
+            stale_filters = [
+                TelegramTask.kind == k,
+                TelegramTask.status == "running",
+                or_(TelegramTask.started_at.is_(None), TelegramTask.started_at < cutoff),
+            ]
+            if stale_provider is not None:
+                stale_filters.append(TelegramTask.provider == (stale_provider or "").strip())
+            stale_stmt = select(TelegramTask).where(and_(*stale_filters)).order_by(TelegramTask.started_at.asc(), TelegramTask.id.asc()).limit(1)
+            row = self.session.scalar(stale_stmt)
+
         if not row:
             return None
         if mark_running:
             row.status = "running"
-            row.started_at = dt.datetime.utcnow()
+            row.started_at = now
+            row.finished_at = None
             self.session.commit()
         return row
 
@@ -2019,6 +2134,31 @@ class Repo:
         )
         self.session.add(row)
         self.session.commit()
+        return row
+
+    def update_config_agent_run(
+        self,
+        run_id: int,
+        *,
+        status: str | None = None,
+        snapshot_after_json: str | None = None,
+        error: str | None = None,
+    ) -> ConfigAgentRun:
+        row = self.get_config_agent_run(run_id)
+        if not row:
+            raise ValueError(f"config agent run not found: {run_id}")
+        if status is not None:
+            row.status = (status or "").strip()[:16]
+        if snapshot_after_json is not None:
+            row.snapshot_after_json = str(snapshot_after_json or "")
+        if error is not None:
+            row.error = str(error or "")
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        self.session.refresh(row)
         return row
 
     def get_config_agent_run(self, run_id: int) -> ConfigAgentRun | None:

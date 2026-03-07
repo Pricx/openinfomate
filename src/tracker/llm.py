@@ -11,6 +11,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import httpx
 
 from tracker.integrations.source_binding_mcp import source_binding_mcp_tool_catalog_text
+from tracker.integrations.config_settings_mcp import settings_mcp_tool_catalog_text
 from tracker.models import Topic
 from tracker.repo import Repo
 from tracker.prompt_templates import resolve_prompt_best_effort
@@ -346,6 +347,100 @@ async def llm_plan_tracking_ai_setup(
             "Consider using Profile → One-click config (AI Setup) which transforms large inputs."
         )
     return plan, warnings
+
+
+async def llm_plan_config_agent(
+    *,
+    repo: Repo | None = None,
+    settings: Settings,
+    user_prompt: str,
+    tracking_snapshot_text: str,
+    profile_state_text: str,
+    settings_state_text: str,
+    conversation_history_text: str = "",
+    page_context_text: str = "",
+    settings_mcp_tools_text: str = "",
+    usage_cb: UsageCallback | None = None,
+) -> dict[str, Any] | None:
+    """Generate a bounded JSON plan for generic config-agent requests."""
+    if not settings.llm_base_url:
+        return None
+    kind = "config_agent_core_plan"
+    model = _select_model_for_kind(settings, kind=kind)
+    if not model:
+        return None
+    _ensure_non_codex_model(model)
+    extra_body = _load_llm_extra_body(settings, kind=kind)
+
+    base_url = _select_llm_base_url_for_kind(settings, kind=kind)
+    api_key = _select_llm_api_key_for_kind(settings, kind=kind)
+    proxy = _select_llm_proxy_for_kind(settings, kind=kind)
+
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    lang = "zh" if _contains_cjk(user_prompt) else "en"
+    config_tools = settings_mcp_tools_text or (settings_mcp_tool_catalog_text(repo=repo, settings=settings, lang=lang) if repo is not None else "")
+    system = _tpl(
+        repo,
+        settings,
+        "config_agent.core.plan.system",
+        {
+            "tracking_mcp_tools": source_binding_mcp_tool_catalog_text(lang=lang),
+            "config_settings_mcp_tools": config_tools,
+        },
+    )
+    user = _tpl(
+        repo,
+        settings,
+        "config_agent.core.plan.user",
+        {
+            "user_prompt": _truncate((user_prompt or "").strip(), 80_000),
+            "conversation_history_text": _truncate((conversation_history_text or "").strip(), 6_000),
+            "page_context_text": _truncate((page_context_text or "").strip(), 2_000),
+            "tracking_snapshot_text": _truncate((tracking_snapshot_text or "").strip(), 16_000),
+            "profile_state_text": _truncate((profile_state_text or "").strip(), 8_000),
+            "settings_state_text": _truncate((settings_state_text or "").strip(), 16_000),
+        },
+    )
+
+    max_tokens = 2400
+    try:
+        max_tokens = int(getattr(settings, "ai_setup_plan_max_tokens", 2400) or 2400)
+    except Exception:
+        max_tokens = 2400
+    max_tokens = max(1200, min(12_000, max_tokens))
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0,
+        "max_tokens": int(max_tokens),
+    }
+    payload.update(extra_body)
+
+    async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
+        data, _mode_used = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
+    resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
+    _emit_usage(usage_cb, kind=kind, model=resp_model, topic="config_agent", data=data)
+
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text content")
+    obj = _extract_first_json_object(content)
+    if not obj or not isinstance(obj, dict):
+        raise RuntimeError("LLM did not return valid JSON object")
+    return obj
 
 
 async def llm_transform_tracking_ai_setup_input(

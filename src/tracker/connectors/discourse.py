@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 # but allow RSS feeds. Cache by netloc to avoid the extra (failing) request on
 # every fetch in long-running services.
 _CF_CHALLENGED_NETLOCS: set[str] = set()
+_RSS_OPTIONAL_UNAVAILABLE_URLS: set[str] = set()
 
 
 def build_discourse_json_url(*, base_url: str, json_path: str = "/latest.json") -> str:
@@ -58,21 +59,22 @@ class DiscourseConnector(Connector):
         except Exception:
             return url
 
-    def _rss_recall_urls(self, url: str) -> list[str]:
+    def _rss_recall_urls(self, url: str, *, include_top_daily: bool = False) -> list[str]:
         """
-        Return RSS URLs to use when JSON endpoints are blocked (e.g. Cloudflare challenge).
+        Return auxiliary RSS URLs that improve recall for Discourse latest feeds.
 
-        We always include the direct RSS fallback, and (for "latest" feeds) add an
-        additional "top daily" RSS feed as a recall backstop so important posts
-        aren't missed during service downtime.
+        - primary: direct RSS fallback for the requested JSON endpoint
+        - new.rss: backstop for newly created topics that may roll off `latest` quickly
+        - top.rss?period=daily: optional stale-run backstop for older-but-important posts
         """
         primary = self._rss_fallback_url(url)
         urls: list[str] = [primary]
         try:
             parts = urlsplit(primary)
             if parts.path.rstrip("/") == "/latest.rss":
-                top_daily = urlunsplit((parts.scheme, parts.netloc, "/top.rss", "period=daily", ""))
-                urls.append(top_daily)
+                urls.append(urlunsplit((parts.scheme, parts.netloc, "/new.rss", "", "")))
+                if include_top_daily:
+                    urls.append(urlunsplit((parts.scheme, parts.netloc, "/top.rss", "period=daily", "")))
         except Exception:
             pass
         out: list[str] = []
@@ -95,6 +97,19 @@ class DiscourseConnector(Connector):
         if not rss_path.startswith("/"):
             rss_path = f"/{rss_path}"
         return urlunsplit((parts.scheme, parts.netloc, rss_path, "", ""))
+
+    def _effective_rss_catchup_pages(self, *, url: str, include_top_daily: bool) -> int:
+        pages = max(1, int(self.rss_catchup_pages or 1))
+        try:
+            primary = self._rss_fallback_url(url)
+            path = (urlsplit(primary).path or "").rstrip("/")
+        except Exception:
+            path = ""
+        if path == "/latest.rss":
+            pages = max(pages, 8)
+            if include_top_daily:
+                pages = max(pages, 12)
+        return pages
 
     def _parse_rss(self, *, text: str) -> list[FetchedEntry]:
         feed = feedparser.parse(text)
@@ -149,6 +164,38 @@ class DiscourseConnector(Connector):
                     merged.append(e)
         return merged
 
+    async def _merge_rss_urls(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        urls: list[str],
+        seen: set[str],
+        entries: list[FetchedEntry],
+    ) -> None:
+        headers = {"User-Agent": "tracker/0.1"}
+        if self.cookie:
+            headers["Cookie"] = self.cookie
+        for extra in urls:
+            if extra in _RSS_OPTIONAL_UNAVAILABLE_URLS:
+                continue
+            try:
+                extra_resp = await client.get(extra, headers=headers)
+                if extra_resp.status_code == 404:
+                    _RSS_OPTIONAL_UNAVAILABLE_URLS.add(extra)
+                    continue
+                final_url = str(getattr(extra_resp, "url", extra) or extra)
+                if extra_resp.status_code in {401, 403} or looks_like_login_redirect(
+                    original_url=extra, final_url=final_url
+                ):
+                    raise AuthRequiredError(url=extra, status_code=extra_resp.status_code, final_url=final_url)
+                extra_resp.raise_for_status()
+                for entry in self._parse_rss(text=extra_resp.text):
+                    if entry.url and entry.url not in seen:
+                        seen.add(entry.url)
+                        entries.append(entry)
+            except Exception as exc:
+                logger.info("discourse rss recall failed: url=%s err=%s", extra, exc)
+
     async def fetch(self, *, url: str, include_top_daily: bool = False) -> list[FetchedEntry]:
         parts = urlsplit(url)
         netloc = parts.netloc
@@ -157,52 +204,24 @@ class DiscourseConnector(Connector):
             if self.cookie:
                 headers["Cookie"] = self.cookie
             if netloc and netloc in _CF_CHALLENGED_NETLOCS:
-                rss_urls = self._rss_recall_urls(url)
+                rss_urls = self._rss_recall_urls(url, include_top_daily=include_top_daily)
                 primary = rss_urls[0]
-                pages = self.rss_catchup_pages if include_top_daily else 1
+                pages = self._effective_rss_catchup_pages(url=url, include_top_daily=include_top_daily)
                 entries = await self._fetch_rss_pages(client=client, primary_url=primary, pages=pages)
                 seen = {e.url for e in entries if e.url}
-                for extra in rss_urls[1:]:
-                    try:
-                        extra_resp = await client.get(extra, headers=headers)
-                        final_url = str(getattr(extra_resp, "url", extra) or extra)
-                        if extra_resp.status_code in {401, 403} or looks_like_login_redirect(
-                            original_url=extra, final_url=final_url
-                        ):
-                            raise AuthRequiredError(url=extra, status_code=extra_resp.status_code, final_url=final_url)
-                        extra_resp.raise_for_status()
-                        for e in self._parse_rss(text=extra_resp.text):
-                            if e.url and e.url not in seen:
-                                seen.add(e.url)
-                                entries.append(e)
-                    except Exception as exc:
-                        logger.info("discourse rss recall failed: url=%s err=%s", extra, exc)
+                await self._merge_rss_urls(client=client, urls=rss_urls[1:], seen=seen, entries=entries)
                 return entries
 
             resp = await client.get(url, headers=headers)
             if resp.status_code == 403 and resp.headers.get("cf-mitigated") == "challenge":
                 if netloc:
                     _CF_CHALLENGED_NETLOCS.add(netloc)
-                rss_urls = self._rss_recall_urls(url)
+                rss_urls = self._rss_recall_urls(url, include_top_daily=include_top_daily)
                 primary = rss_urls[0]
-                pages = self.rss_catchup_pages if include_top_daily else 1
+                pages = self._effective_rss_catchup_pages(url=url, include_top_daily=include_top_daily)
                 entries = await self._fetch_rss_pages(client=client, primary_url=primary, pages=pages)
                 seen = {e.url for e in entries if e.url}
-                for extra in rss_urls[1:]:
-                    try:
-                        extra_resp = await client.get(extra, headers=headers)
-                        final_url = str(getattr(extra_resp, "url", extra) or extra)
-                        if extra_resp.status_code in {401, 403} or looks_like_login_redirect(
-                            original_url=extra, final_url=final_url
-                        ):
-                            raise AuthRequiredError(url=extra, status_code=extra_resp.status_code, final_url=final_url)
-                        extra_resp.raise_for_status()
-                        for e in self._parse_rss(text=extra_resp.text):
-                            if e.url and e.url not in seen:
-                                seen.add(e.url)
-                                entries.append(e)
-                    except Exception as exc:
-                        logger.info("discourse rss recall failed: url=%s err=%s", extra, exc)
+                await self._merge_rss_urls(client=client, urls=rss_urls[1:], seen=seen, entries=entries)
                 return entries
 
             final_url = str(getattr(resp, "url", url) or url)
@@ -228,8 +247,9 @@ class DiscourseConnector(Connector):
             # fast-moving topics (or posts created during shorter downtime). When operators
             # set rss_catchup_pages>1, merge a small number of Latest RSS pages (page=0..N)
             # to improve recall while still letting the LLM decide relevance.
-            if self.rss_catchup_pages > 1:
-                rss_urls = self._rss_recall_urls(url)
+            effective_rss_pages = self._effective_rss_catchup_pages(url=url, include_top_daily=include_top_daily)
+            if effective_rss_pages > 1:
+                rss_urls = self._rss_recall_urls(url, include_top_daily=include_top_daily)
                 primary = rss_urls[0]
                 try:
                     p_parts = urlsplit(primary)
@@ -241,19 +261,20 @@ class DiscourseConnector(Connector):
                         for e in await self._fetch_rss_pages(
                             client=client,
                             primary_url=primary,
-                            pages=self.rss_catchup_pages,
+                            pages=effective_rss_pages,
                         ):
                             if e.url and e.url not in seen:
                                 seen.add(e.url)
                                 entries.append(e)
                     except Exception as exc:
                         logger.info("discourse rss recall failed: url=%s err=%s", primary, exc)
+                    await self._merge_rss_urls(client=client, urls=rss_urls[1:], seen=seen, entries=entries)
 
             # Recall backstop after downtime: if the operator requests it, merge a Top Daily RSS feed
             # even when JSON endpoints are accessible (latest.json is a moving window and may miss
             # older-but-important posts when the service was down).
             if include_top_daily:
-                rss_urls = self._rss_recall_urls(url)
+                rss_urls = self._rss_recall_urls(url, include_top_daily=include_top_daily)
                 seen = {e.url for e in entries if e.url}
                 # Also merge a bounded number of Latest RSS pages as a stronger catch-up mechanism
                 # (Top Daily doesn't always include the post we care about).
@@ -266,29 +287,20 @@ class DiscourseConnector(Connector):
                 except Exception:
                     p = None
                 already_merged_latest_pages = bool(
-                    self.rss_catchup_pages > 1 and p and p.path.rstrip("/") == "/latest.rss"
+                    effective_rss_pages > 1 and p and p.path.rstrip("/") == "/latest.rss"
                 )
                 if not already_merged_latest_pages:
                     try:
                         for e in await self._fetch_rss_pages(
                             client=client,
                             primary_url=primary,
-                            pages=self.rss_catchup_pages,
+                            pages=effective_rss_pages,
                         ):
                             if e.url and e.url not in seen:
                                 seen.add(e.url)
                                 entries.append(e)
                     except Exception as exc:
                         logger.info("discourse rss catchup failed: url=%s err=%s", primary, exc)
-                for extra in rss_urls[1:]:
-                    try:
-                        extra_resp = await client.get(extra, headers=headers)
-                        extra_resp.raise_for_status()
-                        for e in self._parse_rss(text=extra_resp.text):
-                            if e.url and e.url not in seen:
-                                seen.add(e.url)
-                                entries.append(e)
-                    except Exception as exc:
-                        logger.info("discourse rss recall failed: url=%s err=%s", extra, exc)
+                await self._merge_rss_urls(client=client, urls=rss_urls[1:], seen=seen, entries=entries)
 
             return entries

@@ -37,3 +37,21 @@ def test_profile_placeholder_is_available_for_triage_and_curate(db_session):
         assert "{{profile}}" not in (res.text or "")
         assert "Care about deployable agent engineering." in (res.text or "")
         assert "Codex CLI, MCP, Playwright" in (res.text or "")
+
+
+def test_runtime_curation_prompts_allow_profile_aligned_community_reports(db_session):
+    from tracker.prompt_templates import resolve_prompt
+    from tracker.repo import Repo
+    from tracker.settings import Settings
+
+    repo = Repo(db_session)
+    repo.set_app_config("profile_understanding", "Care about deployable AI tooling, quotas, and practical operator reports.")
+    settings = Settings(output_language="en")
+
+    triage = resolve_prompt(repo=repo, settings=settings, slot_id="llm.triage_items.system")
+    curate = resolve_prompt(repo=repo, settings=settings, slot_id="llm.curate_items.system")
+
+    for res in (triage, curate):
+        assert "community/forum field reports" in (res.text or "")
+        assert "resource-directory roundups" in (res.text or "")
+        assert "technical founder" not in (res.text or "")

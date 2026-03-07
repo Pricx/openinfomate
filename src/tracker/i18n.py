@@ -783,6 +783,7 @@ ZH_TRANSLATIONS: dict[str, str] = {
     "Open Telegram link": "打开 Telegram 链接",
     "Telegram disconnected.": "已断开 Telegram。",
     "No pending Telegram link. Generate one first.": "没有待确认的 Telegram 链接，请先生成一个。",
+    "Discarded": "已丢弃",
     "Not connected yet. Click the link and press Check again.": "仍未连接。请点击链接完成 /start 后再点一次“检查连接”。",
     # Setup: Topic
     "Create or update a topic, seed default sources, and optionally enable AI-native curation.": "创建/更新主题，添加默认来源，并可选开启 AI-native 筛选。",
@@ -964,6 +965,7 @@ ZH_TRANSLATIONS: dict[str, str] = {
     "Your profile is saved. Next, open AI Setup, generate a plan, review it, and click Apply. This step is only complete after Apply succeeds.": "画像已保存。接下来打开智能配置，生成计划、审阅预览，并点击应用。只有 Apply 成功后这一步才算完成。",
     "Current step: Push Center": "当前步骤：推送中心",
     "Open Push Center, paste a valid Telegram bot token, finish the Telegram binding link, or configure another push channel that can actually send messages.": "打开推送中心，粘贴有效的 Telegram Bot Token 并完成 Telegram 绑定；或者配置其它真正能发消息的推送渠道。",
+    "Open Push Center.": "打开推送中心。",
     "Advanced Setup Tour": "高级设置导览",
     "Enter Advanced Setup Tour (Topics / Sources / Bindings)": "进入高级设置导览（Topics / Sources / Bindings）",
     "Installation is complete. Continue with fine-grained review of topics, sources, and bindings. Close this guide once you no longer need it.": "安装已完成。接下来可继续精细检查 Topics、Sources、Bindings；不再需要时关闭本导览即可。",

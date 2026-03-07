@@ -35,7 +35,7 @@ from tracker.push_dispatch import (
 from tracker.repo import Repo
 from tracker.settings import Settings
 from tracker.timezones import resolve_cron_timezone
-from tracker.alert_budget import try_consume_alert_budget
+from tracker.alert_budget import can_send_alert_under_budget, record_alert_delivery
 from tracker.models import Item, ItemTopic, Source, Topic, TopicSource
 from tracker.llm import (
     llm_curate_topic_items,
@@ -828,11 +828,9 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
         # right after we finish the backoff/min-interval checks.
         source_jobs.append((source, bindings, now, prev_checked_at))
 
-    # Mark as checked before fetching so we don't hammer a failing source.
-    for source, _bindings, now, _prev_checked_at in source_jobs:
-        source.last_checked_at = now
-
-    session.commit()
+    # Only mark a source as checked once its fetch attempt has actually completed.
+    # Otherwise a crash between scheduling and completion creates false freshness and
+    # can silently suppress the next tick via min-interval skipping.
 
     # Discourse-specific recall: when a Discourse source is stale (service downtime),
     # merge a Top Daily RSS feed on the next fetch to avoid missing older-but-important posts
@@ -941,6 +939,7 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
 
     for source, bindings, now, _prev_checked_at in source_jobs:
         entries, fetch_error, update = fetch_results.get(source.id, (None, "fetch missing", None))
+        source.last_checked_at = now
         if fetch_error:
             error = fetch_error
 
@@ -1323,7 +1322,7 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                     if bool(getattr(settings, "alert_global_dedupe_enabled", True)):
                         # Cross-topic de-dupe: if this item was already sent as an alert for any topic,
                         # do not re-send it (common when one source is bound to multiple topics).
-                        if repo.any_push_exists_with_prefix(idempotency_prefix=f"alert:{d.item_id}:"):
+                        if repo.any_push_sent_with_prefix(idempotency_prefix=f"alert:{d.item_id}:"):
                             continue
 
                     id_key = f"alert:{d.item_id}:{d.topic_id}"
@@ -1359,9 +1358,9 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                     if domain_policy and (not domain_policy.allows_push_url(str(push_url or ""))):
                         continue
 
-                    # Only consume the per-topic alert budget the first time we attempt delivery.
-                    if not repo.any_push_exists(idempotency_key=id_key):
-                        if not try_consume_alert_budget(
+                    first_success_for_key = not repo.any_push_sent(idempotency_key=id_key)
+                    if first_success_for_key:
+                        if not can_send_alert_under_budget(
                             session=session,
                             topic_id=d.topic_id,
                             daily_cap=topic.alert_daily_cap,
@@ -1443,7 +1442,10 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                         logger.warning("push webhook failed: key=%s", id_key)
                         pass
 
-                    pushed_alerts += 1 if pushed_any else 0
+                    if pushed_any:
+                        if first_success_for_key:
+                            record_alert_delivery(session=session, topic_id=d.topic_id)
+                        pushed_alerts += 1
 
             per_source.append(
                 TickSourceResult(
@@ -1834,7 +1836,7 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                     id_key = f"alert:{item_id}:{topic_id}"
 
                     if bool(getattr(settings, "alert_global_dedupe_enabled", True)):
-                        if repo.any_push_exists_with_prefix(idempotency_prefix=f"alert:{item_id}:"):
+                        if repo.any_push_sent_with_prefix(idempotency_prefix=f"alert:{item_id}:"):
                             continue
 
                     push_url = _best_push_url_for_item(item=item, source=repo.get_source_by_id(item.source_id))
@@ -1852,8 +1854,9 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                     if domain_policy and (not domain_policy.allows_push_url(str(push_url or ""))):
                         continue
 
-                    if not repo.any_push_exists(idempotency_key=id_key):
-                        if not try_consume_alert_budget(
+                    first_success_for_key = not repo.any_push_sent(idempotency_key=id_key)
+                    if first_success_for_key:
+                        if not can_send_alert_under_budget(
                             session=session,
                             topic_id=topic_id,
                             daily_cap=topic.alert_daily_cap,
@@ -1946,6 +1949,8 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                         pass
 
                     if pushed_any:
+                        if first_success_for_key:
+                            record_alert_delivery(session=session, topic_id=topic_id)
                         total_pushed_alerts += 1
                         pushed_alerts_by_topic[topic_id] = pushed_alerts_by_topic.get(topic_id, 0) + 1
 
@@ -2194,7 +2199,7 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                             item_id = int(d.item_id)
                             # If already pushed as an alert anywhere, skip.
                             if bool(getattr(settings, "alert_global_dedupe_enabled", True)):
-                                if repo.any_push_exists_with_prefix(idempotency_prefix=f"alert:{item_id}:"):
+                                if repo.any_push_sent_with_prefix(idempotency_prefix=f"alert:{item_id}:"):
                                     continue
 
                             topic_ids = {tid for tid in (topics_by_item_id.get(item_id) or set()) if int(tid or 0) > 0}
@@ -2248,8 +2253,9 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                                 continue
 
                             id_key = f"alert:{item_id}:{chosen_topic_id}"
-                            if not repo.any_push_exists(idempotency_key=id_key):
-                                if not try_consume_alert_budget(
+                            first_success_for_key = not repo.any_push_sent(idempotency_key=id_key)
+                            if first_success_for_key:
+                                if not can_send_alert_under_budget(
                                     session=session,
                                     topic_id=chosen_topic_id,
                                     daily_cap=topic.alert_daily_cap,
@@ -2342,6 +2348,8 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                                 pass
 
                             if pushed_any:
+                                if first_success_for_key:
+                                    record_alert_delivery(session=session, topic_id=chosen_topic_id)
                                 total_pushed_alerts += 1
                                 pushed_alerts_by_topic[chosen_topic_id] = pushed_alerts_by_topic.get(chosen_topic_id, 0) + 1
 

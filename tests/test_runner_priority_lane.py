@@ -105,7 +105,7 @@ def test_priority_lane_budget_denied_falls_back_to_digest(db_session, monkeypatc
 
     monkeypatch.setattr("tracker.runner.llm_triage_topic_items", fake_triage)
     monkeypatch.setattr("tracker.runner.llm_curate_topic_items", fake_curate)
-    monkeypatch.setattr("tracker.runner.try_consume_alert_budget", lambda **kwargs: False)
+    monkeypatch.setattr("tracker.runner.can_send_alert_under_budget", lambda **kwargs: False)
     monkeypatch.setattr("tracker.runner.push_webhook_json", fake_push_webhook_json)
 
     settings = Settings(

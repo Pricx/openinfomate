@@ -4,6 +4,12 @@ import asyncio
 import httpx
 
 
+class TelegramPartialDeliveryError(RuntimeError):
+    def __init__(self, message: str, *, message_ids: list[int] | None = None):
+        super().__init__(message)
+        self.message_ids = [int(m) for m in (message_ids or []) if int(m or 0) > 0]
+
+
 def _telegram_api_url(*, bot_token: str, method: str) -> str:
     token = (bot_token or "").strip()
     if not token:
@@ -34,6 +40,11 @@ async def _tg_push_http_client() -> httpx.AsyncClient:
         limits = httpx.Limits(max_connections=40, max_keepalive_connections=20)
         _TG_PUSH_HTTP_CLIENT = httpx.AsyncClient(follow_redirects=True, limits=limits)
         return _TG_PUSH_HTTP_CLIENT
+
+
+def is_stale_telegram_edit_error(error: object) -> bool:
+    msg = (str(error or "") or "").strip().lower()
+    return ("message to edit not found" in msg) or ("message can't be edited" in msg)
 
 
 def split_telegram_message(text: str, *, limit: int = 3800) -> list[str]:
@@ -71,6 +82,19 @@ def split_telegram_message(text: str, *, limit: int = 3800) -> list[str]:
     if cur:
         out.append(cur)
     return [c for c in out if c.strip()]
+
+
+def _extract_required_message_id(payload: object, *, context: str) -> int:
+    if isinstance(payload, dict):
+        result = payload.get("result")
+        if isinstance(result, dict):
+            try:
+                mid = int(result.get("message_id") or 0)
+            except Exception:
+                mid = 0
+            if mid > 0:
+                return mid
+    raise RuntimeError(f"{context}: missing message_id")
 
 
 class TelegramPusher:
@@ -195,14 +219,7 @@ class TelegramPusher:
         if not ok:
             desc = (data.get("description") if isinstance(data, dict) else None) or "telegram api error"
             raise RuntimeError(str(desc))
-        if isinstance(data, dict):
-            result = data.get("result")
-            if isinstance(result, dict):
-                try:
-                    return int(result.get("message_id") or 0)
-                except Exception:
-                    return 0
-        return 0
+        return _extract_required_message_id(data, context="telegram sendMessage ok response")
 
     async def send_text(
         self,
@@ -212,7 +229,6 @@ class TelegramPusher:
         disable_preview: bool = True,
     ) -> list[int]:
         url = _telegram_api_url(bot_token=self.bot_token, method="sendMessage")
-        delete_url = _telegram_api_url(bot_token=self.bot_token, method="deleteMessage")
         cid = (chat_id or "").strip()
         if not cid:
             raise ValueError("missing chat_id")
@@ -235,21 +251,30 @@ class TelegramPusher:
                 mid = await self._send_part(
                     client, url=url, chat_id=cid, text=payload_text, disable_preview=disable_preview
                 )
-            except Exception:
+            except Exception as exc:
                 # Best-effort rollback: avoid leaving partial multi-part messages in chat.
-                for sent_mid in reversed(message_ids):
-                    try:
-                        await client.post(
-                            delete_url,
-                            json={"chat_id": cid, "message_id": int(sent_mid)},
-                            timeout=self.timeout_seconds,
-                        )
-                    except Exception:
-                        continue
+                undeleted_ids = await self._rollback_sent_parts(chat_id=cid, message_ids=message_ids)
+                if undeleted_ids:
+                    raise TelegramPartialDeliveryError(
+                        f"telegram multipart send failed; partial messages remain: {undeleted_ids}",
+                        message_ids=undeleted_ids,
+                    ) from exc
                 raise
             if mid > 0:
                 message_ids.append(mid)
         return message_ids
+
+    async def _rollback_sent_parts(self, *, chat_id: str, message_ids: list[int]) -> list[int]:
+        undeleted_ids: list[int] = []
+        for sent_mid in reversed([int(m) for m in (message_ids or []) if int(m or 0) > 0]):
+            try:
+                deleted = await self.delete_message(chat_id=chat_id, message_id=sent_mid)
+            except Exception:
+                deleted = False
+            if not deleted:
+                undeleted_ids.append(int(sent_mid))
+        undeleted_ids.reverse()
+        return undeleted_ids
 
     async def _send_part(
         self,
@@ -283,14 +308,7 @@ class TelegramPusher:
         if not ok:
             desc = (data.get("description") if isinstance(data, dict) else None) or "telegram api error"
             raise RuntimeError(str(desc))
-        if isinstance(data, dict):
-            result = data.get("result")
-            if isinstance(result, dict):
-                try:
-                    return int(result.get("message_id") or 0)
-                except Exception:
-                    return 0
-        return 0
+        return _extract_required_message_id(data, context="telegram sendMessage ok response")
 
     async def send_document(
         self,
@@ -328,10 +346,4 @@ class TelegramPusher:
         if not isinstance(payload, dict) or not payload.get("ok"):
             desc = (payload.get("description") if isinstance(payload, dict) else None) or "telegram api error"
             raise RuntimeError(str(desc))
-        result = payload.get("result") if isinstance(payload, dict) else None
-        if isinstance(result, dict):
-            try:
-                return int(result.get("message_id") or 0)
-            except Exception:
-                return 0
-        return 0
+        return _extract_required_message_id(payload, context="telegram sendDocument ok response")

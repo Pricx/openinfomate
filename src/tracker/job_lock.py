@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -23,11 +24,46 @@ def _sanitize_lock_name(name: str) -> str:
     return ("".join(out)[:120] or "lock").strip("._") or "lock"
 
 
+def _lock_scope_basis() -> str:
+    parts: list[str] = []
+
+    instance = (os.environ.get("OPENINFOMATE_INSTANCE") or "").strip()
+    if instance:
+        parts.append(f"instance={instance}")
+
+    env_path = (os.environ.get("TRACKER_ENV_PATH") or "").strip()
+    if env_path:
+        try:
+            env_path = str(Path(env_path).expanduser().resolve(strict=False))
+        except Exception:
+            env_path = str(Path(env_path).expanduser())
+        parts.append(f"env={env_path}")
+
+    db_url = (os.environ.get("TRACKER_DB_URL") or "").strip()
+    if db_url:
+        if db_url.startswith("sqlite:///"):
+            raw_path = db_url[len("sqlite:///") :]
+            try:
+                raw_path = str(Path(raw_path).expanduser().resolve(strict=False))
+            except Exception:
+                raw_path = str(Path(raw_path).expanduser())
+            db_url = f"sqlite:///{raw_path}"
+        parts.append(f"db={db_url}")
+
+    if not parts:
+        try:
+            parts.append(f"cwd={Path.cwd().resolve()}")
+        except Exception:
+            parts.append(f"cwd={Path.cwd()}")
+    return "|".join(parts)
+
+
 def job_lock_path(*, name: str) -> Path:
-    # Keep the lock under the working directory so systemd user services
-    # (tracker + tracker-api) share it via WorkingDirectory=%h/tracker.
     safe = _sanitize_lock_name(name)
-    return Path(".tracker_locks") / f"{safe}.lock"
+    scope = _lock_scope_basis().encode("utf-8", errors="ignore")
+    digest = hashlib.sha1(scope).hexdigest()[:12]
+    root = Path.home() / ".local" / "state" / "openinfomate" / "locks" / digest
+    return root / f"{safe}.lock"
 
 
 @contextmanager

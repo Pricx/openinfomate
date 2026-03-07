@@ -72,9 +72,21 @@ _NO_RESTART_ENV_ONLY_FIELDS: set[str] = {
 # Best-effort cache to avoid re-reading `.env` on every call.
 _ENV_ASSIGNMENTS_CACHE: dict[str, Any] = {
     "path": "",
-    "mtime": -1.0,
+    "mtime_ns": -1,
+    "size": -1,
     "assignments": {},
 }
+
+
+def _invalidate_env_assignments_cache(*, env_path: Path | None = None) -> None:
+    cached_path = str(_ENV_ASSIGNMENTS_CACHE.get("path") or "")
+    target = str(env_path) if env_path is not None else ""
+    if target and cached_path and cached_path != target:
+        return
+    _ENV_ASSIGNMENTS_CACHE["path"] = ""
+    _ENV_ASSIGNMENTS_CACHE["mtime_ns"] = -1
+    _ENV_ASSIGNMENTS_CACHE["size"] = -1
+    _ENV_ASSIGNMENTS_CACHE["assignments"] = {}
 
 
 def _load_env_assignments(settings: Settings) -> dict[str, str]:
@@ -82,10 +94,16 @@ def _load_env_assignments(settings: Settings) -> dict[str, str]:
     try:
         st = env_path.stat()
     except Exception:
+        _invalidate_env_assignments_cache(env_path=env_path)
         return {}
 
-    mtime = float(getattr(st, "st_mtime", 0.0) or 0.0)
-    if _ENV_ASSIGNMENTS_CACHE.get("path") == str(env_path) and float(_ENV_ASSIGNMENTS_CACHE.get("mtime") or -1.0) == mtime:
+    mtime_ns = int(getattr(st, "st_mtime_ns", int(float(getattr(st, "st_mtime", 0.0) or 0.0) * 1_000_000_000)) or 0)
+    size = int(getattr(st, "st_size", -1) or 0)
+    if (
+        _ENV_ASSIGNMENTS_CACHE.get("path") == str(env_path)
+        and int(_ENV_ASSIGNMENTS_CACHE.get("mtime_ns") or -1) == mtime_ns
+        and int(_ENV_ASSIGNMENTS_CACHE.get("size") or -1) == size
+    ):
         cached = _ENV_ASSIGNMENTS_CACHE.get("assignments")
         if isinstance(cached, dict):
             return cached  # type: ignore[return-value]
@@ -101,7 +119,8 @@ def _load_env_assignments(settings: Settings) -> dict[str, str]:
         assignments = {}
 
     _ENV_ASSIGNMENTS_CACHE["path"] = str(env_path)
-    _ENV_ASSIGNMENTS_CACHE["mtime"] = mtime
+    _ENV_ASSIGNMENTS_CACHE["mtime_ns"] = mtime_ns
+    _ENV_ASSIGNMENTS_CACHE["size"] = size
     _ENV_ASSIGNMENTS_CACHE["assignments"] = assignments
     return assignments
 
@@ -332,6 +351,7 @@ def apply_env_block_updates(
 
     # 2) .env updates (always write, including secrets).
     upsert_env_vars(path=env_path, updates=updates)
+    _invalidate_env_assignments_cache(env_path=env_path)
 
     # 3) Restart hint (best-effort; keep this conservative).
     #
@@ -432,6 +452,7 @@ def sync_env_and_db(
         repo.set_app_config_many(db_updates)
     if env_updates:
         upsert_env_vars(path=env_path, updates=env_updates)
+        _invalidate_env_assignments_cache(env_path=env_path)
 
     restart_required = False
     return ApplyResult(

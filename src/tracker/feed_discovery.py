@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from urllib.parse import urljoin, urlsplit
+import warnings
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 
 def _looks_like_comment_feed(url: str) -> bool:
@@ -68,13 +69,30 @@ def _looks_like_feed_type(type_value: str | None) -> bool:
     return "rss" in t or "atom" in t or t.endswith("+xml")
 
 
+def _looks_like_xml_document(html: str) -> bool:
+    head = (html or "").lstrip()[:256].lower()
+    return head.startswith("<?xml") or head.startswith("<rss") or head.startswith("<feed")
+
+
+def _make_discovery_soup(html: str) -> BeautifulSoup:
+    raw = html or ""
+    if _looks_like_xml_document(raw):
+        try:
+            return BeautifulSoup(raw, "xml")
+        except Exception:
+            pass
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", XMLParsedAsHTMLWarning)
+        return BeautifulSoup(raw, "html.parser")
+
+
 def discover_feed_urls_from_html(*, page_url: str, html: str) -> list[str]:
     """
     Extract RSS/Atom feed URLs from a HTML document.
 
     This is a best-effort helper for operators; it intentionally stays conservative.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = _make_discovery_soup(html)
     found: list[str] = []
     seen: set[str] = set()
 

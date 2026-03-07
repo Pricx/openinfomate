@@ -189,12 +189,11 @@ class Settings(BaseSettings):
     # merge Top Daily RSS once on the next fetch to avoid missing older-but-important posts.
     # 0 disables the extra recall request.
     discourse_recall_top_rss_if_stale_seconds: int = 3600
-    # Discourse RSS catch-up pages (only used when `include_top_daily` is true, i.e. stale/first-run).
-    # When Discourse JSON endpoints are blocked (e.g. Cloudflare challenge), fetching only page=0 of
-    # `latest.rss` can miss posts created during downtime on high-volume forums. This setting allows
-    # a bounded multi-page catch-up via `latest.rss?page=...` while still letting the LLM decide what
-    # is relevant.
-    discourse_rss_catchup_pages: int = 1
+    # Discourse RSS catch-up pages.
+    # High-volume Discourse sites can move faster than one `latest.json` / `latest.rss` page, so we
+    # keep a bounded multi-page recall window on latest feeds even when JSON works. This remains a
+    # recall mechanism only; the LLM still decides relevance and final push decisions.
+    discourse_rss_catchup_pages: int = 8
     source_disable_after_errors: int = 10
     source_backoff_base_seconds: int = 60
     source_backoff_max_seconds: int = 3600

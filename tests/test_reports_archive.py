@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+from types import SimpleNamespace
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -126,3 +127,35 @@ def test_cli_report_list_and_show(tmp_path, monkeypatch):
     r = runner.invoke(cli_app, ["report", "show", str(rid)])
     assert r.exit_code == 0
     assert "参考消息" in r.stdout
+
+
+
+def test_api_run_digest_force_generates_unique_manual_suffixes(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "api.db"
+    settings = Settings(db_url=f"sqlite:///{db_path}", api_token="secret")
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"x-tracker-token": "secret"}
+
+    suffixes: list[str | None] = []
+
+    async def fake_run_curated_info(*, session, settings, hours: int, push: bool, key_suffix: str | None = None):  # noqa: ANN001, ARG001
+        suffixes.append(key_suffix)
+        return SimpleNamespace(
+            since=dt.datetime.utcnow(),
+            pushed=1,
+            idempotency_key=f"digest:0:{key_suffix}",
+            markdown="# ok\n",
+        )
+
+    monkeypatch.setattr("tracker.api.run_curated_info", fake_run_curated_info)
+
+    r1 = client.post("/run/digest", headers=headers, params={"push": "true", "force": "true"})
+    r2 = client.post("/run/digest", headers=headers, params={"push": "true", "force": "true"})
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert len(suffixes) == 2
+    assert suffixes[0] and suffixes[0].startswith("manual-")
+    assert suffixes[1] and suffixes[1].startswith("manual-")
+    assert suffixes[0] != suffixes[1]

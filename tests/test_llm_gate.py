@@ -179,7 +179,7 @@ def test_llm_gate_alert_budget_falls_back_to_digest(db_session, monkeypatch):
     monkeypatch.setattr("tracker.runner.fetch_entries_for_source", fake_fetch_entries_for_source)
     monkeypatch.setattr("tracker.runner.llm_gate_alert_candidate", fake_gate)
     monkeypatch.setattr("tracker.runner.push_webhook_json", fake_push_webhook_json)
-    monkeypatch.setattr("tracker.runner.try_consume_alert_budget", lambda **kwargs: False)
+    monkeypatch.setattr("tracker.runner.can_send_alert_under_budget", lambda **kwargs: False)
 
     settings = Settings(
         webhook_url="http://example.invalid/webhook",
