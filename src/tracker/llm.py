@@ -183,6 +183,14 @@ def _kind_uses_mini_provider(kind: str) -> bool:
     return (kind or "").strip().lower() in {"digest_summary", "triage_items", "prompt_template_translate"}
 
 
+def _select_timeout_for_kind(settings: Settings, *, kind: str) -> float:  # noqa: ARG001
+    try:
+        timeout = float(getattr(settings, "llm_timeout_seconds", 90) or 90)
+    except Exception:
+        timeout = 90.0
+    return max(5.0, timeout)
+
+
 def _select_llm_base_url_for_kind(settings: Settings, *, kind: str) -> str:
     base = (settings.llm_base_url or "").strip()
     if _kind_uses_mini_provider(kind):
@@ -318,7 +326,7 @@ async def llm_plan_tracking_ai_setup(
     }
     payload.update(extra_body)
 
-    async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
+    async with httpx.AsyncClient(timeout=_select_timeout_for_kind(settings, kind=kind), proxy=proxy) as client:
         data, _mode_used = await post_openai_compat_json(
             repo=repo,
             client=client,

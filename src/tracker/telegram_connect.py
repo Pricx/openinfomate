@@ -7641,7 +7641,7 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                     placeholder_mid = -int(dt.datetime.utcnow().timestamp() * 1_000_000)
                     repo.cancel_telegram_tasks(chat_id=existing_chat_id, kind="config_agent", status="pending", reason="superseded")
                     repo.cancel_telegram_tasks(chat_id=existing_chat_id, kind="config_agent", status="awaiting", reason="superseded")
-                    repo.create_telegram_task(
+                    task = repo.create_telegram_task(
                         chat_id=existing_chat_id,
                         user_id=uid,
                         kind="config_agent",
@@ -7650,10 +7650,18 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                         request_message_id=(msg_id if msg_id > 0 else 0),
                         query=s,
                     )
-                    if _out_lang() == "zh":
-                        await _send_ack("⏳ 已加入智能配置队列…")
-                    else:
-                        await _send_ack("⏳ Queued for config planning…")
+                    ack_text = (
+                        "⏳ 已加入智能配置队列，正在规划中…\n完成后我会直接把结果写回这条消息。"
+                        if _out_lang() == "zh"
+                        else "⏳ Added to the config-planning queue and now working…\nI will write the result back into this message when it is ready."
+                    )
+                    ack_mid = int(await _send_with_markup(text=ack_text, reply_markup=None) or 0)
+                    if ack_mid > 0:
+                        try:
+                            task.prompt_message_id = ack_mid
+                            repo.session.commit()
+                        except Exception:
+                            repo.session.rollback()
                     continue
 
                 # Free-form reply comment: when the operator replies to a pushed message with

@@ -31,13 +31,13 @@ async def test_telegram_plain_message_queues_config_agent_task(tmp_path, monkeyp
     async def fake_get_updates(*, bot_token: str, offset, timeout_seconds: int, client_timeout_seconds: int):  # noqa: ANN001, ARG001
         return batches.pop(0) if batches else []
 
-    async def fake_send_text(self, *, chat_id: str, text: str, disable_preview: bool = True):  # noqa: ANN001, ARG001
+    async def fake_send_raw_text(self, *, chat_id: str, text: str, disable_preview: bool = True, reply_markup: dict | None = None):  # noqa: ANN001, ARG001
         sent.append(text)
-        return True
+        return 222
 
     monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
     monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
-    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
 
     with make_session() as session:
         repo = Repo(session)
@@ -51,6 +51,7 @@ async def test_telegram_plain_message_queues_config_agent_task(tmp_path, monkeyp
         tasks = repo.list_telegram_tasks(chat_id="123", kind="config_agent", limit=5)
         assert len(tasks) == 1
         assert tasks[0].status == "pending"
+        assert tasks[0].prompt_message_id == 222
         assert "linux.do" in (tasks[0].query or "")
     assert any("智能配置队列" in text for text in sent)
 
@@ -71,12 +72,12 @@ async def test_telegram_config_agent_reply_refines_existing_task(tmp_path, monke
     async def fake_get_updates(*, bot_token: str, offset, timeout_seconds: int, client_timeout_seconds: int):  # noqa: ANN001, ARG001
         return batches.pop(0) if batches else []
 
-    async def fake_send_text(self, *, chat_id: str, text: str, disable_preview: bool = True):  # noqa: ANN001, ARG001
-        return True
+    async def fake_send_raw_text(self, *, chat_id: str, text: str, disable_preview: bool = True, reply_markup: dict | None = None):  # noqa: ANN001, ARG001
+        return 333
 
     monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
     monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
-    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
 
     with make_session() as session:
         repo = Repo(session)
@@ -182,7 +183,7 @@ async def test_telegram_config_agent_worker_generates_preview_and_apply(tmp_path
             user_id="123",
             kind="config_agent",
             status="pending",
-            prompt_message_id=-1,
+            prompt_message_id=555,
             request_message_id=10,
             query="把参考消息窗口改成 6 小时",
         )
@@ -195,13 +196,17 @@ async def test_telegram_config_agent_worker_generates_preview_and_apply(tmp_path
             preview_markdown="# Config Agent Preview\n\n## Settings\n- `digest_hours` -> 6",
         )
 
-    raw_sent: list[dict] = []
+    edited: list[dict] = []
+
+    async def fake_edit_raw_text(self, *, chat_id: str, message_id: int, text: str, parse_mode: str | None = None, disable_preview: bool = True, reply_markup: dict | None = None):  # noqa: ANN001, ARG001
+        edited.append({"chat_id": chat_id, "message_id": message_id, "text": text, "reply_markup": reply_markup})
+        return True
 
     async def fake_send_raw_text(self, *, chat_id: str, text: str, disable_preview: bool = True, reply_markup: dict | None = None):  # noqa: ANN001, ARG001
-        raw_sent.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
-        return 555
+        raise AssertionError("send_raw_text should not be called when placeholder message exists")
 
     monkeypatch.setattr("tracker.service.plan_config_agent_request", fake_plan)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.edit_raw_text", fake_edit_raw_text)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
 
     await _run_telegram_config_agent_worker_job(make_session, settings)
@@ -213,7 +218,9 @@ async def test_telegram_config_agent_worker_generates_preview_and_apply(tmp_path
         assert task.prompt_message_id == 555
         payload = json.loads(task.intent or "{}")
         assert payload["run_id"] == 21
-    assert raw_sent and raw_sent[0]["chat_id"] == "123"
+    assert edited and edited[0]["chat_id"] == "123"
+    assert any("仍在规划中" in row["text"] for row in edited)
+    assert any("智能配置计划已生成" in row["text"] for row in edited)
 
     with make_session() as session:
         repo = Repo(session)
@@ -233,14 +240,8 @@ async def test_telegram_config_agent_worker_generates_preview_and_apply(tmp_path
     async def fake_apply(*, session, settings, plan, run_id=None):  # noqa: ANN001
         return ConfigAgentApplyResult(run_id=int(run_id or 0), notes=["settings updated: digest_hours"], warnings=[], restart_required=False)
 
-    sent_text: list[str] = []
-
-    async def fake_send_text(self, *, chat_id: str, text: str, disable_preview: bool = True):  # noqa: ANN001, ARG001
-        sent_text.append(text)
-        return True
-
     monkeypatch.setattr("tracker.service.apply_config_agent_plan", fake_apply)
-    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
 
     await _run_telegram_config_agent_worker_job(make_session, settings)
 
@@ -249,7 +250,8 @@ async def test_telegram_config_agent_worker_generates_preview_and_apply(tmp_path
         task = repo.list_telegram_tasks(chat_id="123", kind="config_agent", limit=1)[0]
         assert task.status == "done"
         assert task.result_key.startswith("config_agent_applied:")
-    assert any("智能配置已应用" in text for text in sent_text)
+        assert task.prompt_message_id == 555
+    assert any("智能配置已应用" in row["text"] for row in edited)
 
 
 @pytest.mark.asyncio
@@ -283,12 +285,12 @@ async def test_telegram_config_agent_worker_handles_reply_only_turns(tmp_path, m
 
     sent_text: list[str] = []
 
-    async def fake_send_text(self, *, chat_id: str, text: str, disable_preview: bool = True):  # noqa: ANN001, ARG001
+    async def fake_send_raw_text(self, *, chat_id: str, text: str, disable_preview: bool = True, reply_markup: dict | None = None):  # noqa: ANN001, ARG001
         sent_text.append(text)
-        return True
+        return 666
 
     monkeypatch.setattr("tracker.service.plan_config_agent_request", fake_plan)
-    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
 
     await _run_telegram_config_agent_worker_job(make_session, settings)
 
@@ -326,12 +328,12 @@ async def test_telegram_config_agent_worker_notifies_on_plan_failure(tmp_path, m
 
     sent_text: list[str] = []
 
-    async def fake_send_text(self, *, chat_id: str, text: str, disable_preview: bool = True):  # noqa: ANN001, ARG001
+    async def fake_send_raw_text(self, *, chat_id: str, text: str, disable_preview: bool = True, reply_markup: dict | None = None):  # noqa: ANN001, ARG001
         sent_text.append(text)
-        return True
+        return 666
 
     monkeypatch.setattr("tracker.service.plan_config_agent_request", fake_plan)
-    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
 
     await _run_telegram_config_agent_worker_job(make_session, settings)
 

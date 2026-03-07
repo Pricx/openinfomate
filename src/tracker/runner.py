@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 from dataclasses import dataclass
 import logging
 import re
@@ -414,6 +415,87 @@ class TickSourceResult:
     created: int
     pushed_alerts: int
     error: str | None = None
+
+@dataclass(frozen=True)
+class SourceCandidatePreview:
+    fetch_url: str
+    titles: list[str]
+    source_content: str
+    signature: str
+
+
+def _preferred_candidate_fetch_url(*, candidate_url: str, discovered_from_url: str = "") -> str:
+    fetch_url = str(candidate_url or "").strip()
+    try:
+        if discovered_from_url:
+            src = urlsplit(str(discovered_from_url or "").strip())
+            dst = urlsplit(fetch_url)
+            src_host = (src.hostname or "").strip().lower()
+            dst_host = (dst.hostname or "").strip().lower()
+            if src_host.startswith("www.") and dst_host and dst_host == src_host[4:]:
+                fetch_url = urlunsplit((dst.scheme or src.scheme, src.netloc, dst.path, dst.query, dst.fragment))
+    except Exception:
+        fetch_url = str(candidate_url or "").strip()
+    return fetch_url
+
+
+def _build_source_candidate_preview(*, entries: list[FetchedEntry], preview_limit: int) -> SourceCandidatePreview | None:
+    lines: list[str] = []
+    titles: list[str] = []
+    sig_tokens: list[str] = []
+    for e in entries[: max(1, preview_limit)]:
+        title = str(getattr(e, "title", "") or "").strip()
+        entry_url = str(getattr(e, "url", "") or "").strip()
+        summary = str(getattr(e, "summary", "") or "").strip()
+        if title:
+            titles.append(title)
+        if title and entry_url:
+            lines.append(f"- {title} | {entry_url}")
+        elif title:
+            lines.append(f"- {title}")
+        elif entry_url:
+            lines.append(f"- {entry_url}")
+        if summary:
+            lines.append(f"  summary: {' '.join(summary.split())[:320]}")
+        token = entry_url or normalize_text(title)
+        token = str(token or "").strip()
+        if token:
+            sig_tokens.append(token[:500])
+    source_content = "\n".join(lines).strip()
+    if not source_content:
+        return None
+    signature = hashlib.sha1("\n".join(sig_tokens or [source_content[:1200]]).encode("utf-8", errors="ignore")).hexdigest()
+    return SourceCandidatePreview(fetch_url="", titles=titles, source_content=source_content, signature=signature)
+
+
+async def _fetch_source_candidate_preview(
+    *,
+    connector: RssConnector,
+    candidate_url: str,
+    discovered_from_url: str = "",
+    preview_limit: int,
+) -> SourceCandidatePreview | None:
+    attempts: list[str] = []
+    preferred = _preferred_candidate_fetch_url(candidate_url=candidate_url, discovered_from_url=discovered_from_url)
+    for fetch_url in [preferred, str(candidate_url or "").strip()]:
+        url = str(fetch_url or "").strip()
+        if not url or url in attempts:
+            continue
+        attempts.append(url)
+        try:
+            entries = await connector.fetch(url=url)
+        except Exception:
+            continue
+        preview = _build_source_candidate_preview(entries=entries, preview_limit=preview_limit)
+        if preview is not None:
+            return SourceCandidatePreview(
+                fetch_url=url,
+                titles=list(preview.titles),
+                source_content=preview.source_content,
+                signature=preview.signature,
+            )
+    return None
+
 
 
 @dataclass(frozen=True)
@@ -2467,6 +2549,10 @@ async def run_discover_sources(
         pass
     profile_block = "\n\n".join([x for x in prof_lines if x.strip()]).strip()
 
+    candidate_preview_limit = max(1, min(8, int(getattr(settings, "discover_sources_auto_accept_preview_entries", 3) or 3)))
+    candidate_connector = RssConnector(timeout_seconds=settings.http_timeout_seconds)
+    candidate_previews_by_id: dict[int, SourceCandidatePreview] = {}
+
     llm_usage_cb = make_llm_usage_recorder(session=session)
     # If the operator explicitly requests discovery for certain topics, allow it even when
     # a topic is currently disabled (e.g. Smart Config creates a draft topic first).
@@ -2777,7 +2863,8 @@ async def run_discover_sources(
                 if not candidates:
                     continue
 
-                found += len(candidates)
+                valid_found = 0
+                seen_preview_signatures: set[tuple[str, str]] = set()
                 for fu in candidates:
                     # Respect global domain filters (keep the candidate pool clean).
                     try:
@@ -2790,14 +2877,42 @@ async def run_discover_sources(
                         continue
                     if exclude_patterns and host_matches_any(host=fu_parts.netloc or "", patterns=exclude_patterns):
                         continue
+
+                    preview = await _fetch_source_candidate_preview(
+                        connector=candidate_connector,
+                        candidate_url=str(fu or "").strip(),
+                        discovered_from_url=page_url,
+                        preview_limit=candidate_preview_limit,
+                    )
+                    if preview is None:
+                        continue
+
+                    sig_host = _url_host(preview.fetch_url or str(fu or "").strip()) or "_"
+                    sig_key = (sig_host, preview.signature)
+                    if sig_key in seen_preview_signatures:
+                        continue
+                    seen_preview_signatures.add(sig_key)
+
+                    candidate_url = preview.fetch_url or str(fu or "").strip()
+                    candidate_title = preview.titles[0] if preview.titles else ""
                     _cand, was_created = repo.add_source_candidate(
                         topic_id=topic.id,
                         source_type="rss",
-                        url=fu,
+                        url=candidate_url,
+                        title=candidate_title,
                         discovered_from_url=page_url,
                     )
+                    try:
+                        cid = int(getattr(_cand, "id", 0) or 0)
+                    except Exception:
+                        cid = 0
+                    if cid > 0:
+                        candidate_previews_by_id[cid] = preview
+                    valid_found += 1
                     if was_created:
                         created += 1
+
+                found += valid_found
 
             per_topic.append(
                 DiscoverSourcesTopicResult(
@@ -2822,9 +2937,9 @@ async def run_discover_sources(
                 ignore_source_candidate as ignore_source_candidate_action,
             )
 
-            preview_limit = max(1, int(settings.discover_sources_auto_accept_preview_entries or 1))
+            preview_limit = candidate_preview_limit
             max_accept = max(0, int(settings.discover_sources_auto_accept_max_per_topic or 0))
-            connector = RssConnector(timeout_seconds=settings.http_timeout_seconds)
+            connector = candidate_connector
 
             for topic in topics:
                 if max_accept <= 0:
@@ -2859,64 +2974,68 @@ async def run_discover_sources(
                     except Exception:
                         continue
 
-                    titles: list[str] = []
-                    source_content = ""
-                    try:
-                        fetch_url = str(cand.url or "").strip()
-                        # Some sites are `www.`-only; older candidate canonicalization may have stripped it.
-                        # If the candidate was discovered from a `www.` page, prefer that host for preview fetches.
+                    preview = candidate_previews_by_id.get(cid)
+                    if preview is None:
+                        preview = await _fetch_source_candidate_preview(
+                            connector=connector,
+                            candidate_url=str(cand.url or "").strip(),
+                            discovered_from_url=str(cand.discovered_from_url or "").strip(),
+                            preview_limit=preview_limit,
+                        )
+                        if preview is not None:
+                            candidate_previews_by_id[cid] = preview
+
+                    if preview is None:
                         try:
-                            if cand.discovered_from_url:
-                                src = urlsplit(str(cand.discovered_from_url or "").strip())
-                                dst = urlsplit(fetch_url)
-                                src_host = (src.hostname or "").strip().lower()
-                                dst_host = (dst.hostname or "").strip().lower()
-                                if src_host.startswith("www.") and dst_host and dst_host == src_host[4:]:
-                                    fetch_url = urlunsplit(
-                                        (dst.scheme or src.scheme, src.netloc, dst.path, dst.query, dst.fragment)
-                                    )
+                            cand.status = "ignored"
+                            repo.upsert_source_candidate_eval(
+                                candidate_id=cid,
+                                decision="ignore",
+                                score=0,
+                                quality_score=0,
+                                relevance_score=0,
+                                novelty_score=0,
+                                why=(
+                                    "无法抓取到近期条目内容；自动扩源现在会直接过滤这类空内容候选。"
+                                ),
+                                model="system:preview_validation",
+                                explore_weight=int(explore_weight),
+                                exploit_weight=int(exploit_weight),
+                            )
+                            session.commit()
                         except Exception:
-                            fetch_url = str(cand.url or "").strip()
-
-                        entries = await connector.fetch(url=fetch_url)
-                        lines: list[str] = []
-                        for e in entries[:preview_limit]:
-                            t = (e.title or "").strip()
-                            u = (e.url or "").strip()
-                            s = (e.summary or "").strip()
-                            if t:
-                                titles.append(t)
-                            if t and u:
-                                lines.append(f"- {t} | {u}")
-                            elif t:
-                                lines.append(f"- {t}")
-                            elif u:
-                                lines.append(f"- {u}")
-                            if s:
-                                s2 = " ".join(s.split())
-                                lines.append(f"  summary: {s2[:320]}")
-                        source_content = "\n".join(lines).strip()
-
-                        if fetch_url and fetch_url != str(cand.url or "").strip():
                             try:
-                                cand.url = canonicalize_url(fetch_url, strip_www=False)
-                                session.commit()
+                                session.rollback()
                             except Exception:
-                                try:
-                                    session.rollback()
-                                except Exception:
-                                    pass
-                    except Exception:
-                        titles = []
-                        source_content = ""
+                                pass
+                        continue
+
+                    if preview.fetch_url and preview.fetch_url != str(cand.url or "").strip():
+                        try:
+                            cand.url = canonicalize_url(preview.fetch_url, strip_www=False)
+                            session.commit()
+                        except Exception:
+                            try:
+                                session.rollback()
+                            except Exception:
+                                pass
+                    if preview.titles and not str(getattr(cand, "title", "") or "").strip():
+                        try:
+                            cand.title = str(preview.titles[0] or "").strip()
+                            session.commit()
+                        except Exception:
+                            try:
+                                session.rollback()
+                            except Exception:
+                                pass
 
                     candidates.append(
                         {
                             "candidate_id": cid,
-                            "url": cand.url,
+                            "url": str(cand.url or "").strip() or preview.fetch_url,
                             "discovered_from_url": cand.discovered_from_url,
-                            "titles": titles,
-                            "source_content": source_content,
+                            "titles": list(preview.titles),
+                            "source_content": preview.source_content,
                         }
                     )
                     cand_by_id[cid] = cand

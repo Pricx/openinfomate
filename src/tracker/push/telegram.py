@@ -174,6 +174,53 @@ class TelegramPusher:
         data = resp.json()
         return bool(data.get("ok")) if isinstance(data, dict) else False
 
+    async def edit_raw_text(
+        self,
+        *,
+        chat_id: str,
+        message_id: int,
+        text: str,
+        parse_mode: str | None = None,
+        disable_preview: bool = True,
+        reply_markup: dict | None = None,
+    ) -> bool:
+        url = _telegram_api_url(bot_token=self.bot_token, method="editMessageText")
+        cid = (chat_id or "").strip()
+        mid = int(message_id or 0)
+        payload_text = (text or "").strip()
+        if not (cid and mid > 0 and payload_text):
+            raise ValueError("missing chat_id/message_id or empty text")
+        payload = {
+            "chat_id": cid,
+            "message_id": mid,
+            "text": payload_text,
+            "disable_web_page_preview": bool(disable_preview),
+        }
+        if (parse_mode or "").strip():
+            payload["parse_mode"] = str(parse_mode or "").strip()
+        if isinstance(reply_markup, dict) and reply_markup:
+            payload["reply_markup"] = reply_markup
+        client = await _tg_push_http_client()
+        resp = await client.post(url, json=payload, timeout=self.timeout_seconds)
+        data: object | None = None
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+        if resp.status_code >= 400:
+            if isinstance(data, dict):
+                desc = (data.get("description") or "").strip()
+                raise RuntimeError(desc or f"telegram api error (status={resp.status_code})")
+            resp.raise_for_status()
+            raise RuntimeError(f"telegram api error (status={resp.status_code})")
+        if data is None:
+            data = resp.json()
+        ok = bool(data.get("ok")) if isinstance(data, dict) else False
+        if not ok:
+            desc = (data.get("description") if isinstance(data, dict) else None) or "telegram api error"
+            raise RuntimeError(str(desc))
+        return True
+
     async def send_raw_text(
         self,
         *,

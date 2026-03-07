@@ -1029,6 +1029,7 @@ async def _run_telegram_config_agent_worker_job(make_session, settings):
                         "chat_id": (task.chat_id or "").strip(),
                         "query": (task.query or "").strip(),
                         "intent": (task.intent or "").strip(),
+                        "prompt_message_id": int(getattr(task, "prompt_message_id", 0) or 0),
                         "out_lang": _norm_output_language(
                             (repo.get_app_config("output_language") or getattr(settings, "output_language", "") or "").strip()
                         ),
@@ -1041,10 +1042,63 @@ async def _run_telegram_config_agent_worker_job(make_session, settings):
         chat_id = str(payload.get("chat_id") or "").strip()
         user_prompt = str(payload.get("query") or "").strip()
         out_lang = str(payload.get("out_lang") or "zh").strip() or "zh"
+        prompt_mid = int(payload.get("prompt_message_id") or 0)
         if task_id <= 0 or not chat_id or not user_prompt:
             if task_id > 0:
                 await _mark_failed(task_id, error="invalid task payload")
             return
+
+        from tracker.push.telegram import TelegramPusher
+
+        p = TelegramPusher(
+            settings.telegram_bot_token,
+            timeout_seconds=int(getattr(settings, "http_timeout_seconds", 20) or 20),
+        )
+        is_zh = out_lang == "zh"
+        heartbeat_stop = asyncio.Event()
+
+        def _heartbeat_text(*, elapsed: int, tick: int = 0) -> str:
+            dots = "." * ((tick % 3) + 1)
+            return (
+                f"⏳ 智能配置仍在规划中{dots}\n已等待 {elapsed} 秒\n完成后我会直接把结果写回这条消息。"
+                if is_zh
+                else f"⏳ Config planning is still running{dots}\nElapsed: {elapsed}s\nI will write the result back into this same message when it is ready."
+            )
+
+        async def _edit_placeholder(*, text: str, reply_markup: dict | None = None) -> bool:
+            nonlocal prompt_mid
+            if not (prompt_mid > 0):
+                return False
+            try:
+                await p.edit_raw_text(chat_id=chat_id, message_id=prompt_mid, text=text, disable_preview=True, reply_markup=reply_markup)
+                return True
+            except Exception:
+                return False
+
+        async def _send_or_edit_final(*, text: str, reply_markup: dict | None = None) -> int:
+            nonlocal prompt_mid
+            if await _edit_placeholder(text=text, reply_markup=reply_markup):
+                return prompt_mid
+            sent_mid = int(await p.send_raw_text(chat_id=chat_id, text=text, disable_preview=True, reply_markup=reply_markup) or 0)
+            if sent_mid > 0:
+                prompt_mid = sent_mid
+            return sent_mid
+
+        async def _run_heartbeat() -> None:
+            started = dt.datetime.utcnow()
+            tick = 1
+            while not heartbeat_stop.is_set():
+                elapsed = max(0, int((dt.datetime.utcnow() - started).total_seconds()))
+                await _edit_placeholder(text=_heartbeat_text(elapsed=elapsed, tick=tick))
+                tick += 1
+                try:
+                    await asyncio.wait_for(heartbeat_stop.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    continue
+
+        if prompt_mid > 0:
+            await _edit_placeholder(text=_heartbeat_text(elapsed=0, tick=0))
+        heartbeat_task = asyncio.create_task(_run_heartbeat()) if prompt_mid > 0 else None
 
         try:
             with make_session() as session:
@@ -1057,18 +1111,25 @@ async def _run_telegram_config_agent_worker_job(make_session, settings):
                     client_host="telegram",
                 )
         except Exception as exc:
+            heartbeat_stop.set()
+            if heartbeat_task is not None:
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
             err = str(exc) or exc.__class__.__name__
             await _mark_failed(task_id, error=err)
-            await _notify_chat(
-                chat_id=chat_id,
-                text=(f"⚠️ 智能配置计划生成失败：{err}" if out_lang == "zh" else f"⚠️ Config planning failed: {err}"),
-            )
+            fail_text = (f"⚠️ 智能配置计划生成失败：{err}" if is_zh else f"⚠️ Config planning failed: {err}")
+            try:
+                await _send_or_edit_final(text=fail_text)
+            except Exception:
+                await _notify_chat(chat_id=chat_id, text=fail_text)
             return
+
+        heartbeat_stop.set()
+        if heartbeat_task is not None:
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
 
         preview = str(result.preview_markdown or "").strip()
         if len(preview) > 3400:
             preview = preview[:3400].rstrip() + "…"
-        is_zh = out_lang == "zh"
         plan = result.plan if isinstance(result.plan, dict) else {}
         actions = list(plan.get("actions") or [])
         questions = [str(q or "").strip() for q in (plan.get("questions") or []) if str(q or "").strip()]
@@ -1092,13 +1153,7 @@ async def _run_telegram_config_agent_worker_job(make_session, settings):
             }
 
             try:
-                from tracker.push.telegram import TelegramPusher
-
-                p = TelegramPusher(
-                    settings.telegram_bot_token,
-                    timeout_seconds=int(getattr(settings, "http_timeout_seconds", 20) or 20),
-                )
-                prompt_mid = int(await p.send_raw_text(chat_id=chat_id, text=text_out, disable_preview=True, reply_markup=kb) or 0)
+                prompt_mid = int(await _send_or_edit_final(text=text_out, reply_markup=kb) or 0)
             except Exception as exc:
                 await _mark_failed(task_id, error=f"telegram send failed: {exc}")
                 return
@@ -1131,13 +1186,7 @@ async def _run_telegram_config_agent_worker_job(make_session, settings):
         text_out = "\n\n".join([line for line in lines if str(line or "").strip()]).strip()
 
         try:
-            from tracker.push.telegram import TelegramPusher
-
-            p = TelegramPusher(
-                settings.telegram_bot_token,
-                timeout_seconds=int(getattr(settings, "http_timeout_seconds", 20) or 20),
-            )
-            await p.send_text(chat_id=chat_id, text=text_out, disable_preview=True)
+            await _send_or_edit_final(text=text_out)
         except Exception as exc:
             await _mark_failed(task_id, error=f"telegram send failed: {exc}")
             return
@@ -1145,7 +1194,10 @@ async def _run_telegram_config_agent_worker_job(make_session, settings):
         try:
             async with job_lock_async(name="jobs", timeout_seconds=60):
                 with make_session() as session:
-                    Repo(session).mark_telegram_task_done(task_id, result_key="config_agent_reply")
+                    row = Repo(session).mark_telegram_task_done(task_id, result_key="config_agent_reply")
+                    if row and prompt_mid > 0:
+                        row.prompt_message_id = prompt_mid
+                        session.commit()
         except Exception as exc:
             await _mark_failed(task_id, error=f"task finalize failed: {exc}")
 
@@ -1154,6 +1206,28 @@ async def _run_telegram_config_agent_worker_job(make_session, settings):
         chat_id = str(payload.get("chat_id") or "").strip()
         payload_text = str(payload.get("intent") or "").strip()
         out_lang = str(payload.get("out_lang") or "zh").strip() or "zh"
+        prompt_mid = int(payload.get("prompt_message_id") or 0)
+
+        from tracker.push.telegram import TelegramPusher
+
+        p = TelegramPusher(
+            settings.telegram_bot_token,
+            timeout_seconds=int(getattr(settings, "http_timeout_seconds", 20) or 20),
+        )
+
+        async def _send_or_edit_apply(*, text: str) -> int:
+            nonlocal prompt_mid
+            if prompt_mid > 0:
+                try:
+                    await p.edit_raw_text(chat_id=chat_id, message_id=prompt_mid, text=text, disable_preview=True)
+                    return prompt_mid
+                except Exception:
+                    pass
+            sent_mid = int(await p.send_raw_text(chat_id=chat_id, text=text, disable_preview=True) or 0)
+            if sent_mid > 0:
+                prompt_mid = sent_mid
+            return sent_mid
+
         try:
             payload_obj = json.loads(payload_text or "{}")
         except Exception:
@@ -1174,14 +1248,8 @@ async def _run_telegram_config_agent_worker_job(make_session, settings):
         except Exception as exc:
             await _mark_failed(task_id, error=str(exc))
             try:
-                from tracker.push.telegram import TelegramPusher
-
-                p = TelegramPusher(
-                    settings.telegram_bot_token,
-                    timeout_seconds=int(getattr(settings, "http_timeout_seconds", 20) or 20),
-                )
                 msg = f"⚠️ 智能配置应用失败：{exc}" if out_lang == "zh" else f"⚠️ Config apply failed: {exc}"
-                await p.send_text(chat_id=chat_id, text=msg, disable_preview=True)
+                await _send_or_edit_apply(text=msg)
             except Exception:
                 pass
             return
@@ -1189,17 +1257,14 @@ async def _run_telegram_config_agent_worker_job(make_session, settings):
         try:
             async with job_lock_async(name="jobs", timeout_seconds=30):
                 with make_session() as session:
-                    Repo(session).mark_telegram_task_done(task_id, result_key=f"config_agent_applied:{run_id}")
+                    row = Repo(session).mark_telegram_task_done(task_id, result_key=f"config_agent_applied:{run_id}")
+                    if row and prompt_mid > 0:
+                        row.prompt_message_id = prompt_mid
+                        session.commit()
         except Exception:
             pass
 
         try:
-            from tracker.push.telegram import TelegramPusher
-
-            p = TelegramPusher(
-                settings.telegram_bot_token,
-                timeout_seconds=int(getattr(settings, "http_timeout_seconds", 20) or 20),
-            )
             note_text = "\n".join([f"- {n}" for n in (result.notes or [])[:10]])
             if out_lang == "zh":
                 tail = "\n⚠️ 部分设置需要重启后生效。" if result.restart_required else ""
@@ -1207,7 +1272,7 @@ async def _run_telegram_config_agent_worker_job(make_session, settings):
             else:
                 tail = "\n⚠️ Some settings require restart to fully apply." if result.restart_required else ""
                 msg = f"✅ Config applied (run_id={run_id})" + ("\n" + note_text if note_text else "") + tail
-            await p.send_text(chat_id=chat_id, text=msg, disable_preview=True)
+            await _send_or_edit_apply(text=msg)
         except Exception:
             pass
 

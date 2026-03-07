@@ -102,3 +102,43 @@ def test_run_discover_sources_auto_ignores_new_candidates(db_session, monkeypatc
 
     sources = repo.list_sources()
     assert not any(s.url == "https://example.com/feed.xml" for s in sources)
+
+
+def test_run_discover_sources_marks_unpreviewable_candidates_ignored(db_session, monkeypatch):
+    repo = Repo(db_session)
+    topic = repo.add_topic(name="T", query="gpu")
+    repo.upsert_topic_policy(topic_id=topic.id, llm_curation_enabled=True, llm_curation_prompt="keep signals")
+
+    cand, _created = repo.add_source_candidate(
+        topic_id=topic.id,
+        source_type="rss",
+        url="https://example.com/feed.xml",
+        discovered_from_url="https://example.com/blog/",
+    )
+
+    async def fake_fetch(self, *, url: str):  # type: ignore[no-untyped-def]
+        return []
+
+    async def fake_decide(*, settings, topic, policy_prompt, candidates, max_accept, usage_cb=None):  # type: ignore[no-untyped-def]
+        raise AssertionError("llm_decide_source_candidates should not be called for empty-preview candidates")
+
+    monkeypatch.setattr("tracker.runner.RssConnector.fetch", fake_fetch)
+    monkeypatch.setattr("tracker.runner.llm_decide_source_candidates", fake_decide)
+
+    settings = Settings(
+        llm_base_url="http://llm.local",
+        llm_model="gpt-5.2",
+        discover_sources_auto_accept_enabled=True,
+        discover_sources_auto_accept_max_per_topic=1,
+        discover_sources_auto_accept_preview_entries=1,
+    )
+    asyncio.run(run_discover_sources(session=db_session, settings=settings, topic_ids=[topic.id]))
+
+    cand_row = repo.get_source_candidate_by_id(cand.id)
+    assert cand_row is not None
+    assert cand_row.status == "ignored"
+
+    ev = repo.get_source_candidate_eval(candidate_id=cand.id)
+    assert ev is not None
+    assert ev.decision == "ignore"
+    assert "空内容候选" in (ev.why or "")

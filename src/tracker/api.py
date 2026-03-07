@@ -3165,6 +3165,47 @@ def create_app(settings: Settings) -> FastAPI:
         )
 
     @app.get(
+        "/admin/config-agent/recent",
+        dependencies=[Depends(auth_dep)],
+        include_in_schema=False,
+    )
+    def admin_config_agent_recent(
+        request: Request,
+        after_run_id: int = 0,
+        prompt: str = "",
+        limit: int = 6,
+        session: Session = Depends(get_db),
+    ):
+        repo = Repo(session)
+        want = str(prompt or "").strip()
+        after_id = max(0, int(after_run_id or 0))
+        rows = repo.list_config_agent_runs(kind="config_agent_core", limit=max(1, min(int(limit or 6), 20)))
+        out: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            rid = int(getattr(row, "id", 0) or 0)
+            if rid <= after_id:
+                continue
+            if want and str(getattr(row, "user_prompt", "") or "").strip() != want:
+                continue
+            try:
+                plan = json.loads(str(getattr(row, "plan_json", "") or "") or "{}")
+            except Exception:
+                plan = {}
+            if not isinstance(plan, dict):
+                plan = {}
+            out.append(
+                {
+                    "run_id": rid,
+                    "status": str(getattr(row, "status", "") or ""),
+                    "user_prompt": str(getattr(row, "user_prompt", "") or ""),
+                    "plan": plan,
+                    "preview_markdown": str(getattr(row, "preview_markdown", "") or ""),
+                    "error": str(getattr(row, "error", "") or ""),
+                }
+            )
+        return JSONResponse(status_code=200, content={"ok": True, "runs": out})
+
+    @app.get(
         "/admin/config-agent/bootstrap",
         dependencies=[Depends(auth_dep)],
         include_in_schema=False,

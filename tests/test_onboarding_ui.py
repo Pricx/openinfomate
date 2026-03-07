@@ -54,6 +54,7 @@ def test_setup_wizard_includes_detailed_playbook_and_bookmark_export_help(tmp_pa
     assert "How to export browser bookmarks" in resp.text
     assert "Chrome: Bookmarks Manager" in resp.text
     assert "BotFather" in resp.text
+    assert resp.text.index("Required Setup Checklist") < resp.text.index("Step-by-step Playbook") < resp.text.index("Doctor")
 
 
 def test_push_center_includes_rebind_flow_and_bot_tutorial(tmp_path):
@@ -139,6 +140,16 @@ def test_admin_renders_floating_config_chat_widget(tmp_path):
     assert 'trackerConfigChatPanel' in resp.text
     assert 'aria-hidden="true"' in resp.text
     assert '.cfg-chat-panel[hidden] { display: none !important; }' in resp.text
+    assert 'hasStoredOpen: false' in resp.text
+    assert "Object.prototype.hasOwnProperty.call(obj, 'open')" in resp.text
+    assert 'open: !!_trackerConfigChat.open' in resp.text
+    assert 'if (_trackerConfigChat.hasStoredOpen) {' in resp.text
+    assert 'trackerConfigChatScrollToBottom()' in resp.text
+    assert "window.requestAnimationFrame(() => window.requestAnimationFrame(apply));" in resp.text
+    assert "/admin/config-agent/recent" in resp.text
+    assert "trackerConfigChatInsertPendingMessage(want)" in resp.text
+    assert "trackerConfigChatEnsurePendingWatch()" in resp.text
+    assert "data-cfg-chat-pending-id" in resp.text
     assert 'conversation_json' in resp.text
     assert 'Smart Config' in resp.text or '智能配置' in resp.text
 

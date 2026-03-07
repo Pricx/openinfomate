@@ -13,6 +13,10 @@ def test_run_discover_sources_derives_github_releases_feed(db_session, monkeypat
         assert source.type == "searxng_search"
         return [FetchedEntry(url="https://github.com/acme/widgets", title="Repo")]
 
+    async def fake_rss_fetch(self, *, url: str):  # type: ignore[no-untyped-def]
+        assert url == "https://github.com/acme/widgets/releases.atom"
+        return [FetchedEntry(url="https://github.com/acme/widgets/releases/tag/v1", title="Release")]
+
     class FakeResp:
         def __init__(self, text: str):
             self.text = text
@@ -37,6 +41,7 @@ def test_run_discover_sources_derives_github_releases_feed(db_session, monkeypat
 
     monkeypatch.setattr("tracker.runner.fetch_entries_for_source", fake_fetch_entries_for_source)
     monkeypatch.setattr("tracker.runner.httpx.AsyncClient", FakeClient)
+    monkeypatch.setattr("tracker.runner.RssConnector.fetch", fake_rss_fetch)
 
     repo = Repo(db_session)
     topic = repo.add_topic(name="T", query="x")

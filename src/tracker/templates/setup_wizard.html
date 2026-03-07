@@ -86,34 +86,6 @@
       {% endif %}
     </div>
 
-    <div class="card narrow">
-      <h2>{{ t("Doctor") }}</h2>
-      {% if doctor_report %}
-        <div class="muted">
-          {{ t("cron_timezone") }}={{ doctor_report.cron_timezone }}
-          · {{ t("now") }}={{ doctor_report.cron_now_iso }}
-        </div>
-        <div class="muted" style="margin-top:6px">
-          API=<code>{{ doctor_report.api_host }}:{{ doctor_report.api_port }}</code>
-          · auth=<code>{{ 'on' if doctor_report.api_auth_configured else 'off' }}</code>
-          · bind=<code>{{ 'public' if doctor_report.api_bind_public else 'localhost' }}</code>
-        </div>
-        <div class="actions" style="margin-top:10px">
-          <span class="badge {{ 'ok' if access_ok else 'warn' }}">{{ t("Access Control") }}</span>
-          <span class="badge {{ 'ok' if llm_ok else 'warn' }}">LLM</span>
-          <span class="badge {{ 'ok' if profile_ai_ok else 'warn' }}">{{ t("Profile + AI Setup") }}</span>
-          <span class="badge {{ 'ok' if push_ok else 'warn' }}">{{ t("Push Center") }}</span>
-        </div>
-      {% else %}
-        <div class="muted">{{ t("Doctor report unavailable.") }}</div>
-      {% endif %}
-      <div class="actions" style="margin-top:12px">
-        <a class="btn-ghost" href="/admin{{ token_qs }}">{{ t("Back to Admin") }}</a>
-      </div>
-    </div>
-  </div>
-
-  <div class="row" style="margin-top:18px">
     <div class="card wide">
       <h2>{{ t("Step-by-step Playbook") }}</h2>
       <div class="muted">{{ t("If you only follow one page, follow this order from top to bottom.") }}</div>
@@ -162,6 +134,34 @@
           <li>{{ t("You must click the generated Telegram link and press /start in Telegram to finish binding. After that, return and click Check Connection if needed.") }}</li>
         </ol>
       </details>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:18px">
+    <div class="card narrow">
+      <h2>{{ t("Doctor") }}</h2>
+      {% if doctor_report %}
+        <div class="muted">
+          {{ t("cron_timezone") }}={{ doctor_report.cron_timezone }}
+          · {{ t("now") }}={{ doctor_report.cron_now_iso }}
+        </div>
+        <div class="muted" style="margin-top:6px">
+          API=<code>{{ doctor_report.api_host }}:{{ doctor_report.api_port }}</code>
+          · auth=<code>{{ 'on' if doctor_report.api_auth_configured else 'off' }}</code>
+          · bind=<code>{{ 'public' if doctor_report.api_bind_public else 'localhost' }}</code>
+        </div>
+        <div class="actions" style="margin-top:10px">
+          <span class="badge {{ 'ok' if access_ok else 'warn' }}">{{ t("Access Control") }}</span>
+          <span class="badge {{ 'ok' if llm_ok else 'warn' }}">LLM</span>
+          <span class="badge {{ 'ok' if profile_ai_ok else 'warn' }}">{{ t("Profile + AI Setup") }}</span>
+          <span class="badge {{ 'ok' if push_ok else 'warn' }}">{{ t("Push Center") }}</span>
+        </div>
+      {% else %}
+        <div class="muted">{{ t("Doctor report unavailable.") }}</div>
+      {% endif %}
+      <div class="actions" style="margin-top:12px">
+        <a class="btn-ghost" href="/admin{{ token_qs }}">{{ t("Back to Admin") }}</a>
+      </div>
     </div>
 
     <div class="card narrow">

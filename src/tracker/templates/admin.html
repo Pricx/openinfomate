@@ -1861,7 +1861,7 @@ TRACKER_EMAIL_TO=...{% endif %}
       });
     }
 
-	    function _trackerPostForm(path, fieldsObj) {
+	    function _trackerPostForm(path, fieldsObj, opts) {
 	      let url = String(path || '');
 	      if (_trackerToken) {
 	        url += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(_trackerToken);
@@ -1870,14 +1870,29 @@ TRACKER_EMAIL_TO=...{% endif %}
       try {
         Object.entries(fieldsObj || {}).forEach(([k, v]) => fd.append(String(k), String(v ?? '')));
       } catch (e) {}
-      return fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'accept': 'application/json' }, body: fd }).then(async (r) => {
+      const timeoutMs = Math.max(0, Number(opts && opts.timeoutMs || 0));
+      const timeoutMessage = String((opts && opts.timeoutMessage) || 'Request timed out');
+      const controller = (timeoutMs > 0 && typeof AbortController !== 'undefined') ? new AbortController() : null;
+      const timer = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : 0;
+      return fetch(url, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'accept': 'application/json' },
+        body: fd,
+        signal: controller ? controller.signal : undefined,
+      }).then(async (r) => {
         const data = await r.json().catch(() => null);
         if (!r.ok) {
           const msg = (data && (data.message || data.detail || data.error)) ? String(data.message || data.detail || data.error) : ('HTTP ' + r.status);
           throw new Error(msg);
         }
 	        return data;
-	      });
+	      }).catch((err) => {
+        if (err && err.name === 'AbortError') throw new Error(timeoutMessage);
+        throw err;
+      }).finally(() => {
+        if (timer) window.clearTimeout(timer);
+      });
 	    }
 
 	    function _trackerGetJson(path) {
@@ -1900,7 +1915,11 @@ TRACKER_EMAIL_TO=...{% endif %}
       messages: [],
       pendingRunId: 0,
       open: false,
+      hasStoredOpen: false,
       loading: false,
+      heartbeatTimer: 0,
+      lastRecentSyncAt: 0,
+      syncingRecent: false,
     };
 
     function trackerConfigChatStorageKey() {
@@ -1942,6 +1961,7 @@ TRACKER_EMAIL_TO=...{% endif %}
         const payload = {
           messages: (_trackerConfigChat.messages || []).slice(-40),
           pendingRunId: Number(_trackerConfigChat.pendingRunId || 0) || 0,
+          open: !!_trackerConfigChat.open,
         };
         localStorage.setItem(trackerConfigChatStorageKey(), JSON.stringify(payload));
       } catch (e) {}
@@ -1955,8 +1975,12 @@ TRACKER_EMAIL_TO=...{% endif %}
         const msgs = Array.isArray(obj && obj.messages) ? obj.messages : [];
         _trackerConfigChat.messages = msgs.filter((msg) => msg && typeof msg === 'object').slice(-40);
         _trackerConfigChat.pendingRunId = parseInt(String(obj && obj.pendingRunId || '0'), 10) || 0;
+        _trackerConfigChat.hasStoredOpen = !!(obj && Object.prototype.hasOwnProperty.call(obj, 'open'));
+        _trackerConfigChat.open = _trackerConfigChat.hasStoredOpen ? !!obj.open : false;
         return _trackerConfigChat.messages.length > 0;
       } catch (e) {
+        _trackerConfigChat.hasStoredOpen = false;
+        _trackerConfigChat.open = false;
         return false;
       }
     }
@@ -2029,6 +2053,22 @@ TRACKER_EMAIL_TO=...{% endif %}
       });
     }
 
+    function trackerConfigChatScrollToBottom() {
+      try {
+        const list = document.getElementById('trackerConfigChatMessages');
+        if (!list) return;
+        const apply = () => {
+          try { list.scrollTop = list.scrollHeight; } catch (e) {}
+        };
+        apply();
+        if (typeof window.requestAnimationFrame === 'function') {
+          window.requestAnimationFrame(() => window.requestAnimationFrame(apply));
+        } else {
+          window.setTimeout(apply, 0);
+        }
+      } catch (e) {}
+    }
+
     function trackerConfigChatRender() {
       try {
         const list = document.getElementById('trackerConfigChatMessages');
@@ -2042,8 +2082,9 @@ TRACKER_EMAIL_TO=...{% endif %}
           const wrap = document.createElement('div');
           wrap.className = 'cfg-chat-msg ' + role;
           const bubble = document.createElement('div');
-          bubble.className = 'cfg-chat-bubble';
-          bubble.textContent = String(msg.text || '');
+          bubble.className = 'cfg-chat-bubble' + (msg.pending ? ' pending' : '');
+          bubble.textContent = msg.pending ? trackerConfigChatPendingMessageText(msg) : String(msg.text || '');
+          if (msg.pending) bubble.setAttribute('data-cfg-chat-pending-id', String(msg.id || ''));
           wrap.appendChild(bubble);
           if (msg.preview_markdown) {
             const pre = document.createElement('pre');
@@ -2070,7 +2111,8 @@ TRACKER_EMAIL_TO=...{% endif %}
         });
         const latest = (_trackerConfigChat.messages || []).slice(-1)[0];
         if (actions) trackerConfigChatRenderActions(actions, latest && latest.footer_actions ? latest.footer_actions : [], latest ? String(latest.id || '') : '');
-        try { list.scrollTop = list.scrollHeight; } catch (e) {}
+        trackerConfigChatScrollToBottom();
+        trackerConfigChatRefreshPendingUi();
       } catch (e) {}
     }
 
@@ -2114,9 +2156,13 @@ TRACKER_EMAIL_TO=...{% endif %}
         panel.setAttribute('aria-hidden', next ? 'false' : 'true');
         launcher.setAttribute('aria-expanded', next ? 'true' : 'false');
         _trackerConfigChat.open = next;
+        _trackerConfigChat.hasStoredOpen = true;
+        trackerConfigChatPersist();
         if (next) {
           const input = document.getElementById('trackerConfigChatInput');
           if (input) input.focus();
+          trackerConfigChatScrollToBottom();
+          trackerConfigChatEnsurePendingWatch();
         }
       } catch (e) {}
     }
@@ -2167,6 +2213,232 @@ TRACKER_EMAIL_TO=...{% endif %}
       };
     }
 
+    function trackerConfigChatFindPendingMessage() {
+      try {
+        const msgs = Array.isArray(_trackerConfigChat.messages) ? _trackerConfigChat.messages : [];
+        for (let i = msgs.length - 1; i >= 0; i -= 1) {
+          const msg = msgs[i];
+          if (msg && typeof msg === 'object' && msg.pending) return msg;
+        }
+      } catch (e) {}
+      return null;
+    }
+
+    function trackerConfigChatHasPendingMessage() {
+      return !!trackerConfigChatFindPendingMessage();
+    }
+
+    function trackerConfigChatPendingElapsedSeconds(msg) {
+      try {
+        const started = Math.max(0, Number(msg && msg.pending_started_at || 0));
+        if (!(started > 0)) return 0;
+        return Math.max(0, Math.floor((Date.now() - started) / 1000));
+      } catch (e) {
+        return 0;
+      }
+    }
+
+    function trackerConfigChatPendingMessageText(msg) {
+      const bootstrap = _trackerConfigChat.bootstrap || {};
+      const zh = String(bootstrap.lang || 'en') === 'zh';
+      const elapsed = trackerConfigChatPendingElapsedSeconds(msg);
+      const dots = '.'.repeat((elapsed % 3) + 1);
+      const detached = !!(msg && msg.pending_detached);
+      if (zh) {
+        return detached
+          ? ('⏳ 仍在后台规划中' + dots + '
+已等待 ' + String(elapsed) + ' 秒
+刷新后我会继续把结果补回这里。')
+          : ('⏳ 正在规划中' + dots + '
+已等待 ' + String(elapsed) + ' 秒
+保持页面打开或刷新都可以，我会把结果补回这里。');
+      }
+      return detached
+        ? ('⏳ Still planning in the background' + dots + '
+Elapsed: ' + String(elapsed) + 's
+After refresh, I will recover the result back into this chat.')
+        : ('⏳ Planning in progress' + dots + '
+Elapsed: ' + String(elapsed) + 's
+Keep the page open or refresh it; I will recover the result back into this chat.');
+    }
+
+    function trackerConfigChatPendingStatusText(msg) {
+      const bootstrap = _trackerConfigChat.bootstrap || {};
+      const zh = String(bootstrap.lang || 'en') === 'zh';
+      const elapsed = trackerConfigChatPendingElapsedSeconds(msg);
+      return zh ? ('规划中… 已等待 ' + String(elapsed) + ' 秒') : ('Planning… elapsed ' + String(elapsed) + 's');
+    }
+
+    function trackerConfigChatReplaceMessage(messageId, patch) {
+      const target = String(messageId || '');
+      if (!target) return;
+      _trackerConfigChat.messages = (_trackerConfigChat.messages || []).map((msg) => {
+        if (String(msg && msg.id || '') !== target) return msg;
+        return Object.assign({}, msg || {}, patch || {});
+      });
+      trackerConfigChatPersist();
+      trackerConfigChatRender();
+    }
+
+    function trackerConfigChatInsertPendingMessage(prompt) {
+      const existing = trackerConfigChatFindPendingMessage();
+      const pending = {
+        id: 'pending-' + String(Date.now()) + '-' + String(Math.random()).slice(2),
+        role: 'assistant',
+        text: '',
+        pending: true,
+        pending_prompt: String(prompt || '').trim(),
+        pending_started_at: Date.now(),
+        pending_detached: false,
+      };
+      if (existing && existing.id) {
+        trackerConfigChatReplaceMessage(existing.id, pending);
+        return String(existing.id);
+      }
+      _trackerConfigChat.messages.push(pending);
+      if (_trackerConfigChat.messages.length > 40) _trackerConfigChat.messages = _trackerConfigChat.messages.slice(-40);
+      trackerConfigChatPersist();
+      trackerConfigChatRender();
+      return String(pending.id);
+    }
+
+    function trackerConfigChatResolvePendingMessage(payload) {
+      const pending = trackerConfigChatFindPendingMessage();
+      if (!pending || !pending.id) {
+        trackerConfigChatPushMessage(payload || {});
+        return;
+      }
+      trackerConfigChatReplaceMessage(String(pending.id), Object.assign({}, payload || {}, {
+        pending: false,
+        pending_prompt: '',
+        pending_started_at: 0,
+        pending_detached: false,
+      }));
+    }
+
+    function trackerConfigChatFailPendingMessage(text, meta) {
+      trackerConfigChatResolvePendingMessage({
+        role: 'assistant',
+        text: String(text || 'error'),
+        meta: String(meta || '{{ t("Failed") }}'),
+        actions: [],
+      });
+    }
+
+    function trackerConfigChatSeenRunIds() {
+      const ids = new Set();
+      try {
+        (_trackerConfigChat.messages || []).forEach((msg) => {
+          const rid = parseInt(String(msg && msg.run_id || '0'), 10) || 0;
+          if (rid > 0) ids.add(rid);
+        });
+      } catch (e) {}
+      return ids;
+    }
+
+    function trackerConfigChatBuildRecoveredRunMessage(run) {
+      try {
+        const bootstrap = _trackerConfigChat.bootstrap || {};
+        const rid = parseInt(String(run && run.run_id || '0'), 10) || 0;
+        if (!(rid > 0)) return null;
+        const plan = (run && run.plan && typeof run.plan === 'object') ? run.plan : {};
+        const hasActions = trackerConfigChatPlanHasActions(plan);
+        const status = String(run && run.status || 'planned');
+        const msg = {
+          role: 'assistant',
+          text: trackerConfigChatComposeReplyText(bootstrap, {
+            plan,
+            warnings: [],
+            preview_markdown: String(run && run.preview_markdown || ''),
+          }),
+          run_id: rid,
+          preview_markdown: hasActions ? String(run && run.preview_markdown || '') : '',
+          actions: (status === 'planned' && hasActions)
+            ? [
+                { kind: 'apply', label: String(bootstrap.apply_label || 'Apply'), run_id: rid },
+                { kind: 'discard', label: String(bootstrap.discard_label || 'Discard'), run_id: rid },
+              ]
+            : [],
+        };
+        if (status === 'applied') msg.meta = '{{ t("Saved") }}';
+        else if (status === 'failed') msg.meta = String(run && run.error || '{{ t("Failed") }}');
+        else msg.meta = '{{ t("Recovered") }}';
+        return msg;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    async function trackerConfigChatSyncRecentRuns() {
+      const pending = trackerConfigChatFindPendingMessage();
+      if (!pending) return 0;
+      if (_trackerConfigChat.syncingRecent) return 0;
+      _trackerConfigChat.syncingRecent = true;
+      try {
+        const prompt = String(pending.pending_prompt || '').trim();
+        if (!prompt) return 0;
+        const seen = trackerConfigChatSeenRunIds();
+        let afterRunId = 0;
+        seen.forEach((rid) => { if (rid > afterRunId) afterRunId = rid; });
+        const data = await _trackerGetJson('/admin/config-agent/recent?after_run_id=' + encodeURIComponent(String(afterRunId)) + '&limit=6&prompt=' + encodeURIComponent(prompt));
+        const runs = Array.isArray(data && data.runs) ? data.runs : [];
+        let recovered = 0;
+        runs.forEach((run) => {
+          const rid = parseInt(String(run && run.run_id || '0'), 10) || 0;
+          if (!(rid > 0) || seen.has(rid)) return;
+          const msg = trackerConfigChatBuildRecoveredRunMessage(run);
+          if (!msg) return;
+          seen.add(rid);
+          trackerConfigChatResolvePendingMessage(msg);
+          recovered += 1;
+        });
+        return recovered;
+      } catch (e) {
+        return 0;
+      } finally {
+        _trackerConfigChat.syncingRecent = false;
+      }
+    }
+
+    function trackerConfigChatRefreshPendingUi() {
+      const pending = trackerConfigChatFindPendingMessage();
+      const sendBtn = document.getElementById('trackerConfigChatSendBtn');
+      if (!pending) {
+        if (!_trackerConfigChat.loading) trackerConfigChatSetStatus('');
+        if (sendBtn && !_trackerConfigChat.loading) sendBtn.disabled = false;
+        if (_trackerConfigChat.heartbeatTimer) {
+          window.clearInterval(_trackerConfigChat.heartbeatTimer);
+          _trackerConfigChat.heartbeatTimer = 0;
+        }
+        return;
+      }
+      trackerConfigChatSetStatus(trackerConfigChatPendingStatusText(pending));
+      if (sendBtn) sendBtn.disabled = true;
+      try {
+        document.querySelectorAll('[data-cfg-chat-pending-id]').forEach((el) => {
+          const mid = String(el.getAttribute('data-cfg-chat-pending-id') || '');
+          const msg = (_trackerConfigChat.messages || []).find((row) => String(row && row.id || '') === mid);
+          if (msg) el.textContent = trackerConfigChatPendingMessageText(msg);
+        });
+      } catch (e) {}
+    }
+
+    function trackerConfigChatEnsurePendingWatch() {
+      trackerConfigChatRefreshPendingUi();
+      if (!trackerConfigChatHasPendingMessage()) return;
+      if (_trackerConfigChat.heartbeatTimer) return;
+      _trackerConfigChat.lastRecentSyncAt = 0;
+      _trackerConfigChat.heartbeatTimer = window.setInterval(async () => {
+        trackerConfigChatRefreshPendingUi();
+        if (!trackerConfigChatHasPendingMessage()) return;
+        const now = Date.now();
+        if ((now - Number(_trackerConfigChat.lastRecentSyncAt || 0)) < 5000) return;
+        _trackerConfigChat.lastRecentSyncAt = now;
+        await trackerConfigChatSyncRecentRuns();
+        trackerConfigChatRefreshPendingUi();
+      }, 1000);
+    }
+
     async function trackerConfigChatSend(event) {
       try { if (event && event.preventDefault) event.preventDefault(); } catch (e) {}
       const bootstrap = _trackerConfigChat.bootstrap || {};
@@ -2179,14 +2451,19 @@ TRACKER_EMAIL_TO=...{% endif %}
         trackerConfigChatToggle(true);
         return;
       }
-      if (_trackerConfigChat.loading) return;
+      if (_trackerConfigChat.loading || trackerConfigChatHasPendingMessage()) {
+        trackerShowToast(String((bootstrap.lang || 'en') === 'zh' ? '上一条智能配置还在规划中，请先等它完成。' : 'The previous smart-config request is still running. Please wait for it to finish.'), 'warning', String(bootstrap.panel_title || 'Smart Config'), 4200);
+        trackerConfigChatEnsurePendingWatch();
+        return;
+      }
       _trackerConfigChat.loading = true;
-      trackerConfigChatSetStatus(String(bootstrap.thinking_label || 'Planning…'));
       const sendBtn = document.getElementById('trackerConfigChatSendBtn');
       if (sendBtn) sendBtn.disabled = true;
       const history = trackerConfigChatPlannerHistory();
       trackerConfigChatPushMessage({ role: 'user', text: want });
       trackerConfigChatClearInput();
+      trackerConfigChatInsertPendingMessage(want);
+      trackerConfigChatEnsurePendingWatch();
       try {
         const data = await _trackerPostForm('/admin/config-agent/plan', {
           user_prompt: want,
@@ -2199,7 +2476,7 @@ TRACKER_EMAIL_TO=...{% endif %}
         const hasActions = trackerConfigChatPlanHasActions(plan);
         const rid = hasActions ? (parseInt(String(data.run_id || '0'), 10) || 0) : 0;
         _trackerConfigChat.pendingRunId = rid > 0 ? rid : 0;
-        trackerConfigChatPushMessage({
+        trackerConfigChatResolvePendingMessage({
           role: 'assistant',
           text: trackerConfigChatComposeReplyText(bootstrap, data),
           run_id: rid,
@@ -2212,12 +2489,21 @@ TRACKER_EMAIL_TO=...{% endif %}
             : [],
         });
       } catch (e) {
-        trackerConfigChatPushMessage({ role: 'assistant', text: String(e || 'error') });
-        trackerShowToast(String(e || 'error'), 'error', String(bootstrap.panel_title || 'Smart Config'), 5200);
+        const recovered = await trackerConfigChatSyncRecentRuns();
+        if (!(recovered > 0)) {
+          const errText = String(e || 'error');
+          const pending = trackerConfigChatFindPendingMessage();
+          if (pending && /failed to fetch|network|load failed|abort/i.test(errText.toLowerCase())) {
+            trackerConfigChatReplaceMessage(String(pending.id), { pending_detached: true });
+            trackerConfigChatEnsurePendingWatch();
+          } else {
+            trackerConfigChatFailPendingMessage(errText, '{{ t("Failed") }}');
+            trackerShowToast(errText, 'error', String(bootstrap.panel_title || 'Smart Config'), 5200);
+          }
+        }
       } finally {
         _trackerConfigChat.loading = false;
-        trackerConfigChatSetStatus('');
-        if (sendBtn) sendBtn.disabled = false;
+        trackerConfigChatRefreshPendingUi();
       }
     }
 
@@ -2295,9 +2581,12 @@ TRACKER_EMAIL_TO=...{% endif %}
         if (closeBtn) closeBtn.addEventListener('click', () => trackerConfigChatToggle(false));
         const input = document.getElementById('trackerConfigChatInput');
         if (input) input.addEventListener('keydown', trackerConfigChatHandleKeydown);
-        if (_trackerConfigChat.bootstrap && _trackerConfigChat.bootstrap.auto_open && (_trackerConfigChat.messages || []).length <= 1) {
+        if (_trackerConfigChat.hasStoredOpen) {
+          trackerConfigChatToggle(!!_trackerConfigChat.open);
+        } else if (_trackerConfigChat.bootstrap && _trackerConfigChat.bootstrap.auto_open && (_trackerConfigChat.messages || []).length <= 1) {
           trackerConfigChatToggle(true);
         }
+        trackerConfigChatEnsurePendingWatch();
       } catch (e) {}
     }
 
@@ -2566,6 +2855,15 @@ TRACKER_EMAIL_TO=...{% endif %}
           topLine.appendChild(sBadge);
           topLine.appendChild(urlWrap);
           row.appendChild(topLine);
+
+          const title = String(c.title || '').trim();
+          if (title) {
+            const titleEl = document.createElement('div');
+            titleEl.style.marginTop = '6px';
+            titleEl.style.fontWeight = '600';
+            titleEl.textContent = title;
+            row.appendChild(titleEl);
+          }
 
           const meta = document.createElement('div');
           meta.className = 'muted';

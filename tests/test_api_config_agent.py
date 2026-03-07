@@ -153,3 +153,41 @@ def test_admin_config_agent_plan_endpoint_supports_reply_only_turns(tmp_path, mo
     assert body["plan"]["assistant_reply"].startswith("我可以回答配置问题")
     assert body["preview_markdown"] == ""
 
+
+
+def test_admin_config_agent_recent_endpoint_recovers_matching_runs(tmp_path):
+    db_path = Path(tmp_path) / "api-config-agent-recent.db"
+    env_path = Path(tmp_path) / ".env"
+    settings = Settings(db_url=f"sqlite:///{db_path}", api_token="secret", env_path=str(env_path))
+    app = create_app(settings)
+    client = TestClient(app)
+
+    _engine, make_session = session_factory(settings)
+    with make_session() as session:
+        repo = Repo(session)
+        repo.add_config_agent_run(
+            kind="config_agent_core",
+            status="planned",
+            user_prompt="别的需求",
+            plan_json=json.dumps({"actions": [{"op": "mcp.setting.set", "field": "digest_hours", "value": "4"}]}, ensure_ascii=False),
+            preview_markdown="# other",
+            snapshot_before_json="{}",
+        )
+        repo.add_config_agent_run(
+            kind="config_agent_core",
+            status="planned",
+            user_prompt="我想要linuxdo这种前沿技术论坛的rss，是否还有更多类似的高质量技术论坛，帮我搜索",
+            plan_json=json.dumps({"assistant_reply": "ok", "actions": [{"op": "source.add_rss", "url": "https://example.com/feed.xml"}]}, ensure_ascii=False),
+            preview_markdown="# preview",
+            snapshot_before_json="{}",
+        )
+
+    resp = client.get(
+        "/admin/config-agent/recent?token=secret&after_run_id=0&prompt=我想要linuxdo这种前沿技术论坛的rss，是否还有更多类似的高质量技术论坛，帮我搜索"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert len(body["runs"]) == 1
+    assert body["runs"][0]["plan"]["assistant_reply"] == "ok"
+    assert body["runs"][0]["preview_markdown"] == "# preview"
