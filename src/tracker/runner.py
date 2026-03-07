@@ -3934,6 +3934,50 @@ async def run_curated_info(
         h = 24
     since = now_utc - dt.timedelta(hours=h)
 
+    def _recent_curated_rows() -> list[tuple[object, object, object, object]]:
+        return repo.list_recent_events(
+            topic=None,
+            decisions=["alert", "digest"],
+            since=since,
+            limit=5000,
+        )
+
+    rows = _recent_curated_rows()
+    if not rows:
+        stalled_topic_ids: list[int] = []
+        try:
+            for topic in repo.list_topics():
+                if not getattr(topic, "enabled", True):
+                    continue
+                pending = repo.list_uncurated_item_topics_for_topic(topic=topic, since=since, limit=1)
+                if pending:
+                    stalled_topic_ids.append(int(topic.id))
+        except Exception:
+            stalled_topic_ids = []
+
+        if stalled_topic_ids:
+            logger.warning(
+                "curated info window is empty but found stalled candidates; auto-running digest repair: hours=%s topics=%s",
+                h,
+                ",".join(str(x) for x in stalled_topic_ids),
+            )
+            try:
+                await run_digest(
+                    session=session,
+                    settings=settings,
+                    hours=h,
+                    push=False,
+                    topic_ids=stalled_topic_ids,
+                    key_suffix=f"autorepair-{now_utc.strftime('%Y%m%d%H%M%S')}",
+                )
+                try:
+                    session.expire_all()
+                except Exception:
+                    pass
+                rows = _recent_curated_rows()
+            except Exception as exc:
+                logger.warning("curated info auto-repair failed: %s", exc)
+
     # Explicit operator feedback: muted domains should not appear in Curated Info.
     active_mute_domains: set[str] = set()
     try:
@@ -3967,13 +4011,6 @@ async def run_curated_info(
     by_item_id: dict[int, dict] = {}
 
     # NOTE: list_recent_events is ordered by recency; we still re-sort after grouping.
-    rows = repo.list_recent_events(
-        topic=None,
-        decisions=["alert", "digest"],
-        since=since,
-        # Curated Info is the "show all" surface; keep a high cap but still bounded.
-        limit=5000,
-    )
     for it_row, item, topic, source in rows:
         try:
             if not getattr(topic, "enabled", True):
