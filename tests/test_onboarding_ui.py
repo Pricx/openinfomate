@@ -146,6 +146,7 @@ def test_admin_renders_floating_config_chat_widget(tmp_path):
     assert 'if (_trackerConfigChat.hasStoredOpen) {' in resp.text
     assert 'trackerConfigChatScrollToBottom()' in resp.text
     assert "window.requestAnimationFrame(() => window.requestAnimationFrame(apply));" in resp.text
+    assert "\\nElapsed: " in resp.text
     assert "/admin/config-agent/recent" in resp.text
     assert "trackerConfigChatInsertPendingMessage(want)" in resp.text
     assert "trackerConfigChatEnsurePendingWatch()" in resp.text

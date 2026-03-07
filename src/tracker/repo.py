@@ -1847,6 +1847,15 @@ class Repo:
         self.session.commit()
         return row
 
+    def set_telegram_task_prompt_message(self, task_id: int, *, prompt_message_id: int) -> TelegramTask | None:
+        row = self.session.get(TelegramTask, int(task_id or 0))
+        mid = int(prompt_message_id or 0)
+        if not row or mid == 0:
+            return row
+        row.prompt_message_id = mid
+        self.session.commit()
+        return row
+
     def mark_telegram_task_canceled(self, task_id: int, *, reason: str = "") -> TelegramTask | None:
         row = self.session.get(TelegramTask, int(task_id or 0))
         if not row:

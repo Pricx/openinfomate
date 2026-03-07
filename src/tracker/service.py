@@ -1065,6 +1065,19 @@ async def _run_telegram_config_agent_worker_job(make_session, settings):
                 else f"⏳ Config planning is still running{dots}\nElapsed: {elapsed}s\nI will write the result back into this same message when it is ready."
             )
 
+        async def _persist_prompt_message_id(mid: int) -> None:
+            nonlocal prompt_mid
+            clean_mid = int(mid or 0)
+            if clean_mid <= 0:
+                return
+            prompt_mid = clean_mid
+            try:
+                async with job_lock_async(name="jobs", timeout_seconds=60):
+                    with make_session() as session:
+                        Repo(session).set_telegram_task_prompt_message(task_id, prompt_message_id=clean_mid)
+            except Exception:
+                return
+
         async def _edit_placeholder(*, text: str, reply_markup: dict | None = None) -> bool:
             nonlocal prompt_mid
             if not (prompt_mid > 0):
@@ -1075,13 +1088,21 @@ async def _run_telegram_config_agent_worker_job(make_session, settings):
             except Exception:
                 return False
 
+        async def _ensure_placeholder_message() -> int:
+            if prompt_mid > 0:
+                return prompt_mid
+            sent_mid = int(await p.send_raw_text(chat_id=chat_id, text=_heartbeat_text(elapsed=0, tick=0), disable_preview=True) or 0)
+            if sent_mid > 0:
+                await _persist_prompt_message_id(sent_mid)
+            return sent_mid
+
         async def _send_or_edit_final(*, text: str, reply_markup: dict | None = None) -> int:
             nonlocal prompt_mid
             if await _edit_placeholder(text=text, reply_markup=reply_markup):
                 return prompt_mid
             sent_mid = int(await p.send_raw_text(chat_id=chat_id, text=text, disable_preview=True, reply_markup=reply_markup) or 0)
             if sent_mid > 0:
-                prompt_mid = sent_mid
+                await _persist_prompt_message_id(sent_mid)
             return sent_mid
 
         async def _run_heartbeat() -> None:
@@ -1098,6 +1119,11 @@ async def _run_telegram_config_agent_worker_job(make_session, settings):
 
         if prompt_mid > 0:
             await _edit_placeholder(text=_heartbeat_text(elapsed=0, tick=0))
+        else:
+            try:
+                await _ensure_placeholder_message()
+            except Exception:
+                pass
         heartbeat_task = asyncio.create_task(_run_heartbeat()) if prompt_mid > 0 else None
 
         try:

@@ -2246,20 +2246,12 @@ TRACKER_EMAIL_TO=...{% endif %}
       const detached = !!(msg && msg.pending_detached);
       if (zh) {
         return detached
-          ? ('⏳ 仍在后台规划中' + dots + '
-已等待 ' + String(elapsed) + ' 秒
-刷新后我会继续把结果补回这里。')
-          : ('⏳ 正在规划中' + dots + '
-已等待 ' + String(elapsed) + ' 秒
-保持页面打开或刷新都可以，我会把结果补回这里。');
+          ? ('⏳ 仍在后台规划中' + dots + '\n已等待 ' + String(elapsed) + ' 秒\n刷新后我会继续把结果补回这里。')
+          : ('⏳ 正在规划中' + dots + '\n已等待 ' + String(elapsed) + ' 秒\n保持页面打开或刷新都可以，我会把结果补回这里。');
       }
       return detached
-        ? ('⏳ Still planning in the background' + dots + '
-Elapsed: ' + String(elapsed) + 's
-After refresh, I will recover the result back into this chat.')
-        : ('⏳ Planning in progress' + dots + '
-Elapsed: ' + String(elapsed) + 's
-Keep the page open or refresh it; I will recover the result back into this chat.');
+        ? ('⏳ Still planning in the background' + dots + '\nElapsed: ' + String(elapsed) + 's\nAfter refresh, I will recover the result back into this chat.')
+        : ('⏳ Planning in progress' + dots + '\nElapsed: ' + String(elapsed) + 's\nKeep the page open or refresh it; I will recover the result back into this chat.');
     }
 
     function trackerConfigChatPendingStatusText(msg) {

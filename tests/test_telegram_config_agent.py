@@ -72,7 +72,10 @@ async def test_telegram_config_agent_reply_refines_existing_task(tmp_path, monke
     async def fake_get_updates(*, bot_token: str, offset, timeout_seconds: int, client_timeout_seconds: int):  # noqa: ANN001, ARG001
         return batches.pop(0) if batches else []
 
+    sent: list[str] = []
+
     async def fake_send_raw_text(self, *, chat_id: str, text: str, disable_preview: bool = True, reply_markup: dict | None = None):  # noqa: ANN001, ARG001
+        sent.append(text)
         return 333
 
     monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
@@ -102,8 +105,10 @@ async def test_telegram_config_agent_reply_refines_existing_task(tmp_path, monke
         tasks = repo.list_telegram_tasks(chat_id="123", kind="config_agent", limit=10)
         pending = [t for t in tasks if t.status == "pending"]
         assert len(pending) == 1
+        assert pending[0].prompt_message_id == 333
         assert "加入 linux.do 的 codex fast 搜索" in (pending[0].query or "")
         assert "补充/修订" in (pending[0].query or "")
+    assert any("智能配置修订队列" in text for text in sent)
 
 
 @pytest.mark.asyncio
@@ -284,13 +289,19 @@ async def test_telegram_config_agent_worker_handles_reply_only_turns(tmp_path, m
         )
 
     sent_text: list[str] = []
+    edited: list[str] = []
 
     async def fake_send_raw_text(self, *, chat_id: str, text: str, disable_preview: bool = True, reply_markup: dict | None = None):  # noqa: ANN001, ARG001
         sent_text.append(text)
         return 666
 
+    async def fake_edit_raw_text(self, *, chat_id: str, message_id: int, text: str, parse_mode: str | None = None, disable_preview: bool = True, reply_markup: dict | None = None):  # noqa: ANN001, ARG001
+        edited.append(text)
+        return True
+
     monkeypatch.setattr("tracker.service.plan_config_agent_request", fake_plan)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.edit_raw_text", fake_edit_raw_text)
 
     await _run_telegram_config_agent_worker_job(make_session, settings)
 
@@ -299,7 +310,10 @@ async def test_telegram_config_agent_worker_handles_reply_only_turns(tmp_path, m
         task = repo.list_telegram_tasks(chat_id="123", kind="config_agent", limit=1)[0]
         assert task.status == "done"
         assert task.result_key == "config_agent_reply"
-    assert sent_text == ["我是 OpenInfoMate 的智能配置助手。"]
+        assert task.prompt_message_id == 666
+    assert len(sent_text) == 1
+    assert "仍在规划中" in sent_text[0]
+    assert edited == ["我是 OpenInfoMate 的智能配置助手。"]
 
 
 @pytest.mark.asyncio
@@ -327,13 +341,19 @@ async def test_telegram_config_agent_worker_notifies_on_plan_failure(tmp_path, m
         raise RuntimeError("llm unavailable")
 
     sent_text: list[str] = []
+    edited: list[str] = []
 
     async def fake_send_raw_text(self, *, chat_id: str, text: str, disable_preview: bool = True, reply_markup: dict | None = None):  # noqa: ANN001, ARG001
         sent_text.append(text)
         return 666
 
+    async def fake_edit_raw_text(self, *, chat_id: str, message_id: int, text: str, parse_mode: str | None = None, disable_preview: bool = True, reply_markup: dict | None = None):  # noqa: ANN001, ARG001
+        edited.append(text)
+        return True
+
     monkeypatch.setattr("tracker.service.plan_config_agent_request", fake_plan)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.edit_raw_text", fake_edit_raw_text)
 
     await _run_telegram_config_agent_worker_job(make_session, settings)
 
@@ -341,5 +361,8 @@ async def test_telegram_config_agent_worker_notifies_on_plan_failure(tmp_path, m
         repo = Repo(session)
         task = repo.list_telegram_tasks(chat_id="123", kind="config_agent", limit=1)[0]
         assert task.status == "failed"
+        assert task.prompt_message_id == 666
         assert "llm unavailable" in (task.error or "")
-    assert any("计划生成失败" in text for text in sent_text)
+    assert len(sent_text) == 1
+    assert "仍在规划中" in sent_text[0]
+    assert any("计划生成失败" in text for text in edited)
