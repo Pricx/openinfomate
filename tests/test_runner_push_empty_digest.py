@@ -136,3 +136,98 @@ def test_curated_info_auto_repairs_stalled_candidates_before_empty_window(tmp_pa
     markdown = asyncio.run(_run())
     assert called["digest"] == 1
     assert "Recovered item" in markdown
+
+
+def test_curated_info_auto_repairs_stalled_candidates_even_with_existing_rows(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "tracker.db"
+    env_path = Path(tmp_path) / ".env"
+    env_path.write_text('TRACKER_API_TOKEN="secret"\n', encoding="utf-8")
+
+    settings = Settings(
+        db_url=f"sqlite:///{db_path}",
+        api_token="secret",
+        env_path=str(env_path),
+        digest_push_enabled=False,
+        cron_timezone="+8",
+    )
+    engine, make_session = session_factory(settings)
+    Base.metadata.create_all(engine)
+
+    with make_session() as session:
+        repo = Repo(session)
+        topic = repo.add_topic(name="AI Agents", query="agent", digest_cron="0 9 * * *")
+        source = Source(type="rss", url="https://example.com/feed")
+        session.add(source)
+        session.flush()
+        now = dt.datetime(2026, 3, 7, 8, 0, 0)
+
+        alert_item = Item(
+            source_id=int(source.id),
+            url="https://example.com/p/alert",
+            canonical_url="https://example.com/p/alert",
+            title="Existing alert",
+            created_at=now - dt.timedelta(minutes=50),
+        )
+        digest_item = Item(
+            source_id=int(source.id),
+            url="https://example.com/p/digest",
+            canonical_url="https://example.com/p/digest",
+            title="Recovered digest",
+            created_at=now - dt.timedelta(minutes=40),
+        )
+        session.add_all([alert_item, digest_item])
+        session.flush()
+        session.add(
+            ItemTopic(
+                item_id=int(alert_item.id),
+                topic_id=int(topic.id),
+                decision="alert",
+                reason="llm_why: alert\nllm_hint: alert",
+                created_at=now - dt.timedelta(minutes=50),
+            )
+        )
+        session.add(
+            ItemTopic(
+                item_id=int(digest_item.id),
+                topic_id=int(topic.id),
+                decision="candidate",
+                reason="",
+                created_at=now - dt.timedelta(minutes=40),
+            )
+        )
+        session.commit()
+        digest_item_id = int(digest_item.id)
+        topic_id = int(topic.id)
+
+    called = {"digest": 0}
+
+    async def _fake_run_digest(*, session, settings, hours, push, topic_ids=None, key_suffix=None):  # noqa: ANN001, ARG001
+        called["digest"] += 1
+        repo = Repo(session)
+        row = repo.get_item_topic(item_id=digest_item_id, topic_id=topic_id)
+        assert row is not None
+        row.decision = "digest"
+        row.reason = "llm_why: repaired\nllm_hint: digest"
+        session.commit()
+        return DigestResult(since=dt.datetime.utcnow(), per_topic=[])
+
+    import tracker.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "run_digest", _fake_run_digest, raising=True)
+
+    async def _run() -> str:
+        with make_session() as session:
+            result = await run_curated_info(
+                session=session,
+                settings=settings,
+                hours=2,
+                push=False,
+                key_suffix="repair-existing-rows",
+                now=dt.datetime(2026, 3, 7, 8, 0, 0),
+            )
+            return result.markdown
+
+    markdown = asyncio.run(_run())
+    assert called["digest"] == 1
+    assert "Existing alert" in markdown
+    assert "Recovered digest" in markdown

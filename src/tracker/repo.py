@@ -596,16 +596,12 @@ class Repo:
         order: str = "desc",
     ) -> list[tuple[ItemTopic, Item]]:
         """
-        List "uncurated" candidate items for a topic (best-effort).
+        List pending candidate items for a topic.
 
-        This is used to recover from:
-        - service downtime (candidates ingested but never curated),
-        - legacy include_keywords backfills (items flipped to candidate after the fact).
-
-        Heuristic definition of "uncurated":
-        - decision is still `candidate`, AND
-        - reason indicates it hasn't gone through final digest curation yet,
-          including tick-stage provisional `digest_candidate` hints.
+        Intentionally treat *any* `decision == "candidate"` row in-window as pending
+        digest work. Older code paths and manual backfills have used a mix of reason
+        strings (including blank reason), so tying recovery to specific reason text is
+        brittle and can silently strand valid backlog items.
         """
         limit = max(1, min(500, int(limit)))
         exclude_ids = exclude_item_ids or set()
@@ -620,11 +616,6 @@ class Repo:
                     ItemTopic.topic_id == topic.id,
                     ItemTopic.decision == "candidate",
                     func.coalesce(Item.published_at, Item.created_at) >= since,
-                    or_(
-                        ItemTopic.reason == "llm curation candidate",
-                        ItemTopic.reason.like("%digest_candidate%"),
-                        ItemTopic.reason.like("backfill:%"),
-                    ),
                 )
             )
             .order_by(

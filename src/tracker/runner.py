@@ -3943,40 +3943,41 @@ async def run_curated_info(
         )
 
     rows = _recent_curated_rows()
-    if not rows:
-        stalled_topic_ids: list[int] = []
-        try:
-            for topic in repo.list_topics():
-                if not getattr(topic, "enabled", True):
-                    continue
-                pending = repo.list_uncurated_item_topics_for_topic(topic=topic, since=since, limit=1)
-                if pending:
-                    stalled_topic_ids.append(int(topic.id))
-        except Exception:
-            stalled_topic_ids = []
+    stalled_topic_ids: list[int] = []
+    try:
+        for topic in repo.list_topics():
+            if not getattr(topic, "enabled", True):
+                continue
+            pending = repo.list_uncurated_item_topics_for_topic(topic=topic, since=since, limit=1)
+            if pending:
+                stalled_topic_ids.append(int(topic.id))
+    except Exception:
+        stalled_topic_ids = []
 
-        if stalled_topic_ids:
-            logger.warning(
-                "curated info window is empty but found stalled candidates; auto-running digest repair: hours=%s topics=%s",
-                h,
-                ",".join(str(x) for x in stalled_topic_ids),
+    if stalled_topic_ids:
+        log_fn = logger.warning if not rows else logger.info
+        log_fn(
+            "curated info found pending candidate backlog; auto-running digest repair: hours=%s topics=%s preexisting_rows=%s",
+            h,
+            ",".join(str(x) for x in stalled_topic_ids),
+            len(rows),
+        )
+        try:
+            await run_digest(
+                session=session,
+                settings=settings,
+                hours=h,
+                push=False,
+                topic_ids=stalled_topic_ids,
+                key_suffix=f"autorepair-{now_utc.strftime('%Y%m%d%H%M%S')}",
             )
             try:
-                await run_digest(
-                    session=session,
-                    settings=settings,
-                    hours=h,
-                    push=False,
-                    topic_ids=stalled_topic_ids,
-                    key_suffix=f"autorepair-{now_utc.strftime('%Y%m%d%H%M%S')}",
-                )
-                try:
-                    session.expire_all()
-                except Exception:
-                    pass
-                rows = _recent_curated_rows()
-            except Exception as exc:
-                logger.warning("curated info auto-repair failed: %s", exc)
+                session.expire_all()
+            except Exception:
+                pass
+            rows = _recent_curated_rows()
+        except Exception as exc:
+            logger.warning("curated info auto-repair failed: %s", exc)
 
     # Explicit operator feedback: muted domains should not appear in Curated Info.
     active_mute_domains: set[str] = set()
