@@ -388,3 +388,63 @@ def test_curated_info_fetches_fulltext_for_low_signal_titles(tmp_path, monkeypat
     assert seen["fetched"] == 1
     assert "Copilot Free limits" in seen["snippet"]
     assert "VS Code Copilot 功能速查：免费额度、多模型选择与 MCP 工具连接" in markdown
+
+
+
+def test_curated_info_applies_domain_down_rank_score_gate(tmp_path):
+    db_path = Path(tmp_path) / "tracker.db"
+    env_path = Path(tmp_path) / ".env"
+    env_path.write_text('TRACKER_API_TOKEN="secret"\n', encoding="utf-8")
+
+    settings = Settings(
+        db_url=f"sqlite:///{db_path}",
+        api_token="secret",
+        env_path=str(env_path),
+        digest_push_enabled=False,
+        cron_timezone="+8",
+        domain_quality_low_domains="dev.to",
+        source_quality_min_score=50,
+    )
+    engine, make_session = session_factory(settings)
+    Base.metadata.create_all(engine)
+
+    with make_session() as session:
+        repo = Repo(session)
+        topic = repo.add_topic(name="AI Agents", query="agent", digest_cron="0 9 * * *")
+        source = repo.add_source(type="rss", url="https://dev.to/feed/tag/agents")
+        repo.upsert_source_score(source_id=source.id, score=74, origin="manual")
+        now = dt.datetime(2026, 3, 7, 8, 0, 0)
+        item = Item(
+            source_id=int(source.id),
+            url="https://dev.to/ghost-task",
+            canonical_url="https://dev.to/ghost-task",
+            title="Ghost task problem",
+            created_at=now - dt.timedelta(minutes=10),
+        )
+        session.add(item)
+        session.flush()
+        session.add(
+            ItemTopic(
+                item_id=int(item.id),
+                topic_id=int(topic.id),
+                decision="digest",
+                reason="llm_why: field report\nllm_hint: digest",
+                created_at=now - dt.timedelta(minutes=10),
+            )
+        )
+        session.commit()
+
+    async def _run() -> str:
+        with make_session() as session:
+            result = await run_curated_info(
+                session=session,
+                settings=settings,
+                hours=2,
+                push=False,
+                key_suffix="domain-soft-downrank",
+                now=dt.datetime(2026, 3, 7, 8, 0, 0),
+            )
+            return result.markdown
+
+    markdown = asyncio.run(_run())
+    assert "Ghost task problem" not in markdown

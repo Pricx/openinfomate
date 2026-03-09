@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
 import json
 import logging
 import re
@@ -9,6 +11,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
+from sqlalchemy.orm import Session as OrmSession
 
 from tracker.integrations.source_binding_mcp import source_binding_mcp_tool_catalog_text
 from tracker.integrations.config_settings_mcp import settings_mcp_tool_catalog_text
@@ -17,9 +20,11 @@ from tracker.repo import Repo
 from tracker.prompt_templates import resolve_prompt_best_effort
 from tracker.settings import Settings
 from tracker.story import extract_notable_links
+from tracker.push_dispatch import push_dingtalk_markdown, push_email_text, push_telegram_text, push_webhook_json
 from tracker.openai_compat import (
     extract_text_from_openai_compat_response,
     extract_usage_tokens,
+    normalize_openai_compat_base_url,
     post_openai_compat_json,
 )
 
@@ -238,6 +243,329 @@ def _load_llm_extra_body(settings: Settings, *, kind: str = "") -> dict:
     return obj
 
 
+_LLM_PROVIDER_STATE_PREFIX = "llm_provider_health:"
+
+
+def _llm_provider_slot(settings: Settings, *, kind: str) -> tuple[str, str]:
+    explicit_mini = bool(
+        (getattr(settings, "llm_mini_base_url", "") or "").strip()
+        or (getattr(settings, "llm_mini_api_key", "") or "").strip()
+        or (getattr(settings, "llm_model_mini", "") or "").strip()
+    )
+    if _kind_uses_mini_provider(kind) and explicit_mini:
+        return "mini", "Aux LLM"
+    return "reasoning", "Primary LLM"
+
+
+def _llm_provider_state_key(*, slot: str, base_url: str, model: str) -> str:
+    norm_base = normalize_openai_compat_base_url(base_url)
+    digest = hashlib.sha1(f"{slot}|{norm_base}|{model}".encode("utf-8")).hexdigest()[:16]
+    return f"{_LLM_PROVIDER_STATE_PREFIX}{slot}:{digest}"
+
+
+def _parse_iso_utc(value: object) -> dt.datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        ts = dt.datetime.fromisoformat(raw)
+    except Exception:
+        return None
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return ts
+
+
+def _iso_utc(value: dt.datetime | None) -> str:
+    if value is None:
+        return ""
+    if value.tzinfo is not None:
+        value = value.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return value.replace(microsecond=0).isoformat() + "Z"
+
+
+def _load_llm_provider_state(repo: Repo, *, key: str) -> dict[str, object]:
+    raw = (repo.get_app_config(key) or "").strip()
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _save_llm_provider_state(repo: Repo, *, key: str, state: dict[str, object]) -> None:
+    repo.set_app_config(key, json.dumps(state, ensure_ascii=False, sort_keys=True))
+
+
+def _llm_provider_alert_text(
+    *,
+    settings: Settings,
+    slot_label: str,
+    model: str,
+    base_url: str,
+    streak: int,
+    error_message: str,
+    first_failure_at: dt.datetime | None,
+) -> tuple[str, str, dict[str, object]]:
+    lang = _output_lang(settings)
+    base = normalize_openai_compat_base_url(base_url) or (base_url or "").strip()
+    err = (error_message or "").strip().replace("\n", " ")
+    if len(err) > 300:
+        err = err[:300] + "…"
+    since_txt = _iso_utc(first_failure_at) or "unknown"
+    if lang == "zh":
+        title = f"LLM 供应商连续失败：{slot_label}"
+        body = (
+            f"# {title}\n\n"
+            f"- provider: {slot_label}\n"
+            f"- model: {model or '-'}\n"
+            f"- base_url: {base or '-'}\n"
+            f"- consecutive_failures: {max(0, int(streak or 0))}\n"
+            f"- since_utc: {since_txt}\n"
+            f"- last_error: {err or '-'}\n\n"
+            "请检查 Web Admin → LLM 供应商配置、上游 API 可用性、网络代理与额度/鉴权状态。"
+        )
+    else:
+        title = f"LLM provider unhealthy: {slot_label}"
+        body = (
+            f"# {title}\n\n"
+            f"- provider: {slot_label}\n"
+            f"- model: {model or '-'}\n"
+            f"- base_url: {base or '-'}\n"
+            f"- consecutive_failures: {max(0, int(streak or 0))}\n"
+            f"- since_utc: {since_txt}\n"
+            f"- last_error: {err or '-'}\n\n"
+            "Please check Web Admin → LLM provider config, upstream API availability, proxy/network, and quota/auth state."
+        )
+    payload = {
+        "type": "llm_provider_unhealthy",
+        "provider": slot_label,
+        "model": model,
+        "base_url": base,
+        "consecutive_failures": max(0, int(streak or 0)),
+        "since_utc": since_txt,
+        "last_error": err,
+    }
+    return title, body, payload
+
+
+async def _push_llm_provider_alert(
+    *,
+    repo: Repo,
+    settings: Settings,
+    slot_label: str,
+    model: str,
+    base_url: str,
+    streak: int,
+    error_message: str,
+    first_failure_at: dt.datetime | None,
+) -> bool:
+    title, body, payload = _llm_provider_alert_text(
+        settings=settings,
+        slot_label=slot_label,
+        model=model,
+        base_url=base_url,
+        streak=streak,
+        error_message=error_message,
+        first_failure_at=first_failure_at,
+    )
+    digest = hashlib.sha1(f"{slot_label}|{normalize_openai_compat_base_url(base_url)}|{model}".encode("utf-8")).hexdigest()[:16]
+    key = f"llm_provider_unhealthy:{digest}:{dt.datetime.utcnow().strftime('%Y%m%d%H%M')}"
+    pushed = False
+    try:
+        pushed |= bool(
+            await push_dingtalk_markdown(
+                repo=repo,
+                settings=settings,
+                idempotency_key=key,
+                title=title,
+                markdown=body,
+            )
+        )
+    except Exception:
+        pass
+    try:
+        pushed |= bool(await push_telegram_text(repo=repo, settings=settings, idempotency_key=key, text=body))
+    except Exception:
+        pass
+    try:
+        pushed |= bool(
+            push_email_text(
+                repo=repo,
+                settings=settings,
+                idempotency_key=key,
+                subject=f"[OpenInfoMate] {title}",
+                text=body,
+            )
+        )
+    except Exception:
+        pass
+    try:
+        pushed |= bool(
+            await push_webhook_json(
+                repo=repo,
+                settings=settings,
+                idempotency_key=key,
+                payload=payload,
+            )
+        )
+    except Exception:
+        pass
+    return pushed
+
+
+async def _record_llm_provider_result(
+    *,
+    repo: Repo | None,
+    settings: Settings,
+    kind: str,
+    base_url: str,
+    model: str,
+    ok: bool,
+    error_message: str = "",
+) -> None:
+    if repo is None or not base_url or not model:
+        return
+    if not bool(getattr(settings, "llm_failure_alert_enabled", True)) and ok:
+        return
+    try:
+        bind = repo.session.get_bind()
+    except Exception:
+        bind = None
+    if bind is None:
+        return
+
+    slot, slot_label = _llm_provider_slot(settings, kind=kind)
+    key = _llm_provider_state_key(slot=slot, base_url=base_url, model=model)
+    now = dt.datetime.utcnow()
+    try:
+        threshold = max(1, int(getattr(settings, "llm_failure_alert_threshold", 5) or 5))
+    except Exception:
+        threshold = 5
+    try:
+        min_minutes = max(0, int(getattr(settings, "llm_failure_alert_min_minutes", 10)))
+    except Exception:
+        min_minutes = 10
+    try:
+        cooldown_minutes = max(0, int(getattr(settings, "llm_failure_alert_cooldown_minutes", 180)))
+    except Exception:
+        cooldown_minutes = 180
+
+    should_alert = False
+    streak = 0
+    first_failure_at: dt.datetime | None = None
+    with OrmSession(bind=bind) as state_session:
+        state_repo = Repo(state_session)
+        state = _load_llm_provider_state(state_repo, key=key)
+        if ok:
+            state.update(
+                {
+                    "slot": slot,
+                    "slot_label": slot_label,
+                    "base_url": normalize_openai_compat_base_url(base_url),
+                    "model": model,
+                    "failure_streak": 0,
+                    "first_failure_at": "",
+                    "last_failure_at": "",
+                    "last_error": "",
+                    "last_success_at": _iso_utc(now),
+                    "last_alert_at": "",
+                    "last_alert_streak": 0,
+                }
+            )
+            _save_llm_provider_state(state_repo, key=key, state=state)
+            return
+
+        prev_streak = int(state.get("failure_streak") or 0)
+        first_failure_at = _parse_iso_utc(state.get("first_failure_at")) or now
+        streak = prev_streak + 1 if prev_streak > 0 else 1
+        state.update(
+            {
+                "slot": slot,
+                "slot_label": slot_label,
+                "base_url": normalize_openai_compat_base_url(base_url),
+                "model": model,
+                "failure_streak": streak,
+                "first_failure_at": _iso_utc(first_failure_at),
+                "last_failure_at": _iso_utc(now),
+                "last_error": (error_message or "")[:1000],
+            }
+        )
+        last_alert_at = _parse_iso_utc(state.get("last_alert_at"))
+        elapsed_minutes = max(0.0, (now - first_failure_at).total_seconds() / 60.0)
+        cooldown_ok = last_alert_at is None or (now - last_alert_at) >= dt.timedelta(minutes=cooldown_minutes)
+        if bool(getattr(settings, "llm_failure_alert_enabled", True)) and streak >= threshold and elapsed_minutes >= float(min_minutes):
+            if cooldown_ok:
+                should_alert = True
+        _save_llm_provider_state(state_repo, key=key, state=state)
+
+    if not should_alert:
+        return
+
+    with OrmSession(bind=bind) as push_session:
+        push_repo = Repo(push_session)
+        pushed = await _push_llm_provider_alert(
+            repo=push_repo,
+            settings=settings,
+            slot_label=slot_label,
+            model=model,
+            base_url=base_url,
+            streak=streak,
+            error_message=error_message,
+            first_failure_at=first_failure_at,
+        )
+        if pushed:
+            state = _load_llm_provider_state(push_repo, key=key)
+            state["last_alert_at"] = _iso_utc(now)
+            state["last_alert_streak"] = streak
+            _save_llm_provider_state(push_repo, key=key, state=state)
+
+
+async def _post_llm_json(
+    *,
+    repo: Repo | None,
+    settings: Settings,
+    kind: str,
+    model: str,
+    client: httpx.AsyncClient,
+    base_url: str,
+    headers: dict[str, str],
+    payload_chat: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    try:
+        data, mode = await post_openai_compat_json(
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload_chat,
+        )
+    except Exception as exc:
+        await _record_llm_provider_result(
+            repo=repo,
+            settings=settings,
+            kind=kind,
+            base_url=base_url,
+            model=model,
+            ok=False,
+            error_message=str(exc),
+        )
+        raise
+    await _record_llm_provider_result(
+        repo=repo,
+        settings=settings,
+        kind=kind,
+        base_url=base_url,
+        model=model,
+        ok=True,
+    )
+    return data, mode
+
+
 async def llm_plan_tracking_ai_setup(
     *,
     repo: Repo | None = None,
@@ -327,7 +655,7 @@ async def llm_plan_tracking_ai_setup(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=_select_timeout_for_kind(settings, kind=kind), proxy=proxy) as client:
-        data, _mode_used = await post_openai_compat_json(
+        data, _mode_used = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,
@@ -432,7 +760,7 @@ async def llm_plan_config_agent(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        data, _mode_used = await post_openai_compat_json(
+        data, _mode_used = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,
@@ -509,7 +837,7 @@ async def llm_transform_tracking_ai_setup_input(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        data, _mode_used = await post_openai_compat_json(
+        data, _mode_used = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,
@@ -594,7 +922,7 @@ async def llm_translate_prompt_template(
     }
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        data, _mode_used = await post_openai_compat_json(
+        data, _mode_used = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,
@@ -693,7 +1021,7 @@ async def llm_localize_item_titles(
         payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=_select_timeout_for_kind(settings, kind=kind), proxy=proxy) as client:
-        data, _mode_used = await post_openai_compat_json(
+        data, _mode_used = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,
@@ -948,7 +1276,7 @@ async def llm_propose_topic_setup(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        data, _mode_used = await post_openai_compat_json(
+        data, _mode_used = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,
@@ -1185,7 +1513,7 @@ async def llm_propose_profile_setup(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        data, _mode_used = await post_openai_compat_json(
+        data, _mode_used = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,
@@ -1339,7 +1667,7 @@ async def llm_update_profile_delta_from_feedback(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        data, _mode = await post_openai_compat_json(
+        data, _mode = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,
@@ -1441,7 +1769,7 @@ async def llm_update_prompt_delta_from_feedback(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        data, _mode = await post_openai_compat_json(
+        data, _mode = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,
@@ -1542,7 +1870,7 @@ async def llm_gate_alert_candidate(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        data, _mode = await post_openai_compat_json(
+        data, _mode = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,
@@ -1667,7 +1995,7 @@ async def llm_summarize_digest(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        data, _mode = await post_openai_compat_json(
+        data, _mode = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,
@@ -1766,12 +2094,15 @@ async def llm_triage_topic_items(
             dislikes = int(c.get("domain_dislikes") or 0)
         except Exception:
             dislikes = 0
+        domain_tier = str(c.get("domain_tier", "") or "").strip().lower()
         raw_snippet = str(c.get("snippet", "") or "")
         snippet = _truncate(raw_snippet, 420)
         links = extract_notable_links(text=raw_snippet, url=url, max_links=3)
         parts = [f"item_id={item_id}", f"title={title}", f"url={url}"]
         if domain:
             parts.append(f"domain={domain}")
+        if domain_tier and domain_tier != "unknown":
+            parts.append(f"domain_tier={domain_tier}")
         if likes or dislikes:
             parts.append(f"domain_feedback=+{max(0, likes)}/-{max(0, dislikes)}")
         if links:
@@ -1832,7 +2163,7 @@ async def llm_triage_topic_items(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        data, _mode = await post_openai_compat_json(
+        data, _mode = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,
@@ -1969,6 +2300,7 @@ async def llm_curate_topic_items(
             dislikes = int(c.get("domain_dislikes") or 0)
         except Exception:
             dislikes = 0
+        domain_tier = str(c.get("domain_tier", "") or "").strip().lower()
         raw_snippet = str(c.get("snippet", "") or "")
         links = extract_notable_links(text=raw_snippet, url=url, max_links=4)
         snippet = _truncate(raw_snippet, 1200)
@@ -1977,6 +2309,8 @@ async def llm_curate_topic_items(
         cand_lines.append(f"   url={url}")
         if domain:
             cand_lines.append(f"   domain={domain}")
+        if domain_tier and domain_tier != "unknown":
+            cand_lines.append(f"   domain_tier={domain_tier}")
         if likes or dislikes:
             cand_lines.append(f"   domain_feedback=+{max(0, likes)}/-{max(0, dislikes)}")
         if links:
@@ -2013,7 +2347,7 @@ async def llm_curate_topic_items(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        data, _mode = await post_openai_compat_json(
+        data, _mode = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,
@@ -2136,7 +2470,7 @@ async def llm_guess_feed_urls(
     payload.update(extra_body)
 
     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
-        data, _mode = await post_openai_compat_json(
+        data, _mode = await _post_llm_json(settings=settings, kind=kind, model=model, 
             repo=repo,
             client=client,
             base_url=base_url,

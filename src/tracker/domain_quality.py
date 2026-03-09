@@ -62,6 +62,27 @@ class DomainQualityPolicy:
         tier = self.tier_for_url(url)
         return _tier_rank(tier) >= int(self.min_push_rank)
 
+    def score_adjustment_for_tier(self, tier: Tier) -> int:
+        t = (tier or "").strip().lower()
+        if t == "high":
+            return 5
+        if t == "low":
+            return -25
+        return 0
+
+    def score_adjustment_for_url(self, url: str) -> int:
+        return self.score_adjustment_for_tier(self.tier_for_url(url))
+
+    def extra_min_score_for_tier(self, tier: Tier) -> int:
+        t = (tier or "").strip().lower()
+        if t == "low":
+            return 15
+        return 0
+
+    def min_score_threshold_for_url(self, *, base_min_score: int, url: str) -> int:
+        threshold = int(base_min_score or 0) + int(self.extra_min_score_for_tier(self.tier_for_url(url)))
+        return max(0, min(100, threshold))
+
 
 def build_domain_quality_policy(*, settings: Settings) -> DomainQualityPolicy:
     low = parse_domains_csv(getattr(settings, "domain_quality_low_domains", "") or "")

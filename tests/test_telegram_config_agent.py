@@ -24,6 +24,13 @@ async def test_telegram_plain_message_queues_config_agent_task(tmp_path, monkeyp
 
     batches = [[{"update_id": 1, "message": {"message_id": 10, "text": "帮我加入 linux.do 的 codex fast 搜索", "chat": {"id": 123}, "from": {"id": 123}}}]]
     sent: list[str] = []
+    created_prompt_ids: list[int] = []
+
+    original_create = Repo.create_telegram_task
+
+    def capture_create(self, **kwargs):  # noqa: ANN001
+        created_prompt_ids.append(int(kwargs.get("prompt_message_id") or 0))
+        return original_create(self, **kwargs)
 
     async def fake_delete_webhook(*, bot_token: str, client_timeout_seconds: int) -> None:  # noqa: ARG001
         return
@@ -38,6 +45,7 @@ async def test_telegram_plain_message_queues_config_agent_task(tmp_path, monkeyp
     monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
     monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
+    monkeypatch.setattr("tracker.telegram_connect.Repo.create_telegram_task", capture_create)
 
     with make_session() as session:
         repo = Repo(session)
@@ -53,7 +61,10 @@ async def test_telegram_plain_message_queues_config_agent_task(tmp_path, monkeyp
         assert tasks[0].status == "pending"
         assert tasks[0].prompt_message_id == 222
         assert "linux.do" in (tasks[0].query or "")
-    assert any("智能配置队列" in text for text in sent)
+    assert created_prompt_ids == [222]
+    assert len(sent) == 1
+    assert "已等待 0 秒" in sent[0]
+    assert "已加入智能配置队列" not in sent[0]
 
 
 @pytest.mark.asyncio
@@ -65,6 +76,13 @@ async def test_telegram_config_agent_reply_refines_existing_task(tmp_path, monke
     Base.metadata.create_all(_engine)
 
     batches = [[{"update_id": 1, "message": {"message_id": 11, "text": "再加上 windows codex 环境排障", "chat": {"id": 123}, "from": {"id": 123}, "reply_to_message": {"message_id": 200}}}]]
+    created_prompt_ids: list[int] = []
+
+    original_create = Repo.create_telegram_task
+
+    def capture_create(self, **kwargs):  # noqa: ANN001
+        created_prompt_ids.append(int(kwargs.get("prompt_message_id") or 0))
+        return original_create(self, **kwargs)
 
     async def fake_delete_webhook(*, bot_token: str, client_timeout_seconds: int) -> None:  # noqa: ARG001
         return
@@ -81,6 +99,7 @@ async def test_telegram_config_agent_reply_refines_existing_task(tmp_path, monke
     monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
     monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
+    monkeypatch.setattr("tracker.telegram_connect.Repo.create_telegram_task", capture_create)
 
     with make_session() as session:
         repo = Repo(session)
@@ -108,7 +127,10 @@ async def test_telegram_config_agent_reply_refines_existing_task(tmp_path, monke
         assert pending[0].prompt_message_id == 333
         assert "加入 linux.do 的 codex fast 搜索" in (pending[0].query or "")
         assert "补充/修订" in (pending[0].query or "")
-    assert any("智能配置修订队列" in text for text in sent)
+    assert created_prompt_ids[-1:] == [333]
+    assert len(sent) == 1
+    assert "已等待 0 秒" in sent[0]
+    assert "智能配置修订队列" not in sent[0]
 
 
 @pytest.mark.asyncio

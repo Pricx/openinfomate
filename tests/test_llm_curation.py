@@ -689,3 +689,60 @@ def test_llm_curation_digest_curates_existing_digest_decisions(db_session, monke
 
     rows = list(db_session.scalars(select(ItemTopic).order_by(ItemTopic.item_id)))
     assert [r.decision for r in rows] == ["digest", "alert", "ignore"]
+
+
+
+def test_llm_curation_digest_down_ranks_low_tier_domains_on_output(db_session, monkeypatch):
+    repo = Repo(db_session)
+    topic = repo.add_topic(name="T", query="agent")
+    repo.upsert_topic_policy(topic_id=topic.id, llm_curation_enabled=True, llm_curation_prompt="pick signals only")
+    source = repo.add_source(type="rss", url="https://dev.to/feed/tag/agents")
+    repo.upsert_source_score(source_id=source.id, score=74, origin="manual")
+
+    now = dt.datetime.utcnow()
+    item = Item(
+        source_id=source.id,
+        url="https://dev.to/ghost-task",
+        canonical_url="https://dev.to/ghost-task",
+        title="Ghost task problem",
+        content_text="Community write-up with concrete details.",
+        content_hash="",
+        simhash64=0,
+        created_at=now,
+    )
+    db_session.add(item)
+    db_session.flush()
+    db_session.add(ItemTopic(item_id=item.id, topic_id=topic.id, decision="candidate", reason="", created_at=now))
+    db_session.commit()
+
+    seen: dict[str, str] = {}
+
+    async def fake_curate(  # type: ignore[no-untyped-def]
+        *, repo=None, settings, topic, policy_prompt, candidates, recent_sent=None, max_digest, max_alert, usage_cb=None
+    ):
+        assert len(candidates) == 1
+        seen["domain"] = str(candidates[0].get("domain") or "")
+        seen["domain_tier"] = str(candidates[0].get("domain_tier") or "")
+        return [
+            LlmCurationDecision(
+                item_id=int(candidates[0]["item_id"]),
+                decision="digest",
+                why="field report",
+                summary="signal",
+            )
+        ]
+
+    monkeypatch.setattr("tracker.runner.llm_curate_topic_items", fake_curate)
+
+    settings = Settings(
+        llm_base_url="http://llm.local",
+        llm_model="dummy",
+        llm_curation_enabled=True,
+        domain_quality_low_domains="dev.to",
+        source_quality_min_score=50,
+    )
+
+    result = asyncio.run(run_digest(session=db_session, settings=settings, hours=24, push=False))
+    md = result.per_topic[0].markdown
+    assert seen == {"domain": "dev.to", "domain_tier": "low"}
+    assert "Ghost task problem" not in md

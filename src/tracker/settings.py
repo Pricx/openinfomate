@@ -141,6 +141,7 @@ class Settings(BaseSettings):
     exclude_domains: str = "csdn.net"
     # Domain quality tiering (best-effort; used for push selection).
     # This does NOT filter content by "safety" categories; it only helps reduce low-quality sources.
+    # Low-tier domains are soft down-ranked / reviewed more strictly, not hard-blocked by themselves.
     domain_quality_low_domains: str = "csdn.net"
     domain_quality_medium_domains: str = "cnblogs.com"
     domain_quality_high_domains: str = ""
@@ -229,6 +230,10 @@ class Settings(BaseSettings):
     llm_mini_extra_body_json: str = ""
     llm_timeout_seconds: int = 90
     llm_max_candidates_per_tick: int = 10
+    llm_failure_alert_enabled: bool = True
+    llm_failure_alert_threshold: int = 5
+    llm_failure_alert_min_minutes: int = 10
+    llm_failure_alert_cooldown_minutes: int = 180
 
     # Optional cost estimation (USD per 1M tokens).
     # If unset/0, Tracker will still record token counts (when the backend reports them),

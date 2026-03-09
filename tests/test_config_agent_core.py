@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tracker.config_agent_core import apply_config_agent_plan, validate_config_agent_plan
+from tracker.config_agent_core import apply_config_agent_plan, build_config_agent_preview_markdown, validate_config_agent_plan
 from tracker.db import session_factory
 from tracker.envfile import parse_env_assignments
 from tracker.llm import LlmProfileProposal
@@ -122,6 +122,41 @@ def test_validate_config_agent_plan_accepts_reply_only_turns():
     assert warnings == []
     assert clean["assistant_reply"].startswith("我可以回答配置问题")
     assert clean["actions"] == []
+
+
+def test_build_config_agent_preview_markdown_keeps_full_profile_text(tmp_path):
+    db_path = Path(tmp_path) / "config-agent-preview.db"
+    env_path = Path(tmp_path) / ".env"
+    settings = Settings(db_url=f"sqlite:///{db_path}", env_path=str(env_path))
+    _engine, make_session = session_factory(settings)
+    Base.metadata.create_all(_engine)
+
+    profile_text = """AI 理解（不会用于关键词匹配）：
+你强烈关注能落地的 AI Agent 工程化。
+
+安全/漏洞信息偏好（重要）：
+- 你不关心 MCP CVE 这类泛安全资讯
+- 你只关心被广泛使用基础设施的远程 RCE 漏洞"""
+
+    with make_session() as session:
+        repo = Repo(session)
+        preview = build_config_agent_preview_markdown(
+            repo=repo,
+            settings=settings,
+            session=session,
+            plan={
+                "actions": [
+                    {"op": "mcp.profile.set", "topic_name": "Profile", "profile_text": profile_text},
+                ]
+            },
+        )
+
+    assert "- Rebuild `Profile` profile from new text:" in preview
+    assert "  AI 理解（不会用于关键词匹配）：" in preview
+    assert "  安全/漏洞信息偏好（重要）：" in preview
+    assert "  - 你不关心 MCP CVE 这类泛安全资讯" in preview
+    assert "你不关…" not in preview
+    assert "  - 你只关心被广泛使用基础设施的远程 RCE 漏洞" in preview
 
 
 @pytest.mark.asyncio

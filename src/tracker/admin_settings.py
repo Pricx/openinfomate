@@ -232,8 +232,8 @@ def default_settings_sections(*, settings: Settings | None = None) -> list[Setti
                 ),
                 SettingFieldDef(
                     field="domain_quality_low_domains",
-                    label="Low-quality domains",
-                    description="Comma-separated hosts treated as low tier.",
+                    label="Down-ranked domains",
+                    description="Comma-separated hosts treated as low tier for soft down-rank / stricter review. They face a higher final keep bar, but are not hard-blocked; use exclude_domains or mute rules to block.",
                     example="csdn.net",
                     advanced=True,
                 ),
@@ -313,6 +313,10 @@ def default_settings_sections(*, settings: Settings | None = None) -> list[Setti
                 ),
                 SettingFieldDef(field="llm_proxy", label="Primary proxy (optional)", description="Optional HTTP proxy for the primary model/provider.", kind="password", advanced=True),
                 SettingFieldDef(field="llm_mini_proxy", label="Aux proxy (optional)", description="Optional HTTP proxy for the aux model/provider.", kind="password", advanced=True),
+                SettingFieldDef(field="llm_failure_alert_enabled", label="Provider failure alerts", description="Push an alert when any configured LLM provider keeps failing for long enough and exceeds the retry threshold.", kind="toggle", advanced=True),
+                SettingFieldDef(field="llm_failure_alert_threshold", label="Failure alert threshold", description="Consecutive failed runtime LLM calls before provider failure alerts are eligible.", kind="number", example="5", advanced=True),
+                SettingFieldDef(field="llm_failure_alert_min_minutes", label="Failure alert min minutes", description="Minimum continuous failure duration before provider failure alerts are sent.", kind="number", example="10", advanced=True),
+                SettingFieldDef(field="llm_failure_alert_cooldown_minutes", label="Failure alert cooldown", description="Minimum minutes between repeated alerts for the same failing LLM provider.", kind="number", example="180", advanced=True),
                 SettingFieldDef(
                     field="llm_model",
                     label="Default model (legacy)",

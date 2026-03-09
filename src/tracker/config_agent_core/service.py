@@ -65,6 +65,18 @@ def _join_nonempty(lines: list[str], *, sep: str = "\n") -> str:
     return sep.join([line for line in lines if _norm_text(line)]).strip()
 
 
+def _append_indented_block(lines: list[str], text: object, *, indent: str = "  ") -> None:
+    raw = str(text or "")
+    if not raw.strip():
+        return
+    for line in raw.splitlines():
+        clean = line.rstrip()
+        if clean:
+            lines.append(f"{indent}{clean}")
+        else:
+            lines.append(indent.rstrip())
+
+
 def _coerce_setting_value(field: str, raw_value: object) -> str:
     ann = Settings.model_fields[field].annotation
     raw = raw_value
@@ -244,10 +256,12 @@ def build_config_agent_preview_markdown(*, repo: Repo, settings: Settings, sessi
     else:
         for action in profile_actions[:10]:
             topic_name = _norm_text(action.get("topic_name") or "Profile") or "Profile"
-            text = _norm_text(action.get("profile_text"))
-            if len(text) > 200:
-                text = text[:200].rstrip() + "…"
-            lines.append(f"- Rebuild `{topic_name}` profile from new text: {text}")
+            profile_text = _norm_text(action.get("profile_text"))
+            if not profile_text:
+                lines.append(f"- Rebuild `{topic_name}` profile from new text: (empty)")
+                continue
+            lines.append(f"- Rebuild `{topic_name}` profile from new text:")
+            _append_indented_block(lines, profile_text)
 
     lines.extend(["", "## Settings"])
     setting_actions = [a for a in (plan.get("actions") or []) if str(a.get("op") or "") in {MCP_SETTING_SET_OP, MCP_SETTING_CLEAR_OP}]

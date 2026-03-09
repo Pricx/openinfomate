@@ -645,6 +645,20 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
             except Exception:
                 return 0
 
+        def _config_agent_pending_text(*, refine: bool = False, elapsed: int = 0, tick: int = 0) -> str:
+            dots = "." * ((int(tick or 0) % 3) + 1)
+            if _out_lang() == "zh":
+                return (
+                    f"⏳ 智能配置{'修订' if refine else ''}仍在规划中{dots}\n"
+                    f"已等待 {max(0, int(elapsed or 0))} 秒\n"
+                    "完成后我会直接把结果写回这条消息。"
+                )
+            return (
+                f"⏳ Config {'refinement ' if refine else ''}planning is still running{dots}\n"
+                f"Elapsed: {max(0, int(elapsed or 0))}s\n"
+                "I will write the result back into this same message when it is ready."
+            )
+
         def _env_path() -> str:
             from pathlib import Path
 
@@ -6846,30 +6860,19 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                         merged_prompt = merged_prompt + "\n\n补充/修订：\n" + raw
                     else:
                         merged_prompt = raw
-                    placeholder_mid = -int(dt.datetime.utcnow().timestamp() * 1_000_000)
                     repo.mark_telegram_task_canceled(int(t_cfgag.id), reason="superseded_by_reply")
                     repo.cancel_telegram_tasks(chat_id=existing_chat_id, kind="config_agent", status="pending", reason="superseded_by_reply")
-                    task = repo.create_telegram_task(
+                    ack_mid = int(await _send_with_markup(text=_config_agent_pending_text(refine=True, elapsed=0, tick=0), reply_markup=None) or 0)
+                    prompt_mid = ack_mid if ack_mid > 0 else -int(dt.datetime.utcnow().timestamp() * 1_000_000)
+                    repo.create_telegram_task(
                         chat_id=existing_chat_id,
                         user_id=uid,
                         kind="config_agent",
                         status="pending",
-                        prompt_message_id=placeholder_mid,
+                        prompt_message_id=prompt_mid,
                         request_message_id=(msg_id if msg_id > 0 else 0),
                         query=merged_prompt,
                     )
-                    ack_text = (
-                        "⏳ 已加入智能配置修订队列，正在规划中…\n完成后我会直接把结果写回这条消息。"
-                        if _out_lang() == "zh"
-                        else "⏳ Added to the config-refinement queue and now working…\nI will write the result back into this message when it is ready."
-                    )
-                    ack_mid = int(await _send_with_markup(text=ack_text, reply_markup=None) or 0)
-                    if ack_mid > 0:
-                        try:
-                            task.prompt_message_id = ack_mid
-                            repo.session.commit()
-                        except Exception:
-                            repo.session.rollback()
                     continue
 
             target_item_id = 0
@@ -7646,30 +7649,19 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
 
             if kind not in {"like", "dislike", "rate", "mute", "unmute"}:
                 if reply_mid <= 0 and not cmd and not s.startswith("/"):
-                    placeholder_mid = -int(dt.datetime.utcnow().timestamp() * 1_000_000)
                     repo.cancel_telegram_tasks(chat_id=existing_chat_id, kind="config_agent", status="pending", reason="superseded")
                     repo.cancel_telegram_tasks(chat_id=existing_chat_id, kind="config_agent", status="awaiting", reason="superseded")
-                    task = repo.create_telegram_task(
+                    ack_mid = int(await _send_with_markup(text=_config_agent_pending_text(refine=False, elapsed=0, tick=0), reply_markup=None) or 0)
+                    prompt_mid = ack_mid if ack_mid > 0 else -int(dt.datetime.utcnow().timestamp() * 1_000_000)
+                    repo.create_telegram_task(
                         chat_id=existing_chat_id,
                         user_id=uid,
                         kind="config_agent",
                         status="pending",
-                        prompt_message_id=placeholder_mid,
+                        prompt_message_id=prompt_mid,
                         request_message_id=(msg_id if msg_id > 0 else 0),
                         query=s,
                     )
-                    ack_text = (
-                        "⏳ 已加入智能配置队列，正在规划中…\n完成后我会直接把结果写回这条消息。"
-                        if _out_lang() == "zh"
-                        else "⏳ Added to the config-planning queue and now working…\nI will write the result back into this message when it is ready."
-                    )
-                    ack_mid = int(await _send_with_markup(text=ack_text, reply_markup=None) or 0)
-                    if ack_mid > 0:
-                        try:
-                            task.prompt_message_id = ack_mid
-                            repo.session.commit()
-                        except Exception:
-                            repo.session.rollback()
                     continue
 
                 # Free-form reply comment: when the operator replies to a pushed message with

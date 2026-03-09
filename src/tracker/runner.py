@@ -179,7 +179,89 @@ def _url_host(url: str) -> str:
     return _norm_host(host)
 
 
-def _annotate_candidates_domain_feedback(*, repo: Repo, candidates: list[dict], days: int = 90) -> None:
+def _tier_score_for_url(*, url: str, domain_policy: object | None) -> int:
+    if not domain_policy:
+        return 50
+    try:
+        tier = str(domain_policy.tier_for_url(url) or "unknown").strip().lower()
+    except Exception:
+        tier = "unknown"
+    if tier == "high":
+        return 75
+    if tier == "medium":
+        return 55
+    if tier == "low":
+        return 35
+    return 50
+
+
+def _effective_source_score(
+    *,
+    source_id: int,
+    source_url: str,
+    item_url: str,
+    scores_by_source_id: dict[int, int] | None,
+    domain_policy: object | None,
+) -> int:
+    sid = int(source_id or 0)
+    scores = scores_by_source_id or {}
+    if sid > 0 and sid in scores:
+        base = int(scores.get(sid) or 0)
+    else:
+        base = _tier_score_for_url(url=(source_url or item_url or ""), domain_policy=domain_policy)
+    adjusted = int(base)
+    if domain_policy:
+        try:
+            adjusted += int(domain_policy.score_adjustment_for_url(item_url or source_url or ""))
+        except Exception:
+            pass
+    return max(0, min(100, adjusted))
+
+
+def _should_keep_push_item(
+    *,
+    url: str,
+    source_id: int,
+    source_url: str,
+    active_mute_domains: set[str],
+    domain_policy: object | None,
+    min_source_score: int,
+    scores_by_source_id: dict[int, int] | None,
+) -> bool:
+    u = (url or "").strip()
+    if active_mute_domains and _url_host(u) in active_mute_domains:
+        return False
+    if domain_policy and (not domain_policy.allows_push_url(u)):
+        return False
+    keep_min_score = int(min_source_score or 0)
+    if domain_policy:
+        try:
+            keep_min_score = int(
+                domain_policy.min_score_threshold_for_url(
+                    base_min_score=keep_min_score,
+                    url=(u or source_url or ""),
+                )
+            )
+        except Exception:
+            keep_min_score = int(min_source_score or 0)
+    if keep_min_score > 0 and _effective_source_score(
+        source_id=int(source_id or 0),
+        source_url=source_url,
+        item_url=u,
+        scores_by_source_id=scores_by_source_id,
+        domain_policy=domain_policy,
+    ) < keep_min_score:
+        return False
+    return True
+
+
+def _annotate_candidates_domain_feedback(
+    *,
+    repo: Repo,
+    candidates: list[dict],
+    domain_policy: object | None = None,
+    days: int = 90,
+) -> None:
     """
     Attach lightweight domain context to candidate dicts for LLM triage/curation.
 
@@ -212,6 +294,11 @@ def _annotate_candidates_domain_feedback(*, repo: Repo, candidates: list[dict], 
         if not d:
             continue
         c.setdefault("domain", d)
+        if domain_policy is not None:
+            try:
+                c["domain_tier"] = str(domain_policy.tier_for_url(u) or "unknown").strip().lower() or "unknown"
+            except Exception:
+                c["domain_tier"] = "unknown"
         bucket = stats.get(d) or {}
         try:
             c["domain_likes"] = int(bucket.get("like") or 0)
@@ -943,26 +1030,6 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
         scores_by_source_id = {}
         locked_by_source_id = {}
 
-    def _tier_score_for_url(url: str) -> int:
-        if not domain_policy:
-            return 50
-        try:
-            tier = str(domain_policy.tier_for_url(url) or "unknown").strip().lower()
-        except Exception:
-            tier = "unknown"
-        if tier == "high":
-            return 75
-        if tier == "medium":
-            return 55
-        if tier == "low":
-            return 35
-        return 45
-
-    def _effective_source_score(*, source_id: int, source_url: str) -> int:
-        sid = int(source_id or 0)
-        if sid > 0 and sid in scores_by_source_id:
-            return max(0, min(100, int(scores_by_source_id.get(sid) or 0)))
-        return _tier_score_for_url(source_url)
 
     has_dingtalk = bool(settings.dingtalk_webhook_url)
     telegram_chat_id = (repo.get_app_config("telegram_chat_id") or settings.telegram_chat_id or "").strip()
@@ -1575,16 +1642,6 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                         src_for_url = repo.get_source_by_id(item_for_url.source_id) if item_for_url else None
                         push_url = _best_push_url_for_item(item=item_for_url, source=src_for_url) if item_for_url else push_url
 
-                    # Respect explicit operator mutes (domain-level).
-                    try:
-                        host = (urlsplit((push_url or "").strip()).netloc or "").lower()
-                        host = host.split(":", 1)[0].lstrip(".")
-                        if host.startswith("www."):
-                            host = host[4:]
-                    except Exception:
-                        host = ""
-                    if host and host in active_mute_domains:
-                        continue
                     try:
                         src_id = 0
                         src_url = ""
@@ -1592,12 +1649,18 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                         src_id = int(getattr(item_for_url, "source_id", 0) or 0) if item_for_url else 0
                         src_for_url = repo.get_source_by_id(src_id) if src_id > 0 else None
                         src_url = str(getattr(src_for_url, "url", "") or "") if src_for_url else ""
-                        if min_source_score > 0 and _effective_source_score(source_id=src_id, source_url=src_url) < int(min_source_score):
+                        if not _should_keep_push_item(
+                            url=str(push_url or ""),
+                            source_id=src_id,
+                            source_url=src_url,
+                            active_mute_domains=active_mute_domains,
+                            domain_policy=domain_policy,
+                            min_source_score=min_source_score,
+                            scores_by_source_id=scores_by_source_id,
+                        ):
                             continue
                     except Exception:
                         pass
-                    if domain_policy and (not domain_policy.allows_push_url(str(push_url or ""))):
-                        continue
 
                     first_success_for_key = not repo.any_push_sent(idempotency_key=id_key)
                     if first_success_for_key:
@@ -1885,7 +1948,7 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                 }
                 for it in items
             ]
-            _annotate_candidates_domain_feedback(repo=repo, candidates=candidates)
+            _annotate_candidates_domain_feedback(repo=repo, candidates=candidates, domain_policy=domain_policy)
 
             # Provide the model with anti-repeat context (recent digest/alert items),
             # and also pre-dedupe candidates so "same story" bursts don't spam alerts.
@@ -2082,17 +2145,17 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
 
                     push_url = _best_push_url_for_item(item=item, source=repo.get_source_by_id(item.source_id))
 
-                    # Respect explicit operator mutes + domain quality policy (push surface).
-                    try:
-                        host = (urlsplit((push_url or "").strip()).netloc or "").lower()
-                        host = host.split(":", 1)[0].lstrip(".")
-                        if host.startswith("www."):
-                            host = host[4:]
-                    except Exception:
-                        host = ""
-                    if host and host in active_mute_domains:
-                        continue
-                    if domain_policy and (not domain_policy.allows_push_url(str(push_url or ""))):
+                    # Respect explicit operator mutes + soft/hard domain quality policy on the final push surface.
+                    src_url = str(getattr(source, "url", "") or "") if source else ""
+                    if not _should_keep_push_item(
+                        url=str(push_url or ""),
+                        source_id=int(getattr(item, "source_id", 0) or 0),
+                        source_url=src_url,
+                        active_mute_domains=active_mute_domains,
+                        domain_policy=domain_policy,
+                        min_source_score=min_source_score,
+                        scores_by_source_id=scores_by_source_id,
+                    ):
                         continue
 
                     first_success_for_key = not repo.any_push_sent(idempotency_key=id_key)
@@ -2293,7 +2356,7 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                     reverse=True,
                 )
                 pool = pool[:pool_max]
-                _annotate_candidates_domain_feedback(repo=repo, candidates=pool)
+                _annotate_candidates_domain_feedback(repo=repo, candidates=pool, domain_policy=domain_policy)
 
                 # Build a synthetic "topic" for LLM prompts.
                 priority_topic = Topic(name="Priority Lane", query="", alert_keywords="")
@@ -3432,26 +3495,6 @@ async def run_digest(
     except Exception:
         scores_by_source_id = {}
 
-    def _tier_score_for_url(url: str) -> int:
-        if not domain_policy:
-            return 50
-        try:
-            tier = str(domain_policy.tier_for_url(url) or "unknown").strip().lower()
-        except Exception:
-            tier = "unknown"
-        if tier == "high":
-            return 75
-        if tier == "medium":
-            return 55
-        if tier == "low":
-            return 35
-        return 45
-
-    def _effective_source_score(source_id: int) -> int:
-        sid = int(source_id or 0)
-        if sid > 0 and sid in scores_by_source_id:
-            return max(0, min(100, int(scores_by_source_id.get(sid) or 0)))
-        return _tier_score_for_url(source_url_by_id.get(sid, ""))
 
     def _safe_url_for_item(item: Item) -> str:
         u = (str(getattr(item, "canonical_url", "") or "") or str(getattr(item, "url", "") or "")).strip()
@@ -3686,7 +3729,7 @@ async def run_digest(
                         }
                     )
 
-                _annotate_candidates_domain_feedback(repo=repo, candidates=candidates)
+                _annotate_candidates_domain_feedback(repo=repo, candidates=candidates, domain_policy=domain_policy)
 
                 # Optional cheap triage stage (mini model): reduce the pool to a bounded set before full curation.
                 #
@@ -3832,25 +3875,17 @@ async def run_digest(
             if iid > 0 and iid not in url_overrides:
                 url_overrides[iid] = _safe_url_for_item(item)
         if active_mute_domains or domain_policy or (min_source_score > 0):
-            def _host(u: str) -> str:
-                try:
-                    h = (urlsplit((u or "").strip()).netloc or "").lower()
-                    h = h.split(":", 1)[0].lstrip(".")
-                    if h.startswith("www."):
-                        h = h[4:]
-                    return h
-                except Exception:
-                    return ""
-
             def _keep(url: str, *, source_id: int) -> bool:
-                u = (url or "").strip()
-                if active_mute_domains and _host(u) in active_mute_domains:
-                    return False
-                if domain_policy and (not domain_policy.allows_push_url(u)):
-                    return False
-                if min_source_score > 0 and _effective_source_score(int(source_id or 0)) < int(min_source_score):
-                    return False
-                return True
+                sid = int(source_id or 0)
+                return _should_keep_push_item(
+                    url=url,
+                    source_id=sid,
+                    source_url=source_url_by_id.get(sid, ""),
+                    active_mute_domains=active_mute_domains,
+                    domain_policy=domain_policy,
+                    min_source_score=min_source_score,
+                    scores_by_source_id=scores_by_source_id,
+                )
 
             items = [
                 (it, item)
@@ -4165,6 +4200,21 @@ async def run_curated_info(
     except Exception:
         domain_policy = None
 
+    try:
+        min_source_score = int(getattr(settings, "source_quality_min_score", 0) or 0)
+    except Exception:
+        min_source_score = 0
+    min_source_score = max(0, min(100, int(min_source_score)))
+    scores_by_source_id: dict[int, int] = {}
+    try:
+        for sc in repo.list_source_scores(limit=10_000):
+            sid = int(getattr(sc, "source_id", 0) or 0)
+            if sid <= 0:
+                continue
+            scores_by_source_id[sid] = int(getattr(sc, "score", 0) or 0)
+    except Exception:
+        scores_by_source_id = {}
+
     # Build a cross-topic item map.
     #
     # Key: Item.id
@@ -4186,10 +4236,17 @@ async def run_curated_info(
         if not url:
             continue
 
-        host = _url_host(url)
-        if active_mute_domains and host in active_mute_domains:
-            continue
-        if domain_policy and (not domain_policy.allows_push_url(url)):
+        source_id = int(getattr(source, "id", 0) or 0) if source is not None else 0
+        source_url = str(getattr(source, "url", "") or "") if source is not None else ""
+        if not _should_keep_push_item(
+            url=url,
+            source_id=source_id,
+            source_url=source_url,
+            active_mute_domains=active_mute_domains,
+            domain_policy=domain_policy,
+            min_source_score=min_source_score,
+            scores_by_source_id=scores_by_source_id,
+        ):
             continue
 
         when = item.published_at or item.created_at

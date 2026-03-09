@@ -1079,7 +1079,7 @@ def builtin_templates() -> dict[str, PromptTemplate]:
                 "- 严格去重：同一事件/同一 repo/同一发布（即使不同 URL）最多保留 1 条。\n"
                 "- 反复出现：如果 RECENT_SENT 中已经出现同一事件，除非这条带来实质新增，否则不要保留。\n"
                 "- 质量过滤：纯转载/营销软文/标题党/无新增信息 → 不保留。泛泛灌水讨论可丢弃；但社区/论坛一线经验、可复现排障、额度/价格/可用性变化、公共资源/开放注册/邀请码/入口汇总、工具实测，只要与 USER_PROFILE 强相关且包含具体事实，不应因为“不是官方源”就丢弃。\n"
-                "- 域名质量：候选可能包含 domain_feedback（历史 👍/👎 计数）。对长期被 👎 的域名/明显 SEO 转载站，除非是唯一一手来源，否则倾向丢弃；优先官方/原始 repo/论文等一手来源，但不要把高质量社区一线报告一概当作低质。\n"
+                "- 域名质量：候选可能包含 domain_feedback（历史 👍/👎 计数）与 domain_tier（operator 配置的 low/medium/high）。其中 domain_tier=low 表示“降权/提高保留门槛（包括最终推送门槛）”，不是自动硬屏蔽；对长期被 👎 的域名/明显 SEO 转载站，除非是唯一一手来源，否则倾向丢弃；优先官方/原始 repo/论文等一手来源，但不要把高质量社区一线报告一概当作低质。\n"
                 "- 不对“安全/提示词注入/越狱/平台事故”等类别做默认屏蔽；只按信号强度 + 可信度 + 与 TOPIC/画像相关性过滤。\n"
                 "- 若涉及风险/攻击/漏洞，仅保留客观事实/影响/修复线索；不要输出可直接武器化的步骤/代码。\n"
                 "- 允许输出少于 MAX_KEEP；如果没有高信号内容，可输出空列表 []。\n"
@@ -1099,7 +1099,7 @@ def builtin_templates() -> dict[str, PromptTemplate]:
                 "- Strict dedupe: same event/repo/release (even across URLs) keep at most 1.\n"
                 "- Repeats: if RECENT_SENT already covered the same event, only keep if materially new.\n"
                 "- Quality filter: reposts/marketing/clickbait/no-new-info -> drop. Generic chatter can be dropped, but community/forum field reports, reproducible debugging notes, pricing/quota/access changes, public-resource openings, invite/registration threads, resource-directory roundups, and hands-on evaluations should be kept when they contain concrete facts and strongly match USER_PROFILE.\n"
-                "- Domain quality: candidates may include domain_feedback (historical 👍/👎 counts). Down-rank domains with repeated 👎 or obvious SEO repost sites; prefer primary sources (official/repo/paper) when available, but do NOT auto-treat strong first-hand community reports as low quality.\n"
+                "- Domain quality: candidates may include domain_feedback (historical 👍/👎 counts) and domain_tier (operator-configured low/medium/high). domain_tier=low means soft down-rank / a stricter keep bar (including the final push gate), not an automatic hard block. Down-rank domains with repeated 👎 or obvious SEO repost sites; prefer primary sources (official/repo/paper) when available, but do NOT auto-treat strong first-hand community reports as low quality.\n"
                 "- Do NOT apply category bans (security/prompt-injection/jailbreak/outage). Filter by signal strength + credibility + relevance.\n"
                 "- If it involves exploits/vulns, keep it factual (impact/patch) and avoid weaponizable step-by-step.\n"
                 "- It is OK to output fewer than MAX_KEEP; output an empty list [] if nothing meets the bar.\n"
@@ -1156,7 +1156,7 @@ def builtin_templates() -> dict[str, PromptTemplate]:
                 "- 你必须先读 snippet（如果提供）：它可能来自原文全文提取或 feed 摘要；不要只看标题做决定。\n"
                 "- 如果 snippet 为空/信息不足：不要默认给 digest。只有当标题本身是强信号且与画像/主题强相关时，才给 digest/alert；否则 ignore。why 可为空，或仅说明证据状态（例如：仅标题/论坛贴未含一手链接）。\n"
                 "- 质量过滤：纯转载/营销软文/标题党/无新增信息 → 直接 ignore（宁缺毋滥）。泛泛灌水讨论可忽略；但社区/论坛一线经验、可复现排障、额度/价格/可用性变化、开放注册/邀请码/公共资源/入口汇总、工具实测，只要与 USER_PROFILE 强相关且包含具体事实，不应因为“不是官方源”就直接 ignore。\n"
-                "- 域名质量：候选可能包含 domain_feedback（历史 👍/👎 计数）。对长期被 👎 的域名/明显 SEO 转载站，若 snippet 未含一手链接/实质新事实，倾向 ignore；优先官方/原始 repo/论文等一手来源，但不要把高质量社区一线报告一概当作低质。\n"
+                "- 域名质量：候选可能包含 domain_feedback（历史 👍/👎 计数）与 domain_tier（operator 配置的 low/medium/high）。其中 domain_tier=low 表示“降权/提高保留门槛（包括最终推送门槛）”，不是自动硬屏蔽；对长期被 👎 的域名/明显 SEO 转载站，若 snippet 未含一手链接/实质新事实，倾向 ignore；优先官方/原始 repo/论文等一手来源，但不要把高质量社区一线报告一概当作低质。\n"
                 "- 不对“安全/提示词注入/越狱/平台事故”等类别做默认屏蔽；只按信号强度 + 可信度 + 与 TOPIC/画像相关性筛选。\n"
                 "- 若涉及风险/攻击/漏洞，仅做客观摘要（不包含可直接武器化步骤/代码）；以事实/影响/修复/出处为主。\n"
                 "- 重要：对“新模型发布/新开发工具/新框架/重大版本更新”，即使细节不足，也优先 digest/alert，而不是因为缺细节而忽略；但在 priority lane（MAX_DIGEST==0）中，只有满足“强时效+高影响”才允许 alert。\n"
@@ -1188,7 +1188,7 @@ def builtin_templates() -> dict[str, PromptTemplate]:
                 "- Read snippet if provided (may be fulltext extract); do not decide by title alone.\n"
                 "- If snippet is empty/insufficient: do NOT default to digest. Only keep (digest/alert) if the TITLE itself is a strong signal AND it clearly matches the profile/topic; concrete access/pricing/quota/availability changes, first-hand operator reports, or reproducible community findings may still qualify even without a primary link. why may be empty or briefly describe evidence status.\n"
                 "- Quality filter: reposts/marketing/clickbait/no-new-info -> ignore. Generic chatter can be ignored, but community/forum field reports, reproducible debugging notes, pricing/quota/access changes, public-resource openings, invite/registration threads, resource-directory roundups, and hands-on evaluations should be kept when they contain concrete facts and strongly match USER_PROFILE.\n"
-                "- Domain quality: candidates may include domain_feedback (historical 👍/👎 counts). Down-rank domains with repeated 👎 or obvious SEO repost sites; if snippet lacks primary links/new facts, prefer ignore; prefer primary sources (official/repo/paper) when available, but do NOT auto-treat strong first-hand community reports as low quality.\n"
+                "- Domain quality: candidates may include domain_feedback (historical 👍/👎 counts) and domain_tier (operator-configured low/medium/high). domain_tier=low means soft down-rank / a stricter keep bar (including the final push gate), not an automatic hard block. Down-rank domains with repeated 👎 or obvious SEO repost sites; if snippet lacks primary links/new facts, prefer ignore; prefer primary sources (official/repo/paper) when available, but do NOT auto-treat strong first-hand community reports as low quality.\n"
                 "- Do NOT apply category bans (security/prompt-injection/jailbreak/outage). Select by signal strength + credibility + topic/profile relevance.\n"
                 "- If it involves exploits/vulns, summarize objectively (impact/patch/evidence), avoid weaponizable step-by-step.\n"
                 "- Important: for 'new model release / new dev tool / new framework / major version update', prefer digest/alert rather than ignoring due to missing details; but in the priority lane (MAX_DIGEST==0) only alert if it is also time-sensitive/high-impact.\n"
@@ -1599,6 +1599,7 @@ def builtin_templates() -> dict[str, PromptTemplate]:
 - 如果用户要修改画像/兴趣/偏好/关注方向，优先输出 `mcp.profile.set`，并给出完整 `profile_text`。
 - 如果用户要加来源/搜索/站点流/删除或禁用来源，优先使用 tracking/source MCP actions。
 - 如果用户要改 LLM、Push、主题外观、调度、阈值等 Settings，使用 `mcp.setting.set` / `mcp.setting.clear`。
+- 如果用户说某个域名“太多了 / 降低权重 / 少推一点 / 仔细审核”，优先使用软降权（如 `domain_quality_low_domains`）；只有在用户明确要求“屏蔽 / 拉黑 / 不要再推 / 完全排除”时，才使用硬屏蔽字段。
 - 用 `RECENT_CONVERSATION_HISTORY` 与 `WEB_ADMIN_CONTEXT` 解析“继续”“就按刚才那个”“在这个页面里加上”这类跟进式表达。
 - 禁止修改危险远程字段：db_url / env_path / api_host / api_port。
 - 如果请求略有歧义，可以在 questions 里放 1-3 个短问题；能安全推断时直接输出 actions；如果只是回答/解释，也必须返回自然语言 `assistant_reply`。
@@ -1664,6 +1665,7 @@ Hard rules:
 - If the user is changing profile/interests/preferences, prefer `mcp.profile.set` and provide the full desired `profile_text`.
 - If the user is adding/removing/disabling sources/search/site streams, prefer tracking/source MCP actions.
 - If the user is changing LLM, Push, theme, schedules, thresholds, or other Settings, use `mcp.setting.set` / `mcp.setting.clear`.
+- If the user says a domain appears too often / lower its weight / be stricter, prefer a soft down-rank setting (for example `domain_quality_low_domains`); only use hard-block fields when the user clearly says block / never push / fully exclude.
 - Use `RECENT_CONVERSATION_HISTORY` and `WEB_ADMIN_CONTEXT` to resolve follow-up references like “继续”, “就按刚才那个”, “在这个页面里加上”.
 - Forbidden remote fields: db_url / env_path / api_host / api_port.
 - If the request is ambiguous, you may put 1-3 short questions in `questions`; when you can infer safely, emit actions directly; when the best answer is explanatory, still return natural-language `assistant_reply`.
