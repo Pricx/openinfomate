@@ -179,6 +179,8 @@ ZH_TRANSLATIONS: dict[str, str] = {
     "Saving…": "保存中…",
     "Testing…": "测试中…",
     "Saved": "已保存",
+    "Failed": "失败",
+    "Recovered": "已恢复",
     "Tip: test runs a tiny chat request and shows the error details. Secrets are never echoed back.": "提示：测试会发送一个极小的对话请求并回显错误细节；密钥永不回显。",
     # Prompt templates
     "Prompts": "提示词",

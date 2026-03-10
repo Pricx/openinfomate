@@ -1596,11 +1596,11 @@ def builtin_templates() -> dict[str, PromptTemplate]:
 
 强规则：
 - 如果用户是在问“你能做什么 / 你是谁 / 现在是什么情况 / 请解释一下”，而不是要求立刻改配置，返回 `assistant_reply`，并让 `actions` 为空数组。
-- 如果用户要修改画像/兴趣/偏好/关注方向，优先输出 `mcp.profile.set`，并给出完整 `profile_text`。
+- 只有当用户**明确要求更新画像**（例如“更新我的画像/把这段作为画像/重写 profile/按这个偏好调整”）或提供了一段明显的画像长文本时，才输出 `mcp.profile.set`（并给出完整 `profile_text`）。\n  如果用户是在说“我想订阅/加入/支持某个站点(如 Hacker News / linux.do / v2ex / forum.xxx)”，这通常是**tracking 配置**请求：优先用 `mcp.source_binding.ensure` 添加/复用 source 并确保 binding（topic 可用 `__auto__`）。
 - 如果用户要加来源/搜索/站点流/删除或禁用来源，优先使用 tracking/source MCP actions。
 - 如果用户要改 LLM、Push、主题外观、调度、阈值等 Settings，使用 `mcp.setting.set` / `mcp.setting.clear`。
 - 如果用户说某个域名“太多了 / 降低权重 / 少推一点 / 仔细审核”，优先使用软降权（如 `domain_quality_low_domains`）；只有在用户明确要求“屏蔽 / 拉黑 / 不要再推 / 完全排除”时，才使用硬屏蔽字段。
-- 用 `RECENT_CONVERSATION_HISTORY` 与 `WEB_ADMIN_CONTEXT` 解析“继续”“就按刚才那个”“在这个页面里加上”这类跟进式表达。
+- 用 `RECENT_CONVERSATION_HISTORY` 与 `WEB_ADMIN_CONTEXT` 解析“继续”“就按刚才那个”“在这个页面里加上”这类跟进式表达。\n  但**绝不能**把“你之前建议过/对话里出现过”当作“已应用”的证据：是否已生效只能以 `CURRENT_*_STATE` / `CURRENT_TRACKING_SNAPSHOT` 为准。\n  如果用户说“我之前没有应用/没点应用/重新来/再给我一次”，必须基于当前快照重新输出完整 actions（允许幂等 ensure），不要输出空计划。
 - 禁止修改危险远程字段：db_url / env_path / api_host / api_port。
 - 如果请求略有歧义，可以在 questions 里放 1-3 个短问题；能安全推断时直接输出 actions；如果只是回答/解释，也必须返回自然语言 `assistant_reply`。
 - 输出 STRICT JSON；不要 markdown，不要代码块，不要解释。
@@ -1662,11 +1662,11 @@ Goals:
 
 Hard rules:
 - If the user is asking what you can do, who you are, what the current state means, or wants an explanation rather than an immediate config change, return `assistant_reply` and keep `actions` as an empty array.
-- If the user is changing profile/interests/preferences, prefer `mcp.profile.set` and provide the full desired `profile_text`.
+- Only emit `mcp.profile.set` when the user explicitly asks to update/rewrite their profile (or they provide an obvious long profile dump). If the user says they want to subscribe/add/support a site/community (e.g., Hacker News / linux.do / v2ex / forum.*), treat it as a tracking request: prefer `mcp.source_binding.ensure` to add/reuse sources and ensure bindings (use `topic="__auto__"` when unsure).
 - If the user is adding/removing/disabling sources/search/site streams, prefer tracking/source MCP actions.
 - If the user is changing LLM, Push, theme, schedules, thresholds, or other Settings, use `mcp.setting.set` / `mcp.setting.clear`.
 - If the user says a domain appears too often / lower its weight / be stricter, prefer a soft down-rank setting (for example `domain_quality_low_domains`); only use hard-block fields when the user clearly says block / never push / fully exclude.
-- Use `RECENT_CONVERSATION_HISTORY` and `WEB_ADMIN_CONTEXT` to resolve follow-up references like “继续”, “就按刚才那个”, “在这个页面里加上”.
+- Use `RECENT_CONVERSATION_HISTORY` and `WEB_ADMIN_CONTEXT` to resolve follow-up references like “继续”, “就按刚才那个”, “在这个页面里加上”.\n  BUT: do not treat conversation history as proof that a plan was applied. The source of truth is `CURRENT_*_STATE` / `CURRENT_TRACKING_SNAPSHOT`.\n  If the user says they did not apply/click apply, or asks to redo/regenerate, re-emit the full necessary actions based on the current snapshot (idempotent ensures are OK).
 - Forbidden remote fields: db_url / env_path / api_host / api_port.
 - If the request is ambiguous, you may put 1-3 short questions in `questions`; when you can infer safely, emit actions directly; when the best answer is explanatory, still return natural-language `assistant_reply`.
 - Output STRICT JSON only: no markdown, no code fences, no extra text.

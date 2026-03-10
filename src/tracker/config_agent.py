@@ -1517,29 +1517,17 @@ def diff_tracking_snapshots(*, before: dict[str, Any], after: dict[str, Any]) ->
     if added_bind:
         items: list[str] = []
         for t, st, u in added_bind[:20]:
-            if st in {"searxng_search", "hn_search"}:
-                q = _search_query_from_url(st=st, url=u)
-                items.append(f"{t}<=search: {q}".strip() if q else f"{t}<=search")
-            else:
-                items.append(f"{t}<=({st})")
+            items.append(f"{t}<={_format_source(st, u)}".strip())
         lines.append("- Added: " + ", ".join(items) + ("…" if len(added_bind) > 20 else ""))
     if removed_bind:
         items: list[str] = []
         for t, st, u in removed_bind[:20]:
-            if st in {"searxng_search", "hn_search"}:
-                q = _search_query_from_url(st=st, url=u)
-                items.append(f"{t}<=search: {q}".strip() if q else f"{t}<=search")
-            else:
-                items.append(f"{t}<=({st})")
+            items.append(f"{t}<={_format_source(st, u)}".strip())
         lines.append("- Removed: " + ", ".join(items) + ("…" if len(removed_bind) > 20 else ""))
     if changed_bind:
         items2: list[str] = []
         for t, st, u in changed_bind[:20]:
-            if st in {"searxng_search", "hn_search"}:
-                q = _search_query_from_url(st=st, url=u)
-                items2.append(f"{t}<=search: {q}".strip() if q else f"{t}<=search")
-            else:
-                items2.append(f"{t}<=({st})")
+            items2.append(f"{t}<={_format_source(st, u)}".strip())
         lines.append("- Changed: " + ", ".join(items2) + ("…" if len(changed_bind) > 20 else ""))
     if not (added_bind or removed_bind or changed_bind):
         lines.append("- (no binding changes)")
