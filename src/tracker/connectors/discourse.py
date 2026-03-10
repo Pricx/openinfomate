@@ -146,15 +146,53 @@ class DiscourseConnector(Connector):
         headers = {"User-Agent": "tracker/0.1"}
         if self.cookie:
             headers["Cookie"] = self.cookie
+        transient_status_codes = {408, 425, 429, 500, 502, 503, 504}
+        max_consecutive_failures = 3
+        consecutive_failures = 0
+        skipped_pages = 0
         for i in range(max_pages):
             url = primary_url if i == 0 else self._with_page(primary_url, i)
-            resp = await client.get(url, headers=headers)
+            try:
+                resp = await client.get(url, headers=headers)
+            except Exception as exc:
+                if i == 0:
+                    raise
+                skipped_pages += 1
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    logger.info(
+                        "discourse rss catchup stopping after request failures: url=%s failures=%s err=%s",
+                        url,
+                        consecutive_failures,
+                        exc,
+                    )
+                    break
+                logger.info("discourse rss page request failed (skipping): url=%s err=%s", url, exc)
+                continue
             if resp.status_code == 404 and i > 0:
                 break
             final_url = str(getattr(resp, "url", url) or url)
             if resp.status_code in {401, 403} or looks_like_login_redirect(original_url=url, final_url=final_url):
                 raise AuthRequiredError(url=url, status_code=resp.status_code, final_url=final_url)
+            if int(getattr(resp, "status_code", 0) or 0) in transient_status_codes and i > 0:
+                skipped_pages += 1
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    logger.info(
+                        "discourse rss catchup stopping after transient failures: url=%s status=%s failures=%s",
+                        url,
+                        resp.status_code,
+                        consecutive_failures,
+                    )
+                    break
+                logger.info(
+                    "discourse rss page transient error (skipping): url=%s status=%s",
+                    url,
+                    resp.status_code,
+                )
+                continue
             resp.raise_for_status()
+            consecutive_failures = 0
             entries = self._parse_rss(text=resp.text)
             if not entries and i > 0:
                 break
@@ -162,6 +200,8 @@ class DiscourseConnector(Connector):
                 if e.url and e.url not in seen:
                     seen.add(e.url)
                     merged.append(e)
+        if skipped_pages:
+            logger.info("discourse rss catchup skipped_pages=%s primary=%s", skipped_pages, primary_url)
         return merged
 
     async def _merge_rss_urls(
@@ -207,7 +247,11 @@ class DiscourseConnector(Connector):
                 rss_urls = self._rss_recall_urls(url, include_top_daily=include_top_daily)
                 primary = rss_urls[0]
                 pages = self._effective_rss_catchup_pages(url=url, include_top_daily=include_top_daily)
-                entries = await self._fetch_rss_pages(client=client, primary_url=primary, pages=pages)
+                try:
+                    entries = await self._fetch_rss_pages(client=client, primary_url=primary, pages=pages)
+                except Exception as exc:
+                    logger.info("discourse rss fetch failed: url=%s err=%s", primary, exc)
+                    entries = await self._fetch_rss_pages(client=client, primary_url=primary, pages=1)
                 seen = {e.url for e in entries if e.url}
                 await self._merge_rss_urls(client=client, urls=rss_urls[1:], seen=seen, entries=entries)
                 return entries
@@ -219,7 +263,11 @@ class DiscourseConnector(Connector):
                 rss_urls = self._rss_recall_urls(url, include_top_daily=include_top_daily)
                 primary = rss_urls[0]
                 pages = self._effective_rss_catchup_pages(url=url, include_top_daily=include_top_daily)
-                entries = await self._fetch_rss_pages(client=client, primary_url=primary, pages=pages)
+                try:
+                    entries = await self._fetch_rss_pages(client=client, primary_url=primary, pages=pages)
+                except Exception as exc:
+                    logger.info("discourse rss fetch failed: url=%s err=%s", primary, exc)
+                    entries = await self._fetch_rss_pages(client=client, primary_url=primary, pages=1)
                 seen = {e.url for e in entries if e.url}
                 await self._merge_rss_urls(client=client, urls=rss_urls[1:], seen=seen, entries=entries)
                 return entries

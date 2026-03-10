@@ -471,6 +471,67 @@ def test_discourse_fetch_rss_catchup_pages_when_stale(monkeypatch):
     assert "https://forum.example.com/t/topic/1610998" in urls
 
 
+def test_discourse_rss_catchup_tolerates_transient_page_errors(monkeypatch):
+    monkeypatch.setattr("tracker.connectors.discourse._CF_CHALLENGED_NETLOCS", {"forum.example.com"})
+
+    page0 = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Latest</title>
+    <item><title>A</title><link>https://forum.example.com/t/test-topic/123</link></item>
+  </channel>
+</rss>
+"""
+    page2 = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Latest</title>
+    <item><title>Older</title><link>https://forum.example.com/t/topic/1717220</link></item>
+  </channel>
+</rss>
+"""
+
+    class FakeResp:
+        def __init__(self, text: str, *, status_code: int = 200, headers: dict[str, str] | None = None):
+            self.text = text
+            self.status_code = status_code
+            self.headers = headers or {}
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+            return None
+
+    seen_urls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url: str, headers: dict):
+            seen_urls.append(url)
+            if "page=1" in url:
+                return FakeResp("unavailable", status_code=503)
+            if "page=2" in url:
+                return FakeResp(page2, status_code=200)
+            return FakeResp(page0, status_code=200)
+
+    monkeypatch.setattr("tracker.connectors.discourse.httpx.AsyncClient", FakeClient)
+
+    connector = DiscourseConnector(timeout_seconds=1, rss_catchup_pages=8)
+    entries = asyncio.run(connector.fetch(url="https://forum.example.com/latest.json"))
+
+    assert any("/latest.rss" in u and "page=2" in u for u in seen_urls)
+    urls = {e.url for e in entries}
+    assert "https://forum.example.com/t/topic/1717220" in urls
+
+
 def test_discourse_fetch_sends_cookie_header_when_configured(monkeypatch):
     cache: set[str] = {"forum.example.com"}
     monkeypatch.setattr("tracker.connectors.discourse._CF_CHALLENGED_NETLOCS", cache)
