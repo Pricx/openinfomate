@@ -142,7 +142,7 @@
         <div id="f_ai_preset_desc" class="muted" style="margin-top:6px"></div>
         <div style="margin-top:10px">
           <textarea id="f_ai_prompt" name="ai_prompt" rows="10" placeholder="{{ t('Optional per-topic prompt (how to curate and write summaries)') }}">
-你要做的是：为这个 TOPIC 从过去 24 小时信息里挑出最重要的少数几条（宁缺毋滥）。
+你要做的是：为这个 TOPIC 从过去 24 小时信息里挑出真正高信号、值得我读的内容。
 
 偏好：
 - 一手信息、技术细节、可验证、影响面大、可能改变判断/路线图的进展
@@ -150,7 +150,7 @@
 
 输出约束：
 - alert：仅强时效 + 高影响（会让我今天改变决策/行动）
-- digest：最多 5 条（宁缺毋滥）
+- digest：不设固定每日条数上限；保留所有达到高信号门槛的内容，不要凑数，也不要因为固定名额压掉高质量内容
 - summary：一句话概括“发生了什么”（尽量具体）
 - why：一句话说明“为什么重要/对我有什么影响”（避免空话）
 - 先读内容再判断：如果提供了正文/摘要，请基于内容质量做筛选，不要只看标题
