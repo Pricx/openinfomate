@@ -777,6 +777,8 @@ class CuratedInfoResult:
     pushed: int
     markdown: str
     idempotency_key: str = ""
+    recovery_pending: bool = False
+    pending_topic_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3432,6 +3434,7 @@ async def run_digest(
     push: bool,
     topic_ids: list[int] | None = None,
     key_suffix: str | None = None,
+    now: dt.datetime | None = None,
 ) -> DigestResult:
     repo = Repo(session)
     # Apply DB-backed dynamic overrides for non-secret Settings fields.
@@ -3447,7 +3450,12 @@ async def run_digest(
     except Exception:
         settings_out = settings
     llm_usage_cb = make_llm_usage_recorder(session=session)
-    now_utc = dt.datetime.utcnow()
+    if now is None:
+        now_utc = dt.datetime.utcnow()
+    elif now.tzinfo is None:
+        now_utc = now
+    else:
+        now_utc = now.astimezone(dt.timezone.utc).replace(tzinfo=None)
     since = now_utc - dt.timedelta(hours=hours)
     policies_by_topic_id = {p.topic_id: p for p in repo.list_topic_policies()}
 
@@ -4100,6 +4108,7 @@ async def run_curated_info(
     push: bool,
     key_suffix: str | None = None,
     now: dt.datetime | None = None,
+    allow_recovery_enqueue: bool = True,
 ) -> CuratedInfoResult:
     """
     Build ONE cross-topic Curated Info batch (de-dupe only; no interpretation).
@@ -4129,6 +4138,50 @@ async def run_curated_info(
         h = 24
     since = now_utc - dt.timedelta(hours=h)
 
+    def _pending_topic_ids() -> list[int]:
+        out: list[int] = []
+        try:
+            for topic in repo.list_topics():
+                if not getattr(topic, "enabled", True):
+                    continue
+                pending = repo.list_uncurated_item_topics_for_topic(topic=topic, since=since, limit=1)
+                if pending:
+                    out.append(int(topic.id))
+        except Exception:
+            return []
+        return out
+
+    def _recovery_pending_markdown() -> str:
+        is_zh = bool((out_lang or "").strip().lower().startswith("zh")) or (out_lang or "").strip() in {
+            "中文",
+            "简体中文",
+            "繁体中文",
+            "繁體中文",
+            "汉语",
+        }
+        try:
+            tz_name = (settings.cron_timezone or "").strip() or "UTC"
+            tz, tz_ok = resolve_cron_timezone(tz_name)
+            if not tz_ok:
+                tz = dt.timezone.utc
+                tz_name = "UTC"
+            since_local = since.replace(tzinfo=dt.timezone.utc).astimezone(tz).replace(second=0, microsecond=0)
+            until_local = now_utc.replace(tzinfo=dt.timezone.utc).astimezone(tz).replace(second=0, microsecond=0)
+            window_text = f"{since_local.isoformat(timespec='minutes')}–{until_local.isoformat(timespec='minutes')} ({tz_name})"
+        except Exception:
+            window_text = f"{since.isoformat(timespec='minutes')}–{now_utc.isoformat(timespec='minutes')} UTC"
+        if is_zh:
+            return (
+                "# 参考消息暂缓\n\n"
+                f"- 窗口: {window_text}\n"
+                "- 原因: LLM 供应商当前不可用，已加入后台恢复队列；恢复后会自动重放当前窗口。\n"
+            )
+        return (
+            "# Curated Info delayed\n\n"
+            f"- Window: {window_text}\n"
+            "- Reason: the LLM provider is currently unavailable; this window has been queued for background replay.\n"
+        )
+
     def _recent_curated_rows() -> list[tuple[object, object, object, object]]:
         return repo.list_recent_events(
             topic=None,
@@ -4138,16 +4191,9 @@ async def run_curated_info(
         )
 
     rows = _recent_curated_rows()
-    stalled_topic_ids: list[int] = []
-    try:
-        for topic in repo.list_topics():
-            if not getattr(topic, "enabled", True):
-                continue
-            pending = repo.list_uncurated_item_topics_for_topic(topic=topic, since=since, limit=1)
-            if pending:
-                stalled_topic_ids.append(int(topic.id))
-    except Exception:
-        stalled_topic_ids = []
+    stalled_topic_ids = _pending_topic_ids()
+    recovery_pending_topic_ids: list[int] = []
+    recovery_enqueued = False
 
     if stalled_topic_ids:
         log_fn = logger.warning if not rows else logger.info
@@ -4165,6 +4211,7 @@ async def run_curated_info(
                 push=False,
                 topic_ids=stalled_topic_ids,
                 key_suffix=f"autorepair-{now_utc.strftime('%Y%m%d%H%M%S')}",
+                now=now_utc,
             )
             try:
                 session.expire_all()
@@ -4173,7 +4220,36 @@ async def run_curated_info(
             rows = _recent_curated_rows()
         except Exception as exc:
             logger.warning("curated info auto-repair failed: %s", exc)
+        recovery_pending_topic_ids = _pending_topic_ids()
+        if recovery_pending_topic_ids:
+            logger.warning(
+                "curated info still has pending candidate backlog after auto-repair: hours=%s topics=%s rows=%s",
+                h,
+                ",".join(str(x) for x in recovery_pending_topic_ids),
+                len(rows),
+            )
+            if allow_recovery_enqueue:
+                try:
+                    from tracker.curated_recovery_queue import enqueue_curated_recovery_job
 
+                    recovery_enqueued = enqueue_curated_recovery_job(
+                        repo=repo,
+                        window_end_utc=now_utc.replace(microsecond=0).isoformat() + "Z",
+                        hours=h,
+                        push=push,
+                        pending_topic_ids=recovery_pending_topic_ids,
+                        last_error="pending candidate backlog remained after auto-repair",
+                    )
+                except Exception as exc:
+                    logger.warning("curated recovery enqueue failed: %s", exc)
+            if (not allow_recovery_enqueue) or (not rows and recovery_enqueued):
+                return CuratedInfoResult(
+                    since=since,
+                    pushed=0,
+                    markdown=_recovery_pending_markdown(),
+                    recovery_pending=True,
+                    pending_topic_ids=tuple(recovery_pending_topic_ids),
+                )
     # Explicit operator feedback: muted domains should not appear in Curated Info.
     active_mute_domains: set[str] = set()
     try:
@@ -4544,7 +4620,14 @@ async def run_curated_info(
         except Exception:
             pass
 
-    return CuratedInfoResult(since=since, pushed=pushed, markdown=markdown, idempotency_key=key)
+    return CuratedInfoResult(
+        since=since,
+        pushed=pushed,
+        markdown=markdown,
+        idempotency_key=key,
+        recovery_pending=bool(recovery_pending_topic_ids),
+        pending_topic_ids=tuple(recovery_pending_topic_ids),
+    )
 
 async def run_health_report(*, session: Session, settings: Settings, push: bool) -> HealthResult:
     repo = Repo(session)

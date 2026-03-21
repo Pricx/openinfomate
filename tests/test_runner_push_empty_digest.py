@@ -4,8 +4,10 @@ import asyncio
 import datetime as dt
 from pathlib import Path
 
+from sqlalchemy import select
+
 from tracker.db import session_factory
-from tracker.models import Base, Item, ItemTopic, Source
+from tracker.models import Base, Item, ItemTopic, Report, Source
 from tracker.repo import Repo
 from tracker.runner import DigestResult, run_curated_info
 from tracker.settings import Settings
@@ -107,7 +109,7 @@ def test_curated_info_auto_repairs_stalled_candidates_before_empty_window(tmp_pa
 
     called = {"digest": 0}
 
-    async def _fake_run_digest(*, session, settings, hours, push, topic_ids=None, key_suffix=None):  # noqa: ANN001, ARG001
+    async def _fake_run_digest(*, session, settings, hours, push, topic_ids=None, key_suffix=None, now=None):  # noqa: ANN001, ARG001
         called["digest"] += 1
         repo = Repo(session)
         row = repo.get_item_topic(item_id=item_id, topic_id=topic_id)
@@ -136,6 +138,92 @@ def test_curated_info_auto_repairs_stalled_candidates_before_empty_window(tmp_pa
     markdown = asyncio.run(_run())
     assert called["digest"] == 1
     assert "Recovered item" in markdown
+
+
+def test_curated_info_enqueues_recovery_and_skips_empty_push_when_backlog_remains(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "tracker.db"
+    env_path = Path(tmp_path) / ".env"
+    env_path.write_text('TRACKER_API_TOKEN="secret"\n', encoding="utf-8")
+
+    settings = Settings(
+        db_url=f"sqlite:///{db_path}",
+        api_token="secret",
+        env_path=str(env_path),
+        digest_push_enabled=True,
+        cron_timezone="+8",
+    )
+    engine, make_session = session_factory(settings)
+    Base.metadata.create_all(engine)
+
+    with make_session() as session:
+        repo = Repo(session)
+        topic = repo.add_topic(name="AI Agents", query="agent", digest_cron="0 9 * * *")
+        source = Source(type="rss", url="https://example.com/feed")
+        session.add(source)
+        session.flush()
+        now = dt.datetime(2026, 3, 7, 8, 0, 0)
+        item = Item(
+            source_id=int(source.id),
+            url="https://example.com/p/1",
+            canonical_url="https://example.com/p/1",
+            title="Queued item",
+            created_at=now - dt.timedelta(hours=1),
+        )
+        session.add(item)
+        session.flush()
+        session.add(
+            ItemTopic(
+                item_id=int(item.id),
+                topic_id=int(topic.id),
+                decision="candidate",
+                reason="llm curation candidate",
+                created_at=now - dt.timedelta(hours=1),
+            )
+        )
+        session.commit()
+
+    called = {"telegram": 0}
+
+    async def _fake_run_digest(*, session, settings, hours, push, topic_ids=None, key_suffix=None):  # noqa: ANN001, ARG001
+        return DigestResult(since=dt.datetime.utcnow(), per_topic=[])
+
+    async def _fake_push_telegram_report_reader(**_kwargs) -> bool:  # noqa: ANN003
+        called["telegram"] += 1
+        return True
+
+    import tracker.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "run_digest", _fake_run_digest, raising=True)
+    monkeypatch.setattr(runner_mod, "push_telegram_report_reader", _fake_push_telegram_report_reader, raising=True)
+    monkeypatch.setattr(runner_mod, "push_telegram_text", lambda **_k: False, raising=True)
+    monkeypatch.setattr(runner_mod, "push_dingtalk_markdown", lambda **_k: False, raising=True)
+    monkeypatch.setattr(runner_mod, "push_email_text", lambda **_k: False, raising=True)
+    monkeypatch.setattr(runner_mod, "push_webhook_json", lambda **_k: False, raising=True)
+
+    async def _run():
+        with make_session() as session:
+            return await run_curated_info(
+                session=session,
+                settings=settings,
+                hours=2,
+                push=True,
+                key_suffix="queued-test",
+                now=dt.datetime(2026, 3, 7, 8, 0, 0),
+            )
+
+    result = asyncio.run(_run())
+    assert result.recovery_pending is True
+    assert result.pushed == 0
+    assert called["telegram"] == 0
+
+    with make_session() as session:
+        repo = Repo(session)
+        queue_raw = repo.get_app_config("curated_recovery_queue_json") or ""
+        reports = list(session.scalars(select(Report)))
+
+    assert "后台恢复队列" in result.markdown
+    assert queue_raw
+    assert reports == []
 
 
 def test_curated_info_auto_repairs_stalled_candidates_even_with_existing_rows(tmp_path, monkeypatch):
@@ -201,7 +289,7 @@ def test_curated_info_auto_repairs_stalled_candidates_even_with_existing_rows(tm
 
     called = {"digest": 0}
 
-    async def _fake_run_digest(*, session, settings, hours, push, topic_ids=None, key_suffix=None):  # noqa: ANN001, ARG001
+    async def _fake_run_digest(*, session, settings, hours, push, topic_ids=None, key_suffix=None, now=None):  # noqa: ANN001, ARG001
         called["digest"] += 1
         repo = Repo(session)
         row = repo.get_item_topic(item_id=digest_item_id, topic_id=topic_id)
@@ -231,6 +319,75 @@ def test_curated_info_auto_repairs_stalled_candidates_even_with_existing_rows(tm
     assert called["digest"] == 1
     assert "Existing alert" in markdown
     assert "Recovered digest" in markdown
+
+
+def test_curated_info_queues_recovery_when_candidates_remain_after_repair(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "tracker.db"
+    env_path = Path(tmp_path) / ".env"
+    env_path.write_text('TRACKER_API_TOKEN="secret"\n', encoding="utf-8")
+
+    settings = Settings(
+        db_url=f"sqlite:///{db_path}",
+        api_token="secret",
+        env_path=str(env_path),
+        digest_push_enabled=True,
+        cron_timezone="+8",
+    )
+    engine, make_session = session_factory(settings)
+    Base.metadata.create_all(engine)
+
+    with make_session() as session:
+        repo = Repo(session)
+        topic = repo.add_topic(name="AI Agents", query="agent", digest_cron="0 9 * * *")
+        source = Source(type="rss", url="https://example.com/feed")
+        session.add(source)
+        session.flush()
+        now = dt.datetime(2026, 3, 7, 8, 0, 0)
+        item = Item(
+            source_id=int(source.id),
+            url="https://example.com/p/queued",
+            canonical_url="https://example.com/p/queued",
+            title="Queued recovery item",
+            created_at=now - dt.timedelta(minutes=30),
+        )
+        session.add(item)
+        session.flush()
+        session.add(
+            ItemTopic(
+                item_id=int(item.id),
+                topic_id=int(topic.id),
+                decision="candidate",
+                reason="llm curation candidate",
+                created_at=now - dt.timedelta(minutes=30),
+            )
+        )
+        session.commit()
+
+    async def _fake_run_digest(*, session, settings, hours, push, topic_ids=None, key_suffix=None, now=None):  # noqa: ANN001, ARG001
+        return DigestResult(since=dt.datetime.utcnow(), per_topic=[])
+
+    import tracker.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "run_digest", _fake_run_digest, raising=True)
+
+    async def _run() -> None:
+        with make_session() as session:
+            await run_curated_info(
+                session=session,
+                settings=settings,
+                hours=2,
+                push=True,
+                key_suffix="repair-queue-test",
+                now=dt.datetime(2026, 3, 7, 8, 0, 0),
+            )
+
+    asyncio.run(_run())
+
+    with make_session() as session:
+        repo = Repo(session)
+        raw = repo.get_app_config("curated_recovery_queue_json") or ""
+    assert '"hours": 2' in raw
+    assert '"push": true' in raw.lower()
 
 
 def test_curated_info_localizes_non_target_language_titles(tmp_path, monkeypatch):

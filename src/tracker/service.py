@@ -570,6 +570,142 @@ async def _run_ai_setup_discover_queue_job(make_session, settings):
         pass
 
 
+async def _run_curated_recovery_queue_job(make_session, settings):
+    try:
+        from tracker.curated_recovery_queue import has_curated_recovery_jobs
+
+        with make_session() as session:
+            if not has_curated_recovery_jobs(repo=Repo(session)):
+                return
+    except Exception:
+        return
+
+    eff_settings = _effective_runtime_settings(make_session, settings)
+    try:
+        async with job_lock_async(name=_service_job_lock_name("curated"), timeout_seconds=0.0):
+            with make_session() as session:
+                repo = Repo(session)
+                from tracker.curated_recovery_queue import (
+                    complete_curated_recovery_job,
+                    parse_iso_utc,
+                    peek_curated_recovery_job,
+                    record_curated_recovery_attempt,
+                    record_curated_recovery_status,
+                    recovery_key_suffix,
+                )
+                from tracker.runner import run_curated_info
+
+                job = peek_curated_recovery_job(repo=repo)
+                if not job:
+                    return
+
+                try:
+                    record_curated_recovery_status(
+                        repo=repo,
+                        job=job,
+                        ok=False,
+                        queued=True,
+                        running=True,
+                        error="",
+                    )
+                except Exception:
+                    pass
+
+                window_end = parse_iso_utc(job.window_end_utc)
+                if window_end is None:
+                    updated_job = record_curated_recovery_attempt(
+                        repo=repo,
+                        job=job,
+                        error="invalid window_end_utc",
+                    )
+                    try:
+                        record_curated_recovery_status(
+                            repo=repo,
+                            job=updated_job,
+                            ok=False,
+                            queued=True,
+                            running=False,
+                            error="invalid window_end_utc",
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                result = await run_curated_info(
+                    session=session,
+                    settings=eff_settings,
+                    hours=job.hours,
+                    push=job.push,
+                    key_suffix=recovery_key_suffix(window_end_utc=job.window_end_utc),
+                    now=window_end,
+                    allow_recovery_enqueue=False,
+                )
+                if getattr(result, "recovery_pending", False):
+                    pending_topic_ids = list(getattr(result, "pending_topic_ids", ()) or ()) or job.pending_topic_ids
+                    updated_job = record_curated_recovery_attempt(
+                        repo=repo,
+                        job=job,
+                        error="pending backlog remained after replay",
+                        pending_topic_ids=pending_topic_ids,
+                    )
+                    try:
+                        record_curated_recovery_status(
+                            repo=repo,
+                            job=updated_job,
+                            ok=False,
+                            queued=True,
+                            running=False,
+                            error="pending backlog remained after replay",
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                complete_curated_recovery_job(repo=repo, job=job)
+                try:
+                    record_curated_recovery_status(
+                        repo=repo,
+                        job=job,
+                        ok=True,
+                        queued=False,
+                        running=False,
+                        error="",
+                    )
+                except Exception:
+                    pass
+    except TimeoutError:
+        return
+    except Exception as exc:
+        logger.warning("curated recovery queue failed: %s", exc)
+        try:
+            with make_session() as session:
+                repo = Repo(session)
+                from tracker.curated_recovery_queue import (
+                    peek_curated_recovery_job,
+                    record_curated_recovery_attempt,
+                    record_curated_recovery_status,
+                )
+
+                job = peek_curated_recovery_job(repo=repo)
+                if not job:
+                    return
+                updated_job = record_curated_recovery_attempt(
+                    repo=repo,
+                    job=job,
+                    error=str(exc),
+                )
+                record_curated_recovery_status(
+                    repo=repo,
+                    job=updated_job,
+                    ok=False,
+                    queued=True,
+                    running=False,
+                    error=str(exc),
+                )
+        except Exception:
+            pass
+
+
 async def _run_source_candidates_notify_job(make_session, settings) -> None:
     """
     Periodic notifier for the SourceCandidate review queue.
@@ -2073,6 +2209,15 @@ async def serve_forever() -> None:
         seconds=10,
         args=[make_session, settings],
         id="tracking:ai_setup_discover_queue",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        _run_curated_recovery_queue_job,
+        "interval",
+        seconds=max(5, int(getattr(settings, "curated_recovery_queue_poll_seconds", 30) or 30)),
+        args=[make_session, settings],
+        id="tracking:curated_recovery_queue",
         max_instances=1,
         coalesce=True,
     )
