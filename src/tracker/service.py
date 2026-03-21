@@ -571,6 +571,8 @@ async def _run_ai_setup_discover_queue_job(make_session, settings):
 
 
 async def _run_curated_recovery_queue_job(make_session, settings):
+    if not bool(getattr(settings, "curated_recovery_queue_enabled", True)):
+        return
     try:
         from tracker.curated_recovery_queue import has_curated_recovery_jobs
 

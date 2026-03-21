@@ -234,6 +234,8 @@ class Settings(BaseSettings):
     llm_failure_alert_threshold: int = 5
     llm_failure_alert_min_minutes: int = 10
     llm_failure_alert_cooldown_minutes: int = 180
+    curated_recovery_queue_enabled: bool = True
+    curated_recovery_queue_poll_seconds: int = 30
 
     # Optional cost estimation (USD per 1M tokens).
     # If unset/0, Tracker will still record token counts (when the backend reports them),
