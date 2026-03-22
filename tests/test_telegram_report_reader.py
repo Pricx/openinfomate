@@ -8,6 +8,7 @@ from tracker.push_dispatch import push_telegram_report_reader
 from tracker.repo import Repo
 from tracker.runner import CuratedInfoResult
 from tracker.settings import Settings
+from tracker.telegram_report_reader import render_cover_html, render_section_html
 from tracker.telegram_connect import telegram_poll
 
 
@@ -391,3 +392,55 @@ async def test_telegram_report_reader_non_stale_edit_error_does_not_send_duplica
 
     assert acks
     assert any("Reader 操作失败" in (text or "") for text in acks)
+
+def _make_reader_md(ref_count: int) -> str:
+    refs = "\n".join(f"[{i}] Item {i} — https://example.com/{i}" for i in range(1, ref_count + 1))
+    items = "\n".join(f"- Item {i} [{i}] · Profile （摘要）" for i in range(1, ref_count + 1))
+    return (
+        "# 参考消息\n\n"
+        "窗口: 2026-03-21T22:00+08:00–2026-03-22T00:00+08:00 (Asia/Shanghai)\n"
+        f"条目: {ref_count} (0 告警, {ref_count} 摘要)\n\n"
+        "## 条目\n\n"
+        f"{items}\n\n"
+        "References:\n"
+        f"{refs}\n"
+    ).strip()
+
+
+def test_render_cover_html_uses_page_number_buttons_when_pages_ge_three():
+    text, kb = render_cover_html(
+        markdown=_make_reader_md(89),
+        idempotency_key="digest:0:2026-03-22:2000",
+        lang="zh",
+        toc_page=6,
+        show_feedback=True,
+    )
+    rows = kb["inline_keyboard"]
+    assert rows[0] == [
+        {"text": "1", "callback_data": "br:toc:0"},
+        {"text": "2", "callback_data": "br:toc:1"},
+        {"text": "3", "callback_data": "br:toc:2"},
+        {"text": "4", "callback_data": "br:toc:3"},
+        {"text": "5", "callback_data": "br:toc:4"},
+    ]
+    assert rows[1] == [
+        {"text": "6", "callback_data": "br:toc:5"},
+        {"text": "·7·", "callback_data": "br:toc:6"},
+        {"text": "8", "callback_data": "br:toc:7"},
+    ]
+    assert "（7/8）" in text
+
+
+def test_render_section_html_keeps_prev_next_for_two_pages():
+    md = (
+        "# 参考消息\n\n"
+        "## 第一节\n\n"
+        + ("A" * 3600)
+    )
+    text, kb = render_section_html(markdown=md, section_index=0, page=1, lang="zh", show_feedback=False)
+    rows = kb["inline_keyboard"]
+    assert rows[0][0] == {"text": "⬅️ 目录", "callback_data": "br:toc:0"}
+    assert any(button["text"] == "⬅️ 上一页" for button in rows[0])
+    assert all("·" not in button["text"] for button in rows[0])
+    assert "（2/2）" in text
+

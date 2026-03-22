@@ -248,6 +248,55 @@ def parse_reference_entries(ref_block: str) -> list[tuple[int, str, str]]:
     return refs
 
 
+def _page_label(*, page_number: int, current: bool, lang: str) -> str:
+    n = max(1, int(page_number))
+    if current:
+        return f"·{n}·" if lang == "zh" else f"·{n}·"
+    return str(n)
+
+
+def _page_number_rows(
+    *,
+    total_pages: int,
+    current_page: int,
+    callback_builder,
+    row_size: int = 5,
+    min_total_pages: int = 3,
+    lang: str,
+) -> list[list[dict[str, str]]]:
+    total = max(1, int(total_pages or 1))
+    page_i = max(0, min(int(current_page or 0), total - 1))
+    if total < max(1, int(min_total_pages or 3)):
+        return []
+    row_size = max(1, min(int(row_size or 5), 8))
+    buttons = [
+        {
+            "text": _page_label(page_number=page + 1, current=(page == page_i), lang=lang),
+            "callback_data": str(callback_builder(page)),
+        }
+        for page in range(total)
+    ]
+    return [buttons[i : i + row_size] for i in range(0, len(buttons), row_size)]
+
+
+def _prev_next_buttons(
+    *,
+    current_page: int,
+    total_pages: int,
+    previous_callback: str,
+    next_callback: str,
+    lang: str,
+) -> list[dict[str, str]]:
+    total = max(1, int(total_pages or 1))
+    page_i = max(0, min(int(current_page or 0), total - 1))
+    nav: list[dict[str, str]] = []
+    if page_i > 0:
+        nav.append({"text": ("⬅️ 上一页" if lang == "zh" else "⬅️ Prev"), "callback_data": previous_callback})
+    if page_i < total - 1:
+        nav.append({"text": ("下一页 ➡️" if lang == "zh" else "Next ➡️"), "callback_data": next_callback})
+    return nav
+
+
 def _toc_keyboard(*, doc: ReportDoc, toc_page: int, lang: str, show_feedback: bool = False) -> dict:
     # Hide unnamed/preamble sections from the TOC.
     #
@@ -272,13 +321,24 @@ def _toc_keyboard(*, doc: ReportDoc, toc_page: int, lang: str, show_feedback: bo
     if row:
         rows.append(row)
 
-    nav: list[dict[str, str]] = []
-    if page_i > 0:
-        nav.append({"text": ("⬅️ 上一页" if lang == "zh" else "⬅️ Prev"), "callback_data": f"br:toc:{page_i - 1}"})
-    if page_i < max_page:
-        nav.append({"text": ("下一页 ➡️" if lang == "zh" else "Next ➡️"), "callback_data": f"br:toc:{page_i + 1}"})
-    if nav:
-        rows.append(nav)
+    page_rows = _page_number_rows(
+        total_pages=max_page + 1,
+        current_page=page_i,
+        callback_builder=lambda page: f"br:toc:{page}",
+        lang=lang,
+    )
+    if page_rows:
+        rows.extend(page_rows)
+    else:
+        nav = _prev_next_buttons(
+            current_page=page_i,
+            total_pages=max_page + 1,
+            previous_callback=f"br:toc:{page_i - 1}",
+            next_callback=f"br:toc:{page_i + 1}",
+            lang=lang,
+        )
+        if nav:
+            rows.append(nav)
 
     extra_row: list[dict[str, str]] = [
         {"text": ("📚 References" if lang != "zh" else "📚 引用"), "callback_data": "br:refs:0"},
@@ -417,23 +477,24 @@ def render_cover_html(
 
             # Keyboard: paginate items; no TOC/sections for Curated Info.
             kb_rows: list[list[dict[str, str]]] = []
-            nav: list[dict[str, str]] = []
-            if page_i > 0:
-                nav.append(
-                    {
-                        "text": ("⬅️ 上一页" if lang == "zh" else "⬅️ Prev"),
-                        "callback_data": f"br:toc:{page_i - 1}",
-                    }
+            page_rows = _page_number_rows(
+                total_pages=max_page + 1,
+                current_page=page_i,
+                callback_builder=lambda page: f"br:toc:{page}",
+                lang=lang,
+            )
+            if page_rows:
+                kb_rows.extend(page_rows)
+            else:
+                nav = _prev_next_buttons(
+                    current_page=page_i,
+                    total_pages=max_page + 1,
+                    previous_callback=f"br:toc:{page_i - 1}",
+                    next_callback=f"br:toc:{page_i + 1}",
+                    lang=lang,
                 )
-            if page_i < max_page:
-                nav.append(
-                    {
-                        "text": ("下一页 ➡️" if lang == "zh" else "Next ➡️"),
-                        "callback_data": f"br:toc:{page_i + 1}",
-                    }
-                )
-            if nav:
-                kb_rows.append(nav)
+                if nav:
+                    kb_rows.append(nav)
             extra_row: list[dict[str, str]] = [
                 {"text": ("📚 引用" if lang == "zh" else "📚 References"), "callback_data": "br:refs:0"},
                 {"text": ("📄 全文" if lang == "zh" else "📄 Full"), "callback_data": "br:full:0"},
@@ -514,13 +575,28 @@ def render_section_html(
     body_html = _escape_html_with_links(chunk) if chunk else ""
     text = (header + ("\n\n" + body_html if body_html else "")).strip()
 
-    nav_row: list[dict[str, str]] = [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}]
-    if page_i > 0:
-        nav_row.append({"text": ("⬅️ Prev" if lang != "zh" else "⬅️ 上一页"), "callback_data": f"br:sec:{idx}:{page_i - 1}"})
-    if page_i < total - 1:
-        nav_row.append({"text": ("Next ➡️" if lang != "zh" else "下一页 ➡️"), "callback_data": f"br:sec:{idx}:{page_i + 1}"})
-
-    kb_rows: list[list[dict[str, str]]] = [nav_row]
+    kb_rows: list[list[dict[str, str]]] = []
+    page_rows = _page_number_rows(
+        total_pages=total,
+        current_page=page_i,
+        callback_builder=lambda page_no: f"br:sec:{idx}:{page_no}",
+        lang=lang,
+    )
+    if page_rows:
+        kb_rows.extend(page_rows)
+        kb_rows.append([{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}])
+    else:
+        nav_row: list[dict[str, str]] = [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}]
+        nav_row.extend(
+            _prev_next_buttons(
+                current_page=page_i,
+                total_pages=total,
+                previous_callback=f"br:sec:{idx}:{page_i - 1}",
+                next_callback=f"br:sec:{idx}:{page_i + 1}",
+                lang=lang,
+            )
+        )
+        kb_rows.append(nav_row)
     extra_row: list[dict[str, str]] = [
         {"text": ("📚 References" if lang != "zh" else "📚 引用"), "callback_data": "br:refs:0"},
         {"text": ("📄 Full" if lang != "zh" else "📄 全文"), "callback_data": "br:full:0"},
@@ -552,13 +628,28 @@ def render_references_html(*, markdown: str, page: int, lang: str, show_feedback
         )
     ).strip()
 
-    nav_row: list[dict[str, str]] = [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}]
-    if page_i > 0:
-        nav_row.append({"text": ("⬅️ Prev" if lang != "zh" else "⬅️ 上一页"), "callback_data": f"br:refs:{page_i - 1}"})
-    if page_i < total - 1:
-        nav_row.append({"text": ("Next ➡️" if lang != "zh" else "下一页 ➡️"), "callback_data": f"br:refs:{page_i + 1}"})
-
-    kb_rows: list[list[dict[str, str]]] = [nav_row]
+    kb_rows: list[list[dict[str, str]]] = []
+    page_rows = _page_number_rows(
+        total_pages=total,
+        current_page=page_i,
+        callback_builder=lambda page_no: f"br:refs:{page_no}",
+        lang=lang,
+    )
+    if page_rows:
+        kb_rows.extend(page_rows)
+        kb_rows.append([{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}])
+    else:
+        nav_row: list[dict[str, str]] = [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}]
+        nav_row.extend(
+            _prev_next_buttons(
+                current_page=page_i,
+                total_pages=total,
+                previous_callback=f"br:refs:{page_i - 1}",
+                next_callback=f"br:refs:{page_i + 1}",
+                lang=lang,
+            )
+        )
+        kb_rows.append(nav_row)
     extra_row: list[dict[str, str]] = [
         {"text": ("📄 Full" if lang != "zh" else "📄 全文"), "callback_data": "br:full:0"},
     ]
@@ -593,13 +684,28 @@ def render_full_html(*, markdown: str, page: int, lang: str, show_feedback: bool
     body_html = _escape_html_with_links(chunk) if chunk else ""
     text = (header + ("\n\n" + body_html if body_html else "")).strip()
 
-    nav_row: list[dict[str, str]] = [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}]
-    if page_i > 0:
-        nav_row.append({"text": ("⬅️ Prev" if lang != "zh" else "⬅️ 上一页"), "callback_data": f"br:full:{page_i - 1}"})
-    if page_i < total - 1:
-        nav_row.append({"text": ("Next ➡️" if lang != "zh" else "下一页 ➡️"), "callback_data": f"br:full:{page_i + 1}"})
-
-    kb_rows: list[list[dict[str, str]]] = [nav_row]
+    kb_rows: list[list[dict[str, str]]] = []
+    page_rows = _page_number_rows(
+        total_pages=total,
+        current_page=page_i,
+        callback_builder=lambda page_no: f"br:full:{page_no}",
+        lang=lang,
+    )
+    if page_rows:
+        kb_rows.extend(page_rows)
+        kb_rows.append([{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}])
+    else:
+        nav_row: list[dict[str, str]] = [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}]
+        nav_row.extend(
+            _prev_next_buttons(
+                current_page=page_i,
+                total_pages=total,
+                previous_callback=f"br:full:{page_i - 1}",
+                next_callback=f"br:full:{page_i + 1}",
+                lang=lang,
+            )
+        )
+        kb_rows.append(nav_row)
     extra_row: list[dict[str, str]] = [
         {"text": ("📚 References" if lang != "zh" else "📚 引用"), "callback_data": "br:refs:0"},
     ]
@@ -688,12 +794,27 @@ def render_digest_full_html(
         text = text[:3899] + "…"
 
     kb_rows: list[list[dict[str, str]]] = []
-    nav: list[dict[str, str]] = [{"text": ("⬅️ 列表" if lang == "zh" else "⬅️ List"), "callback_data": "br:toc:0"}]
-    if page_i > 0:
-        nav.append({"text": ("⬅️ 上一页" if lang == "zh" else "⬅️ Prev"), "callback_data": f"br:full:{page_i - 1}"})
-    if page_i < max_page:
-        nav.append({"text": ("下一页 ➡️" if lang == "zh" else "Next ➡️"), "callback_data": f"br:full:{page_i + 1}"})
-    kb_rows.append(nav)
+    page_rows = _page_number_rows(
+        total_pages=max_page + 1,
+        current_page=page_i,
+        callback_builder=lambda page_no: f"br:full:{page_no}",
+        lang=lang,
+    )
+    if page_rows:
+        kb_rows.extend(page_rows)
+        kb_rows.append([{"text": ("⬅️ 列表" if lang == "zh" else "⬅️ List"), "callback_data": "br:toc:0"}])
+    else:
+        nav: list[dict[str, str]] = [{"text": ("⬅️ 列表" if lang == "zh" else "⬅️ List"), "callback_data": "br:toc:0"}]
+        nav.extend(
+            _prev_next_buttons(
+                current_page=page_i,
+                total_pages=max_page + 1,
+                previous_callback=f"br:full:{page_i - 1}",
+                next_callback=f"br:full:{page_i + 1}",
+                lang=lang,
+            )
+        )
+        kb_rows.append(nav)
 
     extra_row: list[dict[str, str]] = [
         {"text": ("📚 引用" if lang == "zh" else "📚 References"), "callback_data": "br:refs:0"},
@@ -776,12 +897,27 @@ def render_feedback_html(
             ]
         )
 
-    nav_row: list[dict[str, str]] = [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}]
-    if page_i > 0:
-        nav_row.append({"text": ("⬅️ Prev" if lang != "zh" else "⬅️ 上一页"), "callback_data": f"br:fb:{page_i - 1}"})
-    if page_i < max_page:
-        nav_row.append({"text": ("Next ➡️" if lang != "zh" else "下一页 ➡️"), "callback_data": f"br:fb:{page_i + 1}"})
-    kb_rows.append(nav_row)
+    page_rows = _page_number_rows(
+        total_pages=max_page + 1,
+        current_page=page_i,
+        callback_builder=lambda page_no: f"br:fb:{page_no}",
+        lang=lang,
+    )
+    if page_rows:
+        kb_rows.extend(page_rows)
+        kb_rows.append([{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}])
+    else:
+        nav_row: list[dict[str, str]] = [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}]
+        nav_row.extend(
+            _prev_next_buttons(
+                current_page=page_i,
+                total_pages=max_page + 1,
+                previous_callback=f"br:fb:{page_i - 1}",
+                next_callback=f"br:fb:{page_i + 1}",
+                lang=lang,
+            )
+        )
+        kb_rows.append(nav_row)
 
     text = "\n".join(lines).strip()
     return (text[:4096], {"inline_keyboard": kb_rows})
