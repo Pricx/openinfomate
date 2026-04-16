@@ -75,3 +75,15 @@ def test_get_settings_uses_tracker_env_path_for_loading(tmp_path, monkeypatch):
 
     s = get_settings()
     assert s.db_url.endswith("from_custom.db")
+
+
+def test_get_settings_ignores_empty_numeric_env_values(tmp_path, monkeypatch):
+    env_path = Path(tmp_path) / "custom.env"
+    env_path.write_text('TRACKER_LLM_TIMEOUT_SECONDS=""\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TRACKER_ENV_PATH", str(env_path))
+
+    from tracker.settings import get_settings
+
+    s = get_settings()
+    assert s.llm_timeout_seconds == 90

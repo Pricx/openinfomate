@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import re
 from dataclasses import dataclass
 
@@ -7,6 +8,34 @@ from tracker.push.telegram import split_telegram_message
 
 _MD_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(([^)\s]+)\)")
 _REF_ENTRY_RE = re.compile(r"^\[(\d+)\]\s+(.*?)\s+(?:—|-)\s+(https?://\S+)\s*$")
+
+
+def encode_reader_callback_key(report_key: str) -> str:
+    key = (report_key or "").strip()
+    if not key:
+        return ""
+    token = base64.urlsafe_b64encode(key.encode("utf-8")).decode("ascii").rstrip("=")
+    return token if len(token) <= 40 else ""
+
+
+def decode_reader_callback_key(token: str) -> str:
+    raw = (token or "").strip()
+    if not raw:
+        return ""
+    try:
+        padded = raw + ("=" * (-len(raw) % 4))
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8").strip()
+    except Exception:
+        return ""
+
+
+def reader_callback_data(*, report_key: str, action: str, parts: list[object] | tuple[object, ...] = ()) -> str:
+    act = (action or "").strip().lower() or "toc"
+    extra = [str(part) for part in (parts or [])]
+    token = encode_reader_callback_key(report_key)
+    if token:
+        return ":".join(["brk", token, act, *extra])
+    return ":".join(["br", act, *extra])
 
 
 def _escape_html(text: str) -> str:
@@ -297,7 +326,7 @@ def _prev_next_buttons(
     return nav
 
 
-def _toc_keyboard(*, doc: ReportDoc, toc_page: int, lang: str, show_feedback: bool = False) -> dict:
+def _toc_keyboard(*, doc: ReportDoc, toc_page: int, lang: str, show_feedback: bool = False, report_key: str = "") -> dict:
     # Hide unnamed/preamble sections from the TOC.
     #
     # Why: Many reports include a short preamble before the first `##` heading (window meta, notes).
@@ -314,7 +343,12 @@ def _toc_keyboard(*, doc: ReportDoc, toc_page: int, lang: str, show_feedback: bo
     row: list[dict[str, str]] = []
     for sec_idx, sec in chunk:
         title = _short(sec.title, 18)
-        row.append({"text": title, "callback_data": f"br:sec:{sec_idx}:0"})
+        row.append(
+            {
+                "text": title,
+                "callback_data": reader_callback_data(report_key=report_key, action="sec", parts=[sec_idx, 0]),
+            }
+        )
         if len(row) >= 2:
             rows.append(row)
             row = []
@@ -324,7 +358,7 @@ def _toc_keyboard(*, doc: ReportDoc, toc_page: int, lang: str, show_feedback: bo
     page_rows = _page_number_rows(
         total_pages=max_page + 1,
         current_page=page_i,
-        callback_builder=lambda page: f"br:toc:{page}",
+        callback_builder=lambda page: reader_callback_data(report_key=report_key, action="toc", parts=[page]),
         lang=lang,
     )
     if page_rows:
@@ -333,21 +367,39 @@ def _toc_keyboard(*, doc: ReportDoc, toc_page: int, lang: str, show_feedback: bo
         nav = _prev_next_buttons(
             current_page=page_i,
             total_pages=max_page + 1,
-            previous_callback=f"br:toc:{page_i - 1}",
-            next_callback=f"br:toc:{page_i + 1}",
+            previous_callback=reader_callback_data(report_key=report_key, action="toc", parts=[page_i - 1]),
+            next_callback=reader_callback_data(report_key=report_key, action="toc", parts=[page_i + 1]),
             lang=lang,
         )
         if nav:
             rows.append(nav)
 
     extra_row: list[dict[str, str]] = [
-        {"text": ("📚 References" if lang != "zh" else "📚 引用"), "callback_data": "br:refs:0"},
-        {"text": ("📄 Full" if lang != "zh" else "📄 全文"), "callback_data": "br:full:0"},
+        {
+            "text": ("📚 References" if lang != "zh" else "📚 引用"),
+            "callback_data": reader_callback_data(report_key=report_key, action="refs", parts=[0]),
+        },
+        {
+            "text": ("📄 Full" if lang != "zh" else "📄 全文"),
+            "callback_data": reader_callback_data(report_key=report_key, action="full", parts=[0]),
+        },
     ]
     if show_feedback:
-        extra_row.append({"text": ("🗳️ Feedback" if lang != "zh" else "🗳️ 反馈"), "callback_data": "br:fb:0"})
+        extra_row.append(
+            {
+                "text": ("🗳️ Feedback" if lang != "zh" else "🗳️ 反馈"),
+                "callback_data": reader_callback_data(report_key=report_key, action="fb", parts=[0]),
+            }
+        )
     rows.append(extra_row)
-    rows.append([{"text": ("🔄 Refresh" if lang != "zh" else "🔄 刷新"), "callback_data": f"br:toc:{page_i}"}])
+    rows.append(
+        [
+            {
+                "text": ("🔄 Refresh" if lang != "zh" else "🔄 刷新"),
+                "callback_data": reader_callback_data(report_key=report_key, action="toc", parts=[page_i]),
+            }
+        ]
+    )
     return {"inline_keyboard": rows}
 
 
@@ -480,7 +532,7 @@ def render_cover_html(
             page_rows = _page_number_rows(
                 total_pages=max_page + 1,
                 current_page=page_i,
-                callback_builder=lambda page: f"br:toc:{page}",
+                callback_builder=lambda page: reader_callback_data(report_key=key, action="toc", parts=[page]),
                 lang=lang,
             )
             if page_rows:
@@ -489,20 +541,38 @@ def render_cover_html(
                 nav = _prev_next_buttons(
                     current_page=page_i,
                     total_pages=max_page + 1,
-                    previous_callback=f"br:toc:{page_i - 1}",
-                    next_callback=f"br:toc:{page_i + 1}",
+                    previous_callback=reader_callback_data(report_key=key, action="toc", parts=[page_i - 1]),
+                    next_callback=reader_callback_data(report_key=key, action="toc", parts=[page_i + 1]),
                     lang=lang,
                 )
                 if nav:
                     kb_rows.append(nav)
             extra_row: list[dict[str, str]] = [
-                {"text": ("📚 引用" if lang == "zh" else "📚 References"), "callback_data": "br:refs:0"},
-                {"text": ("📄 全文" if lang == "zh" else "📄 Full"), "callback_data": "br:full:0"},
+                {
+                    "text": ("📚 引用" if lang == "zh" else "📚 References"),
+                    "callback_data": reader_callback_data(report_key=key, action="refs", parts=[0]),
+                },
+                {
+                    "text": ("📄 全文" if lang == "zh" else "📄 Full"),
+                    "callback_data": reader_callback_data(report_key=key, action="full", parts=[0]),
+                },
             ]
             if bool(show_feedback):
-                extra_row.append({"text": ("🗳️ 反馈" if lang == "zh" else "🗳️ Feedback"), "callback_data": "br:fb:0"})
+                extra_row.append(
+                    {
+                        "text": ("🗳️ 反馈" if lang == "zh" else "🗳️ Feedback"),
+                        "callback_data": reader_callback_data(report_key=key, action="fb", parts=[0]),
+                    }
+                )
             kb_rows.append(extra_row)
-            kb_rows.append([{"text": ("🔄 再发一份" if lang == "zh" else "🔄 New batch"), "callback_data": "br:rerun:0"}])
+            kb_rows.append(
+                [
+                    {
+                        "text": ("🔄 再发一份" if lang == "zh" else "🔄 New batch"),
+                        "callback_data": reader_callback_data(report_key=key, action="rerun", parts=[0]),
+                    }
+                ]
+            )
             return (text, {"inline_keyboard": kb_rows})
         except Exception:
             # Fall back to the generic cover if parsing fails.
@@ -541,7 +611,7 @@ def render_cover_html(
         lines.append(_escape_html("If unresponsive: wait 3–5s; then try /status"))
         lines.append("</blockquote>")
 
-    kb = _toc_keyboard(doc=doc, toc_page=toc_page, lang=lang, show_feedback=bool(show_feedback))
+    kb = _toc_keyboard(doc=doc, toc_page=toc_page, lang=lang, show_feedback=bool(show_feedback), report_key=key)
     text = "\n".join(lines).strip()
     if len(text) > 3900:
         text = text[:3899] + "…"
@@ -549,14 +619,14 @@ def render_cover_html(
 
 
 def render_section_html(
-    *, markdown: str, section_index: int, page: int, lang: str, show_feedback: bool = False
+    *, markdown: str, section_index: int, page: int, lang: str, show_feedback: bool = False, report_key: str = ""
 ) -> tuple[str, dict]:
     doc = parse_report_markdown(markdown)
     idx = int(section_index or 0)
     if idx < 0 or idx >= len(doc.sections):
         return render_cover_html(
             markdown=markdown,
-            idempotency_key="",
+            idempotency_key=report_key,
             lang=lang,
             toc_page=0,
             show_feedback=show_feedback,
@@ -579,35 +649,52 @@ def render_section_html(
     page_rows = _page_number_rows(
         total_pages=total,
         current_page=page_i,
-        callback_builder=lambda page_no: f"br:sec:{idx}:{page_no}",
+        callback_builder=lambda page_no: reader_callback_data(report_key=report_key, action="sec", parts=[idx, page_no]),
         lang=lang,
     )
     if page_rows:
         kb_rows.extend(page_rows)
-        kb_rows.append([{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}])
+        kb_rows.append(
+            [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": reader_callback_data(report_key=report_key, action="toc", parts=[0])}]
+        )
     else:
-        nav_row: list[dict[str, str]] = [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}]
+        nav_row: list[dict[str, str]] = [
+            {"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": reader_callback_data(report_key=report_key, action="toc", parts=[0])}
+        ]
         nav_row.extend(
             _prev_next_buttons(
                 current_page=page_i,
                 total_pages=total,
-                previous_callback=f"br:sec:{idx}:{page_i - 1}",
-                next_callback=f"br:sec:{idx}:{page_i + 1}",
+                previous_callback=reader_callback_data(report_key=report_key, action="sec", parts=[idx, page_i - 1]),
+                next_callback=reader_callback_data(report_key=report_key, action="sec", parts=[idx, page_i + 1]),
                 lang=lang,
             )
         )
         kb_rows.append(nav_row)
     extra_row: list[dict[str, str]] = [
-        {"text": ("📚 References" if lang != "zh" else "📚 引用"), "callback_data": "br:refs:0"},
-        {"text": ("📄 Full" if lang != "zh" else "📄 全文"), "callback_data": "br:full:0"},
+        {
+            "text": ("📚 References" if lang != "zh" else "📚 引用"),
+            "callback_data": reader_callback_data(report_key=report_key, action="refs", parts=[0]),
+        },
+        {
+            "text": ("📄 Full" if lang != "zh" else "📄 全文"),
+            "callback_data": reader_callback_data(report_key=report_key, action="full", parts=[0]),
+        },
     ]
     if show_feedback:
-        extra_row.append({"text": ("🗳️ Feedback" if lang != "zh" else "🗳️ 反馈"), "callback_data": "br:fb:0"})
+        extra_row.append(
+            {
+                "text": ("🗳️ Feedback" if lang != "zh" else "🗳️ 反馈"),
+                "callback_data": reader_callback_data(report_key=report_key, action="fb", parts=[0]),
+            }
+        )
     kb_rows.append(extra_row)
     return (text[:4096], {"inline_keyboard": kb_rows})
 
 
-def render_references_html(*, markdown: str, page: int, lang: str, show_feedback: bool = False) -> tuple[str, dict]:
+def render_references_html(
+    *, markdown: str, page: int, lang: str, show_feedback: bool = False, report_key: str = ""
+) -> tuple[str, dict]:
     doc = parse_report_markdown(markdown)
     refs = _im_sanitize_block(doc.references)
     refs = refs.replace("References:", "References").strip()
@@ -632,34 +719,48 @@ def render_references_html(*, markdown: str, page: int, lang: str, show_feedback
     page_rows = _page_number_rows(
         total_pages=total,
         current_page=page_i,
-        callback_builder=lambda page_no: f"br:refs:{page_no}",
+        callback_builder=lambda page_no: reader_callback_data(report_key=report_key, action="refs", parts=[page_no]),
         lang=lang,
     )
     if page_rows:
         kb_rows.extend(page_rows)
-        kb_rows.append([{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}])
+        kb_rows.append(
+            [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": reader_callback_data(report_key=report_key, action="toc", parts=[0])}]
+        )
     else:
-        nav_row: list[dict[str, str]] = [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}]
+        nav_row: list[dict[str, str]] = [
+            {"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": reader_callback_data(report_key=report_key, action="toc", parts=[0])}
+        ]
         nav_row.extend(
             _prev_next_buttons(
                 current_page=page_i,
                 total_pages=total,
-                previous_callback=f"br:refs:{page_i - 1}",
-                next_callback=f"br:refs:{page_i + 1}",
+                previous_callback=reader_callback_data(report_key=report_key, action="refs", parts=[page_i - 1]),
+                next_callback=reader_callback_data(report_key=report_key, action="refs", parts=[page_i + 1]),
                 lang=lang,
             )
         )
         kb_rows.append(nav_row)
     extra_row: list[dict[str, str]] = [
-        {"text": ("📄 Full" if lang != "zh" else "📄 全文"), "callback_data": "br:full:0"},
+        {
+            "text": ("📄 Full" if lang != "zh" else "📄 全文"),
+            "callback_data": reader_callback_data(report_key=report_key, action="full", parts=[0]),
+        },
     ]
     if show_feedback:
-        extra_row.append({"text": ("🗳️ Feedback" if lang != "zh" else "🗳️ 反馈"), "callback_data": "br:fb:0"})
+        extra_row.append(
+            {
+                "text": ("🗳️ Feedback" if lang != "zh" else "🗳️ 反馈"),
+                "callback_data": reader_callback_data(report_key=report_key, action="fb", parts=[0]),
+            }
+        )
     kb_rows.append(extra_row)
     return (text[:4096], {"inline_keyboard": kb_rows})
 
 
-def render_full_html(*, markdown: str, page: int, lang: str, show_feedback: bool = False) -> tuple[str, dict]:
+def render_full_html(
+    *, markdown: str, page: int, lang: str, show_feedback: bool = False, report_key: str = ""
+) -> tuple[str, dict]:
     doc = parse_report_markdown(markdown)
     blocks: list[str] = []
     for sec in doc.sections:
@@ -688,29 +789,41 @@ def render_full_html(*, markdown: str, page: int, lang: str, show_feedback: bool
     page_rows = _page_number_rows(
         total_pages=total,
         current_page=page_i,
-        callback_builder=lambda page_no: f"br:full:{page_no}",
+        callback_builder=lambda page_no: reader_callback_data(report_key=report_key, action="full", parts=[page_no]),
         lang=lang,
     )
     if page_rows:
         kb_rows.extend(page_rows)
-        kb_rows.append([{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}])
+        kb_rows.append(
+            [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": reader_callback_data(report_key=report_key, action="toc", parts=[0])}]
+        )
     else:
-        nav_row: list[dict[str, str]] = [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}]
+        nav_row: list[dict[str, str]] = [
+            {"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": reader_callback_data(report_key=report_key, action="toc", parts=[0])}
+        ]
         nav_row.extend(
             _prev_next_buttons(
                 current_page=page_i,
                 total_pages=total,
-                previous_callback=f"br:full:{page_i - 1}",
-                next_callback=f"br:full:{page_i + 1}",
+                previous_callback=reader_callback_data(report_key=report_key, action="full", parts=[page_i - 1]),
+                next_callback=reader_callback_data(report_key=report_key, action="full", parts=[page_i + 1]),
                 lang=lang,
             )
         )
         kb_rows.append(nav_row)
     extra_row: list[dict[str, str]] = [
-        {"text": ("📚 References" if lang != "zh" else "📚 引用"), "callback_data": "br:refs:0"},
+        {
+            "text": ("📚 References" if lang != "zh" else "📚 引用"),
+            "callback_data": reader_callback_data(report_key=report_key, action="refs", parts=[0]),
+        },
     ]
     if show_feedback:
-        extra_row.append({"text": ("🗳️ Feedback" if lang != "zh" else "🗳️ 反馈"), "callback_data": "br:fb:0"})
+        extra_row.append(
+            {
+                "text": ("🗳️ Feedback" if lang != "zh" else "🗳️ 反馈"),
+                "callback_data": reader_callback_data(report_key=report_key, action="fb", parts=[0]),
+            }
+        )
     kb_rows.append(extra_row)
     return (text[:4096], {"inline_keyboard": kb_rows})
 
@@ -721,6 +834,7 @@ def render_digest_full_html(
     page: int,
     lang: str,
     show_feedback: bool = False,
+    report_key: str = "",
     page_size: int = 18,
 ) -> tuple[str, dict]:
     """
@@ -736,7 +850,7 @@ def render_digest_full_html(
     total = len(refs)
     if total <= 0:
         # Fall back to the generic renderer (best-effort).
-        return render_full_html(markdown=markdown, page=page, lang=lang, show_feedback=show_feedback)
+        return render_full_html(markdown=markdown, page=page, lang=lang, show_feedback=show_feedback, report_key=report_key)
 
     # Try to infer per-item decision from the Items section tail markers.
     decision_by_n: dict[int, str] = {}
@@ -797,32 +911,51 @@ def render_digest_full_html(
     page_rows = _page_number_rows(
         total_pages=max_page + 1,
         current_page=page_i,
-        callback_builder=lambda page_no: f"br:full:{page_no}",
+        callback_builder=lambda page_no: reader_callback_data(report_key=report_key, action="full", parts=[page_no]),
         lang=lang,
     )
     if page_rows:
         kb_rows.extend(page_rows)
-        kb_rows.append([{"text": ("⬅️ 列表" if lang == "zh" else "⬅️ List"), "callback_data": "br:toc:0"}])
+        kb_rows.append(
+            [{"text": ("⬅️ 列表" if lang == "zh" else "⬅️ List"), "callback_data": reader_callback_data(report_key=report_key, action="toc", parts=[0])}]
+        )
     else:
-        nav: list[dict[str, str]] = [{"text": ("⬅️ 列表" if lang == "zh" else "⬅️ List"), "callback_data": "br:toc:0"}]
+        nav: list[dict[str, str]] = [
+            {"text": ("⬅️ 列表" if lang == "zh" else "⬅️ List"), "callback_data": reader_callback_data(report_key=report_key, action="toc", parts=[0])}
+        ]
         nav.extend(
             _prev_next_buttons(
                 current_page=page_i,
                 total_pages=max_page + 1,
-                previous_callback=f"br:full:{page_i - 1}",
-                next_callback=f"br:full:{page_i + 1}",
+                previous_callback=reader_callback_data(report_key=report_key, action="full", parts=[page_i - 1]),
+                next_callback=reader_callback_data(report_key=report_key, action="full", parts=[page_i + 1]),
                 lang=lang,
             )
         )
         kb_rows.append(nav)
 
     extra_row: list[dict[str, str]] = [
-        {"text": ("📚 引用" if lang == "zh" else "📚 References"), "callback_data": "br:refs:0"},
+        {
+            "text": ("📚 引用" if lang == "zh" else "📚 References"),
+            "callback_data": reader_callback_data(report_key=report_key, action="refs", parts=[0]),
+        },
     ]
     if show_feedback:
-        extra_row.append({"text": ("🗳️ 反馈" if lang == "zh" else "🗳️ Feedback"), "callback_data": "br:fb:0"})
+        extra_row.append(
+            {
+                "text": ("🗳️ 反馈" if lang == "zh" else "🗳️ Feedback"),
+                "callback_data": reader_callback_data(report_key=report_key, action="fb", parts=[0]),
+            }
+        )
     kb_rows.append(extra_row)
-    kb_rows.append([{"text": ("🔄 再发一份" if lang == "zh" else "🔄 New batch"), "callback_data": "br:rerun:0"}])
+    kb_rows.append(
+        [
+            {
+                "text": ("🔄 再发一份" if lang == "zh" else "🔄 New batch"),
+                "callback_data": reader_callback_data(report_key=report_key, action="rerun", parts=[0]),
+            }
+        ]
+    )
     return (text[:4096], {"inline_keyboard": kb_rows})
 
 
@@ -834,6 +967,7 @@ def render_feedback_html(
     mute_days: int = 7,
     status: str = "",
     page_size: int = 4,
+    report_key: str = "",
 ) -> tuple[str, dict]:
     """
     Render a compact "per-item feedback" page for Digest Reader.
@@ -853,7 +987,11 @@ def render_feedback_html(
             else "(No References block found; per-item feedback is unavailable.)"
         )
         text = f"{title}\n\n{_escape_html(body)}"
-        kb = {"inline_keyboard": [[{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}]]}
+        kb = {
+            "inline_keyboard": [
+                [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": reader_callback_data(report_key=report_key, action="toc", parts=[0])}]
+            ]
+        }
         return (text[:4096], kb)
 
     size = max(1, min(int(page_size or 4), 8))
@@ -891,29 +1029,33 @@ def render_feedback_html(
         n2 = int(n)
         kb_rows.append(
             [
-                {"text": f"👍{n2}", "callback_data": f"br:fb:like:{n2}:{page_i}"},
-                {"text": f"👎{n2}", "callback_data": f"br:fb:dislike:{n2}:{page_i}"},
-                {"text": f"🔕{n2}", "callback_data": f"br:fb:mute:{n2}:{page_i}"},
+                {"text": f"👍{n2}", "callback_data": reader_callback_data(report_key=report_key, action="fb", parts=["like", n2, page_i])},
+                {"text": f"👎{n2}", "callback_data": reader_callback_data(report_key=report_key, action="fb", parts=["dislike", n2, page_i])},
+                {"text": f"🔕{n2}", "callback_data": reader_callback_data(report_key=report_key, action="fb", parts=["mute", n2, page_i])},
             ]
         )
 
     page_rows = _page_number_rows(
         total_pages=max_page + 1,
         current_page=page_i,
-        callback_builder=lambda page_no: f"br:fb:{page_no}",
+        callback_builder=lambda page_no: reader_callback_data(report_key=report_key, action="fb", parts=[page_no]),
         lang=lang,
     )
     if page_rows:
         kb_rows.extend(page_rows)
-        kb_rows.append([{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}])
+        kb_rows.append(
+            [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": reader_callback_data(report_key=report_key, action="toc", parts=[0])}]
+        )
     else:
-        nav_row: list[dict[str, str]] = [{"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": "br:toc:0"}]
+        nav_row: list[dict[str, str]] = [
+            {"text": ("⬅️ 目录" if lang == "zh" else "⬅️ TOC"), "callback_data": reader_callback_data(report_key=report_key, action="toc", parts=[0])}
+        ]
         nav_row.extend(
             _prev_next_buttons(
                 current_page=page_i,
                 total_pages=max_page + 1,
-                previous_callback=f"br:fb:{page_i - 1}",
-                next_callback=f"br:fb:{page_i + 1}",
+                previous_callback=reader_callback_data(report_key=report_key, action="fb", parts=[page_i - 1]),
+                next_callback=reader_callback_data(report_key=report_key, action="fb", parts=[page_i + 1]),
                 lang=lang,
             )
         )

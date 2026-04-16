@@ -29,6 +29,12 @@ OpenInfoMate🥷 是一个“越用越聪明”的信息助手：把 **你感兴
 mkdir -p ~/openinfomate && cd ~/openinfomate && curl -fsSLO https://raw.githubusercontent.com/Pricx/openinfomate/main/docker-compose.ghcr.yml && docker compose -f docker-compose.ghcr.yml up -d
 ```
 
+首次启动会自动生成 `TRACKER_ADMIN_PASSWORD` / `TRACKER_API_TOKEN`（并写入数据卷 `/data/.env`）。查看方式：
+
+```bash
+docker compose -f docker-compose.ghcr.yml logs api --tail=200 | grep -E 'TRACKER_ADMIN_PASSWORD|TRACKER_API_TOKEN' || true
+```
+
 打开管理后台：
 - `http://127.0.0.1:${OPENINFOMATE_API_PORT:-8899}/admin`
 
@@ -39,6 +45,12 @@ curl -fsSLO https://raw.githubusercontent.com/Pricx/openinfomate/main/scripts/de
 curl -fsSLO https://raw.githubusercontent.com/Pricx/openinfomate/main/docker-compose.ghcr.yml
 curl -fsSLO https://raw.githubusercontent.com/Pricx/openinfomate/main/docker-compose.host.yml
 ./deploy_docker_instance.sh --host --base-port 8901
+```
+
+导入已有 SQLite 数据库（例如从旧实例迁移）：
+
+```bash
+./deploy_docker_instance.sh --base-port 8900 --import-db /path/to/tracker.db
 ```
 
 如果你必须让容器访问宿主机的 `127.0.0.1`（例如你的 LLM gateway 只绑定在宿主机 loopback），使用 host 网络覆盖文件：

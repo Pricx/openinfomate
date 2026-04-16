@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -12,8 +13,11 @@ from tracker.repo import Repo
 logger = logging.getLogger(__name__)
 
 OpenAiCompatMode = Literal["chat_completions", "responses"]
+OpenAiCompatModePreference = Literal["auto", "chat_completions", "responses"]
 
 _MODE_CACHE_KEY = "llm_api_mode_cache_json"
+_TRANSIENT_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
+_ALTERNATE_MODE_HTTP_STATUSES = {400, 401, 403, 404, 405, *_TRANSIENT_HTTP_STATUSES}
 
 
 def normalize_openai_compat_base_url(base_url: str) -> str:
@@ -130,6 +134,15 @@ def set_cached_mode(repo: Repo | None, *, base_url: str, mode: OpenAiCompatMode)
     cache = _load_mode_cache(repo)
     cache[b] = mode
     _save_mode_cache(repo, cache)
+
+
+def normalize_openai_compat_mode_preference(value: object) -> OpenAiCompatModePreference:
+    raw = str(value or "").strip().lower()
+    if raw == "responses":
+        return "responses"
+    if raw in {"chat_completions", "chat-completions", "chat"}:
+        return "chat_completions"
+    return "auto"
 
 
 def chat_payload_to_responses_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -261,13 +274,19 @@ async def post_openai_compat_json(
     base_url: str,
     headers: dict[str, str],
     payload_chat: dict[str, Any],
+    preferred_mode: OpenAiCompatModePreference | None = None,
 ) -> tuple[dict[str, Any], OpenAiCompatMode]:
     """
     Post a request using Chat Completions, with auto-fallback to Responses if required.
 
     Returns (data, mode_used).
     """
-    preferred = get_cached_mode(repo, base_url=base_url) or "chat_completions"
+    preferred_mode_normalized = normalize_openai_compat_mode_preference(preferred_mode)
+    preferred: OpenAiCompatMode = (
+        preferred_mode_normalized
+        if preferred_mode_normalized in {"chat_completions", "responses"}
+        else (get_cached_mode(repo, base_url=base_url) or "chat_completions")
+    )
 
     async def _post(mode: OpenAiCompatMode) -> dict[str, Any]:
         if mode == "responses":
@@ -281,8 +300,29 @@ async def post_openai_compat_json(
         obj = resp.json()
         return obj if isinstance(obj, dict) else {"raw": obj}
 
+    async def _post_with_retry(mode: OpenAiCompatMode) -> dict[str, Any]:
+        attempts = 2
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return await _post(mode)
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                status = int(exc.response.status_code or 0) if exc.response is not None else 0
+                if status not in _TRANSIENT_HTTP_STATUSES or attempt + 1 >= attempts:
+                    raise
+            except httpx.RequestError as exc:
+                last_error = exc
+                if attempt + 1 >= attempts:
+                    raise
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.25)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("openai-compat request failed without an error")
+
     try:
-        data = await _post(preferred)
+        data = await _post_with_retry(preferred)
         set_cached_mode(repo, base_url=base_url, mode=preferred)
         return data, preferred
     except httpx.HTTPStatusError as exc:
@@ -294,25 +334,26 @@ async def post_openai_compat_json(
         status = int(exc.response.status_code or 0) if exc.response is not None else 0
 
         # Main compatibility goal:
-        # - Prefer chat completions when it works.
-        # - If chat completions fails, also try `/v1/responses` (don't rely solely on error-body hints).
-        should_try_responses = False
+        # - Respect explicit operator mode preference when provided.
+        # - Otherwise keep using the cached/default path, but try the alternate endpoint when
+        #   the provider likely rejects only the current transport.
+        alternate_mode: OpenAiCompatMode = "responses" if preferred == "chat_completions" else "chat_completions"
+        should_try_alternate = False
         if preferred == "chat_completions":
             if _looks_like_responses_required(status, body):
-                should_try_responses = True
-            elif status in {400, 404, 405}:
-                # Many providers return a generic 400/404/405 when chat completions is disabled.
-                should_try_responses = True
+                should_try_alternate = True
+            elif status in _ALTERNATE_MODE_HTTP_STATUSES:
+                # Some providers/proxies reject only one transport path. This includes generic
+                # 4xx transport mismatches (even when surfaced as 401/403) and transient errors.
+                should_try_alternate = True
+        elif status in _ALTERNATE_MODE_HTTP_STATUSES:
+            should_try_alternate = True
 
-        if should_try_responses:
+        if should_try_alternate:
             try:
-                data2 = await _post("responses")
-            except httpx.HTTPStatusError as exc2:
-                # Best-effort retry for transient upstream errors.
-                if exc2.response is not None and int(exc2.response.status_code or 0) in {500, 502, 503, 504}:
-                    data2 = await _post("responses")
-                else:
-                    raise
-            set_cached_mode(repo, base_url=base_url, mode="responses")
-            return data2, "responses"
+                data2 = await _post_with_retry(alternate_mode)
+            except httpx.HTTPStatusError:
+                raise
+            set_cached_mode(repo, base_url=base_url, mode=alternate_mode)
+            return data2, alternate_mode
         raise

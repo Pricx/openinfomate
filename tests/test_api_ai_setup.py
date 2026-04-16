@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import httpx
 import json
 from pathlib import Path
 
@@ -279,3 +280,96 @@ def test_admin_ai_setup_plan_returns_error_when_run_persist_fails(tmp_path, monk
     assert body.get("ok") is False
     assert body.get("error") == "plan_persist_failed"
     assert "AI Agents" in str(body.get("preview_markdown") or "")
+
+
+def test_admin_ai_setup_plan_structured_profile_brief_still_calls_llm_planner(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "api-structured-brief.db"
+    env_path = Path(tmp_path) / ".env"
+    settings = Settings(
+        db_url=f"sqlite:///{db_path}",
+        api_token="secret",
+        env_path=str(env_path),
+        llm_base_url="https://example.com/v1",
+        llm_api_key="sk-test",
+        llm_model_reasoning="test-model",
+    )
+
+    planned_calls: list[str] = []
+
+    async def _fake_plan(**kwargs):
+        planned_calls.append(str(kwargs.get("user_prompt") or ""))
+        return (
+            {
+                "actions": [
+                    {"op": "topic.upsert", "name": "Profile", "query": "agent infra", "enabled": True},
+                ]
+            },
+            [],
+        )
+
+    import tracker.api as tracker_api
+
+    monkeypatch.setattr(tracker_api, "llm_plan_tracking_ai_setup", _fake_plan)
+
+    app = create_app(settings)
+    client = TestClient(app)
+
+    structured_brief = "\n".join([
+        "UNDERSTANDING:",
+        "关注 agent infra / workflow automation。",
+        "",
+        "INTEREST_AXES:",
+        "- Agent infra",
+        "- Workflow automation",
+        "",
+        "SEED_QUERIES:",
+        "- agent infra observability",
+        "- workflow automation orchestration",
+    ])
+
+    r = client.post("/admin/ai-setup/plan?token=secret", data={"user_prompt": structured_brief})
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("ok") is True
+    assert planned_calls == [structured_brief]
+    ops = [a.get("op") for a in (body.get("plan") or {}).get("actions") or []]
+    assert "topic.upsert" in ops
+    assert all("expanded deterministically" not in str(item) for item in (body.get("warnings") or []))
+
+
+def test_admin_ai_setup_plan_returns_explicit_timeout_error_without_deterministic_fallback(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "api-plan-timeout.db"
+    env_path = Path(tmp_path) / ".env"
+    settings = Settings(
+        db_url=f"sqlite:///{db_path}",
+        api_token="secret",
+        env_path=str(env_path),
+        llm_base_url="https://example.com/v1",
+        llm_api_key="sk-test",
+        llm_model_reasoning="test-model",
+    )
+
+    async def _fake_plan(**_kwargs):
+        raise httpx.ReadTimeout("planner timed out")
+
+    import tracker.api as tracker_api
+
+    monkeypatch.setattr(tracker_api, "llm_plan_tracking_ai_setup", _fake_plan)
+
+    app = create_app(settings)
+    client = TestClient(app)
+
+    structured_brief = "\n".join([
+        "INTEREST_AXES:",
+        "- Agent infra",
+        "",
+        "SEED_QUERIES:",
+        "- agent infra observability",
+    ])
+
+    r = client.post("/admin/ai-setup/plan?token=secret", data={"user_prompt": structured_brief})
+    assert r.status_code == 504
+    body = r.json()
+    assert body.get("ok") is False
+    assert body.get("error") == "plan_timed_out"
+    assert "timed out" in str(body.get("message") or "")

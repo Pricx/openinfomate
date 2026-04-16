@@ -98,6 +98,41 @@ def extract_llm_summary_why(reason: str) -> tuple[str, str]:
     return summary, why
 
 
+def extract_llm_rank_score(reason: str) -> int | None:
+    for raw in (reason or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if not low.startswith("llm_rank"):
+            continue
+        value = ""
+        if ":" in line:
+            value = line.split(":", 1)[1].strip()
+        elif "=" in line:
+            value = line.split("=", 1)[1].strip()
+        if not value:
+            return None
+        try:
+            parsed = int(value)
+        except Exception:
+            return None
+        return max(0, min(100, parsed))
+    return None
+
+
+def curated_priority_score(*, reason: str, decision: str) -> int:
+    parsed = extract_llm_rank_score(reason)
+    if parsed is not None:
+        return parsed
+    dec = (decision or "").strip().lower()
+    if dec == "alert":
+        return 90
+    if dec == "digest":
+        return 60
+    return 0
+
+
 def format_digest_markdown(
     *,
     topic: Topic,
@@ -107,6 +142,7 @@ def format_digest_markdown(
     tz_name: str = "UTC",
     lang: str = "en",
     url_overrides_by_item_id: dict[int, str] | None = None,
+    title_overrides_by_item_id: dict[int, str] | None = None,
     previous_total: int | None = None,
     previous_alerts: int | None = None,
     previous_items: list[tuple[ItemTopic, Item]] | None = None,
@@ -214,10 +250,12 @@ def format_digest_markdown(
                 lines.append(f"- {r}")
             lines.append("")
 
-    # Prefer ALERT items first in digests (still non-interpretive).
+    # Prefer the highest-ranked items first so the user can stop early and still see
+    # the most valuable entries. Decision/time are only tie-breakers.
     items = sorted(
         items,
         key=lambda row: (
+            -curated_priority_score(reason=str(row[0].reason or ""), decision=str(row[0].decision or "")),
             0 if row[0].decision == "alert" else 1,
             -(
                 int((row[1].published_at or row[1].created_at).timestamp())
@@ -231,19 +269,27 @@ def format_digest_markdown(
 
     refs: list[tuple[int, str, str]] = []
     for ref_i, (it, item) in enumerate(items, start=1):
+        item_id = int(getattr(item, "id", 0) or 0)
         u = (
-            (url_overrides_by_item_id.get(int(getattr(item, "id", 0) or 0)) or "").strip()
+            (url_overrides_by_item_id.get(item_id) or "").strip()
             if url_overrides_by_item_id
             else ""
         )
+        display_title = (
+            (title_overrides_by_item_id.get(item_id) or "").strip()
+            if title_overrides_by_item_id
+            else ""
+        )
+        if not display_title:
+            display_title = (item.title or "").strip()
         if not u:
             u = (item.canonical_url or "").strip()
-        refs.append((ref_i, (item.title or "").strip(), u))
+        refs.append((ref_i, display_title, u))
         if not brief:
             cite = f" [{ref_i}]" if refs[-1][2] else ""
             dec = _decision_label(str(it.decision or ""))
             tail = f"（{dec}）" if is_zh else f"({dec})"
-            lines.append(f"- {item.title}{cite} {tail}".strip())
+            lines.append(f"- {display_title}{cite} {tail}".strip())
             continue
 
         prefix = "[ALERT] " if it.decision == "alert" else ""
@@ -253,7 +299,7 @@ def format_digest_markdown(
         if s:
             extra = f" — {s}"
         cite = f" [{ref_i}]" if refs[-1][2] else ""
-        lines.append(f"- {prefix}{item.title}{cite}{extra}".strip())
+        lines.append(f"- {prefix}{display_title}{cite}{extra}".strip())
 
     if refs:
         lines.append("")

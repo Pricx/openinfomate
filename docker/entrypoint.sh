@@ -38,9 +38,9 @@ fi
 
 # Optional: generate admin/API secrets once (persisted to ENV_PATH) if missing/placeholder.
 #
-# Default UX for the docker-compose quickstart is "no preconfigured password";
-# operators set auth in Web Admin. If you prefer an auto-generated first-run password,
-# do NOT set TRACKER_BOOTSTRAP_ALLOW_NO_AUTH=true.
+# Default UX: auto-generate first-run secrets (and print them once).
+# If you prefer a no-auth first-run bootstrap (only safe behind localhost-only exposure),
+# set TRACKER_BOOTSTRAP_ALLOW_NO_AUTH=true.
 BOOTSTRAP_NO_AUTH="$(printf "%s" "${TRACKER_BOOTSTRAP_ALLOW_NO_AUTH:-}" | tr '[:upper:]' '[:lower:]')"
 if [ "${BOOTSTRAP_NO_AUTH}" != "true" ] && [ "${BOOTSTRAP_NO_AUTH}" != "1" ]; then
   SECRETS_OUT="$(

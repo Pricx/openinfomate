@@ -17,6 +17,7 @@ from tracker.connectors.hn_algolia import HnAlgoliaConnector
 from tracker.connectors.llm_models import LlmModelsConnector
 from tracker.connectors.rss import RssConnector
 from tracker.connectors.searxng import SearxngConnector
+from tracker.immediate_alert_rules import ImmediateAlertRule, match_immediate_alert_rule, parse_immediate_alert_rules
 from tracker.models import Item, ItemTopic, Source, Topic
 from tracker.normalize import canonicalize_url, html_to_text, normalize_text, sha256_hex
 from tracker.repo import Repo
@@ -159,6 +160,7 @@ def decide_item_for_topic(
     include_domains: str = "",
     exclude_domains: str = "",
     match_mode: str = "keywords",  # keywords|llm
+    immediate_alert_rules: tuple[ImmediateAlertRule, ...] | list[ImmediateAlertRule] | None = None,
 ) -> tuple[str, str]:
     # v1 heuristic: keyword match ⇒ digest; alert_keywords ⇒ alert
     # optional LLM mode: pass filters ⇒ candidate (later curated by LLM)
@@ -170,6 +172,14 @@ def decide_item_for_topic(
     exclude_patterns = _parse_domains_csv(exclude_domains)
     if exclude_patterns and _host_matches_domain_patterns(host, exclude_patterns):
         return "ignore", "filtered by exclude_domains"
+
+    immediate_reason = match_immediate_alert_rule(
+        title=title,
+        canonical_url=canonical_url,
+        rules=immediate_alert_rules,
+    )
+    if immediate_reason:
+        return "alert", immediate_reason
 
     mode = (match_mode or "keywords").strip().lower()
     # In LLM curation mode, relevance is decided by the model prompt; avoid keyword prefilters
@@ -193,6 +203,55 @@ def is_near_duplicate(*, new_simhash: int, existing_simhashes: list[int], max_di
     return any(hamming_distance64(new_simhash, s) <= max_distance for s in existing_simhashes)
 
 
+def _entry_content_text(*, title: str, summary: str | None) -> str:
+    text = html_to_text(summary or "")
+    text = normalize_text(text)
+    if text:
+        return text
+    return normalize_text(title)
+
+
+def _is_title_only_text(*, text: str, title: str) -> bool:
+    text_norm = normalize_text(text or "")
+    title_norm = normalize_text(title or "")
+    return not text_norm or text_norm == title_norm
+
+
+def _should_upgrade_existing_item_text(*, existing_item: Item, new_text: str) -> bool:
+    candidate = normalize_text(new_text or "")
+    if not candidate:
+        return False
+    current = normalize_text(existing_item.content_text or "")
+    if candidate == current:
+        return False
+    if not current:
+        return True
+    current_is_title_only = _is_title_only_text(text=current, title=existing_item.title or "")
+    candidate_is_title_only = _is_title_only_text(text=candidate, title=existing_item.title or "")
+    if current_is_title_only and not candidate_is_title_only:
+        return True
+    if candidate_is_title_only:
+        return False
+    if len(candidate) >= len(current) + 32:
+        return True
+    if len(current) > 0 and len(candidate) >= int(len(current) * 1.5):
+        return True
+    return False
+
+
+def _maybe_refresh_existing_item_from_entry(*, existing_item: Item, entry: FetchedEntry) -> int | None:
+    new_text = _entry_content_text(title=entry.title, summary=entry.summary)
+    if not _should_upgrade_existing_item_text(existing_item=existing_item, new_text=new_text):
+        return None
+    sh = simhash64(new_text)
+    existing_item.content_text = new_text
+    existing_item.content_hash = sha256_hex(new_text)
+    existing_item.simhash64 = int_to_signed64(sh)
+    if (not (existing_item.title or "").strip()) and (entry.title or "").strip():
+        existing_item.title = normalize_text(entry.title)
+    return int_to_signed64(sh)
+
+
 async def ingest_rss_source_for_topic(
     *,
     session: Session,
@@ -201,6 +260,7 @@ async def ingest_rss_source_for_topic(
     timeout_seconds: int = 20,
     include_keywords: str = "",
     exclude_keywords: str = "",
+    immediate_alert_rules_json: str = "",
 ) -> list[CreatedDecision]:
     connector = RssConnector(timeout_seconds=timeout_seconds)
     fetched = await connector.fetch(url=source.url)
@@ -212,6 +272,7 @@ async def ingest_rss_source_for_topic(
         entries=fetched,
         include_keywords=include_keywords,
         exclude_keywords=exclude_keywords,
+        immediate_alert_rules_json=immediate_alert_rules_json,
     )
 
 
@@ -293,8 +354,10 @@ def ingest_entries_for_topic_source(
     exclude_domains: str = "",
     simhash_lookback_days: int = 30,
     match_mode: str = "keywords",
+    immediate_alert_rules_json: str = "",
 ) -> list[CreatedDecision]:
     repo = Repo(session)
+    immediate_alert_rules = parse_immediate_alert_rules(immediate_alert_rules_json)
 
     created: list[CreatedDecision] = []
     # naive in-process simhash cache (v1)
@@ -309,6 +372,10 @@ def ingest_entries_for_topic_source(
         canonical = canonicalize_url(entry.url)
         existing_item = repo.get_item_by_canonical_url(canonical)
         if existing_item:
+            refreshed_simhash = _maybe_refresh_existing_item_from_entry(existing_item=existing_item, entry=entry)
+            if refreshed_simhash is not None:
+                session.flush()
+                existing_simhashes.append(refreshed_simhash)
             if repo.item_topic_exists(item_id=existing_item.id, topic_id=topic.id):
                 continue
 
@@ -322,6 +389,7 @@ def ingest_entries_for_topic_source(
                 include_domains=include_domains,
                 exclude_domains=exclude_domains,
                 match_mode=match_mode,
+                immediate_alert_rules=immediate_alert_rules,
             )
             it = ItemTopic(item_id=existing_item.id, topic_id=topic.id, decision=decision, reason=reason)
             session.add(it)
@@ -340,11 +408,7 @@ def ingest_entries_for_topic_source(
             )
             continue
 
-        content_text = html_to_text(entry.summary or "")
-        # Some sources (especially search connectors) may not provide a snippet.
-        # Use the title as a minimal text payload so dedupe + LLM curation have something to work with.
-        if not content_text:
-            content_text = normalize_text(entry.title)
+        content_text = _entry_content_text(title=entry.title, summary=entry.summary)
         content_hash = sha256_hex(content_text)
         sh = simhash64(content_text)
 
@@ -375,6 +439,7 @@ def ingest_entries_for_topic_source(
             include_domains=include_domains,
             exclude_domains=exclude_domains,
             match_mode=match_mode,
+            immediate_alert_rules=immediate_alert_rules,
         )
         it = ItemTopic(item_id=item.id, topic_id=topic.id, decision=decision, reason=reason)
         session.add(it)

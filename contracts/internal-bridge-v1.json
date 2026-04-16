@@ -1,0 +1,17 @@
+{
+  "contract_name": "openinfomate-internal-bridge",
+  "contract_major": 1,
+  "contract_version": "2026-03-22.1",
+  "openapi_path": "/openapi.json",
+  "base_path": "/internal/bridge/v1",
+  "operations": [
+    "GET /internal/bridge/v1/meta",
+    "POST /internal/bridge/v1/profile/propose",
+    "POST /internal/bridge/v1/topic/propose",
+    "POST /internal/bridge/v1/tracking/plan",
+    "POST /internal/bridge/v1/config/plan"
+  ],
+  "reverse_operations": [
+    "POST /api/internal/telegram/upstream-bind/consume"
+  ]
+}

@@ -86,6 +86,19 @@ def _site_base_url(site: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
 
 
+def _normalize_discourse_json_path(path: str) -> str:
+    raw = _norm_text(path) or "/latest.json"
+    if not raw.startswith("/"):
+        raw = f"/{raw}"
+    if raw == "/":
+        return "/latest.json"
+    if raw.endswith(".rss"):
+        raw = raw[: -len(".rss")] + ".json"
+    elif not raw.endswith(".json"):
+        raw = raw.rstrip("/") + ".json"
+    return raw
+
+
 
 def _infer_searxng_base_url(snapshot_before: dict[str, Any], explicit_base_url: str) -> str:
     base = normalize_searxng_base_url(_norm_text(explicit_base_url)) or ""
@@ -183,10 +196,13 @@ def _auto_select_topic(snapshot_before: dict[str, Any], *, query: str, topic_hin
         if score > best_score:
             best_score = score
             best_name = row["name"]
-    profile_name = _find_existing_topic_name(snapshot_before, profile_topic_name) or (_norm_text(profile_topic_name) or "Profile")
+    profile_name = _find_existing_topic_name(snapshot_before, profile_topic_name)
+    fallback_profile_name = profile_name or (_norm_text(profile_topic_name) or "Profile")
     if best_score < 6:
-        return profile_name
-    return best_name or profile_name
+        if profile_name:
+            return profile_name
+        return best_name or fallback_profile_name
+    return best_name or fallback_profile_name
 
 
 
@@ -298,7 +314,7 @@ def _expand_ensure_action(
         if source_type == "discourse" or _should_map_site_stream_to_discourse(source_type=source_type, site=explicit_url):
             parts = urlsplit(explicit_url)
             base_url = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
-            json_path = parts.path or "/latest.json"
+            json_path = _normalize_discourse_json_path(parts.path or "/latest.json")
             out.append({"op": "source.add_discourse", "base_url": base_url, "json_path": json_path, "bind": bind})
             return out, warnings
         out.append({"op": "source.add_rss", "url": explicit_url, "bind": bind})
@@ -311,7 +327,7 @@ def _expand_ensure_action(
                 {
                     "op": "source.add_discourse",
                     "base_url": base_url,
-                    "json_path": _norm_text(action.get("json_path") or "/latest.json") or "/latest.json",
+                    "json_path": _normalize_discourse_json_path(_norm_text(action.get("json_path") or "/latest.json") or "/latest.json"),
                     "bind": bind,
                 }
             )
@@ -369,13 +385,13 @@ def _expand_disable_action(
         return ([{"op": "source.disable", "type": explicit_type, "url": explicit_url}], warnings)
     if explicit_url and source_type == "discourse":
         parts = urlsplit(explicit_url)
-        return ([{"op": "source.disable", "type": "discourse", "url": build_discourse_json_url(base_url=urlunsplit((parts.scheme, parts.netloc, "", "", "")), json_path=parts.path or "/latest.json")}], warnings)
+        return ([{"op": "source.disable", "type": "discourse", "url": build_discourse_json_url(base_url=urlunsplit((parts.scheme, parts.netloc, "", "", "")), json_path=_normalize_discourse_json_path(parts.path or "/latest.json"))}], warnings)
     if explicit_url:
         return ([{"op": "source.disable", "type": "rss", "url": explicit_url}], warnings)
     if site and _should_map_site_stream_to_discourse(source_type=source_type, site=site) and not query:
         base_url = _site_base_url(site)
         if base_url:
-            return ([{"op": "source.disable", "type": "discourse", "url": build_discourse_json_url(base_url=base_url, json_path=_norm_text(action.get("json_path") or "/latest.json") or "/latest.json")}], warnings)
+            return ([{"op": "source.disable", "type": "discourse", "url": build_discourse_json_url(base_url=base_url, json_path=_normalize_discourse_json_path(_norm_text(action.get("json_path") or "/latest.json") or "/latest.json"))}], warnings)
     searx_query = _build_site_search_query(site, query)
     if searx_query:
         url = build_searxng_search_url(

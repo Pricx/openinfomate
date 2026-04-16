@@ -2364,6 +2364,7 @@ def bind_update(
 @run_app.command("tick")
 def run_tick(
     push: bool = typer.Option(False, "--push", help="Push new alerts (if configured)."),
+    drain_backlog: bool = typer.Option(False, "--drain-backlog", help="Manually include historical pending candidates in tick-time LLM curation."),
 ):
     """
     Ingest enabled topic+source pairs and store item decisions.
@@ -2378,7 +2379,7 @@ def run_tick(
             with job_lock(name="jobs", timeout_seconds=120):
                 _engine, make_session = session_factory(settings)
                 with make_session() as session:
-                    result = await run_tick_core(session=session, settings=settings, push=push)
+                    result = await run_tick_core(session=session, settings=settings, push=push, drain_backlog=drain_backlog)
         except TimeoutError:
             console.print("[red]ERROR[/red] busy: another job is running (try again soon)")
             raise typer.Exit(2) from None

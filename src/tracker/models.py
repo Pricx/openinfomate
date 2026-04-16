@@ -50,6 +50,27 @@ class TopicPolicy(Base):
     __table_args__ = (UniqueConstraint("topic_id", name="uq_topic_policies_topic_id"),)
 
 
+class TopicGatePolicy(Base):
+    __tablename__ = "topic_gate_policies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id"), nullable=False)
+
+    initial_min_score: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    candidate_convergence_mode: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
+    push_min_score: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    push_max_digest_items: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    push_max_alert_items: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    push_dedupe_strength: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False, default=dt.datetime.utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, nullable=False, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow
+    )
+
+    __table_args__ = (UniqueConstraint("topic_id", name="uq_topic_gate_policies_topic_id"),)
+
+
 class AppConfig(Base):
     __tablename__ = "app_config"
 

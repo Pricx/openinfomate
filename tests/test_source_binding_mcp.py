@@ -41,6 +41,68 @@ def test_materialize_mcp_site_stream_falls_back_to_profile_for_linux_do():
 
 
 
+def test_materialize_mcp_site_stream_avoids_nonexistent_profile_fallback_when_topics_exist():
+    snapshot_before = {
+        "topics": [
+            {
+                "name": "Agent Engineering",
+                "query": "agent engineering",
+                "enabled": True,
+                "digest_cron": "0 9 * * *",
+                "alert_keywords": "",
+            }
+        ],
+        "sources": [],
+        "bindings": [],
+    }
+    plan = {
+        "actions": [
+            {
+                "op": "mcp.source_binding.ensure",
+                "intent": "site_stream",
+                "source_type": "discourse",
+                "site": "community.openai.com",
+                "topic": "__auto__",
+            }
+        ]
+    }
+    materialized, warnings = materialize_ai_setup_mcp_plan(
+        snapshot_before=snapshot_before,
+        plan=plan,
+        profile_topic_name="Profile",
+    )
+    assert [a["op"] for a in materialized["actions"]] == ["source.add_discourse"]
+    action = materialized["actions"][0]
+    assert action["base_url"] == "https://community.openai.com"
+    assert (action.get("bind") or {}).get("topic") == "Agent Engineering"
+    assert warnings == []
+
+
+def test_materialize_mcp_explicit_discourse_latest_url_normalizes_to_json():
+    plan = {
+        "actions": [
+            {
+                "op": "mcp.source_binding.ensure",
+                "intent": "site_stream",
+                "source_type": "discourse",
+                "url": "https://discuss.huggingface.co/latest",
+                "topic": "__auto__",
+            }
+        ]
+    }
+    materialized, warnings = materialize_ai_setup_mcp_plan(
+        snapshot_before=PROFILE_SNAPSHOT,
+        plan=plan,
+        profile_topic_name="Profile",
+    )
+    assert [a["op"] for a in materialized["actions"]] == ["source.add_discourse"]
+    action = materialized["actions"][0]
+    assert action["base_url"] == "https://discuss.huggingface.co"
+    assert action["json_path"] == "/latest.json"
+    assert (action.get("bind") or {}).get("topic") == "Profile"
+    assert warnings == []
+
+
 def test_materialize_mcp_search_auto_selects_best_topic_and_site_filters_query():
     plan = {
         "actions": [

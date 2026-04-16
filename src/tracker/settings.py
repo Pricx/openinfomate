@@ -7,7 +7,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="TRACKER_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="TRACKER_",
+        env_file=".env",
+        env_ignore_empty=True,
+        extra="ignore",
+    )
 
     db_url: str = Field(default="sqlite:///./tracker.db")
     env_path: str = ".env"
@@ -47,6 +52,12 @@ class Settings(BaseSettings):
     telegram_bot_token: str | None = None
     telegram_bot_username: str | None = None  # e.g. TrackerHotBot
     telegram_chat_id: str | None = None  # optional fallback (preferred: connect via admin UI)
+    # When configured, upstream Telegram ingress can forward `/start <code>` with the given prefix
+    # to a co-located SaaS wrapper (for example OpenInfoMate Pro) while keeping this singleton bot
+    # as the only public Telegram entrypoint.
+    telegram_external_bind_base_url: str | None = None
+    telegram_external_bind_token: str | None = None
+    telegram_external_bind_code_prefix: str = "oim_"
     # Optional "private bot" hardening: if set, only this Telegram user id may bind / issue commands.
     # If unset, the first successful connect will record an owner user id in app config.
     telegram_owner_user_id: str | None = None
@@ -71,7 +82,7 @@ class Settings(BaseSettings):
     # Enable "prompt delta" proposals from reply feedback (auditable; requires Apply/Reject).
     telegram_prompt_delta_enabled: bool = True
     # Default prompt slot targeted by prompt-delta proposals (override via Web Admin / TG /env).
-    telegram_prompt_delta_target_slot_id: str = "llm.curate_items.system"
+    telegram_prompt_delta_target_slot_id: str = "llm.curate_items.operator_delta"
 
     # Push: Email (SMTP)
     smtp_host: str | None = None
@@ -136,14 +147,13 @@ class Settings(BaseSettings):
     # If include_domains is set, only matching hosts are considered (best-effort).
     # exclude_domains always wins (i.e., can block even if included).
     include_domains: str = ""
-    # Default quality gate: filter out common low-signal content farms by domain.
-    # Operators can clear/override in Config Center → Domain Filters.
-    exclude_domains: str = "csdn.net"
-    # Domain quality tiering (best-effort; used for push selection).
-    # This does NOT filter content by "safety" categories; it only helps reduce low-quality sources.
-    # Low-tier domains are soft down-ranked / reviewed more strictly, not hard-blocked by themselves.
-    domain_quality_low_domains: str = "csdn.net"
-    domain_quality_medium_domains: str = "cnblogs.com"
+    # OpenInfoMate open self-host default: no deterministic domain block/filter by default.
+    # Operators may still configure these as optional hard controls.
+    exclude_domains: str = ""
+    # Domain quality tiering (best-effort; used for optional push filtering / ranking).
+    # Default disabled so the LLM, not static host lists, decides what is worth pushing.
+    domain_quality_low_domains: str = ""
+    domain_quality_medium_domains: str = ""
     domain_quality_high_domains: str = ""
     # Minimum tier for items to appear in pushed digests/alerts.
     # Allowed: low | medium | high
@@ -151,9 +161,10 @@ class Settings(BaseSettings):
 
     # Source quality scoring gate (LLM-assisted).
     #
-    # 0..100. Applied as a hard filter before pushing Curated Info and alerts.
-    # Also used as the default acceptance threshold for auto-discovered sources.
-    source_quality_min_score: int = 50
+    # 0..100. Optional hard filter before pushing Curated Info and alerts.
+    # 0 disables the score gate so push decisions remain LLM-driven by default.
+    # Also used as the default threshold for auto-discovered sources.
+    source_quality_min_score: int = 0
 
     # Legacy keyword prefilter (optional; not AI-native).
     # When disabled (default), bindings' `include_keywords` will not hard-filter ingestion in keywords mode.
@@ -168,6 +179,17 @@ class Settings(BaseSettings):
     priority_lane_pool_max_candidates: int = 200
     priority_lane_triage_keep_candidates: int = 20
     priority_lane_max_alert: int = 2
+    # Deterministic global immediate alert rules (JSON list). Matching items are promoted to `alert`
+    # before topic keyword/LLM curation. Example:
+    # [{"host":"linux.do","title_all":["邀请码","冰"],"reason":"matched immediate alert rule: linux.do 邀请码+冰"}]
+    immediate_alert_rules_json: str = ""
+
+    # Source collect messages (JSON list).
+    # Each enabled rule contributes curated digest/alert rows filtered by source ids.
+    # Rules sharing the same cron are merged into one Telegram Reader collect message for that run.
+    # Example:
+    # [{"name":"arXiv","cron":"0 19 * * *","lookback_hours":24,"fallback_lookback_hours":72,"source_ids":[123,124,125]}]
+    collect_message_rules_json: str = ""
 
     # Dedupe policy
     simhash_lookback_days: int = 30  # 0 = scan all history (slow)
@@ -216,6 +238,12 @@ class Settings(BaseSettings):
     # - mini: for pure compression/summarization tasks (default: TRACKER_LLM_MODEL)
     llm_model_reasoning: str | None = None
     llm_model_mini: str | None = None
+    # Optional explicit OpenAI-compatible transport mode.
+    # - auto: use cached/default compat probing
+    # - responses: prefer /v1/responses
+    # - chat_completions: prefer /v1/chat/completions
+    llm_compat_mode: str = "auto"
+    llm_mini_compat_mode: str = "auto"
     # Optional separate provider for mini/triage workloads (cheap, high-throughput).
     # If unset, mini tasks fall back to the main TRACKER_LLM_* provider.
     llm_mini_base_url: str | None = None
@@ -229,12 +257,18 @@ class Settings(BaseSettings):
     # If empty, mini requests fall back to `llm_extra_body_json`.
     llm_mini_extra_body_json: str = ""
     llm_timeout_seconds: int = 90
+    # Retry policy for LLM requests and response validation.
+    # Applies to transport errors and semantic empty-response failures.
+    llm_retry_attempts: int = 4
+    llm_retry_min_wait_seconds: float = 0.5
+    llm_retry_max_wait_seconds: float = 8.0
     llm_max_candidates_per_tick: int = 10
     llm_failure_alert_enabled: bool = True
     llm_failure_alert_threshold: int = 5
     llm_failure_alert_min_minutes: int = 10
     llm_failure_alert_cooldown_minutes: int = 180
-    curated_recovery_queue_enabled: bool = True
+    curated_recovery_queue_enabled: bool = False
+    curated_recovery_auto_enqueue_enabled: bool = False
     curated_recovery_queue_poll_seconds: int = 30
 
     # Optional cost estimation (USD per 1M tokens).
@@ -250,10 +284,18 @@ class Settings(BaseSettings):
     # When enabled, topics with an enabled TopicPolicy will ingest items as "candidate",
     # then call the configured LLM once per topic to decide ignore|digest|alert.
     llm_curation_enabled: bool = True
-    llm_curation_max_candidates: int = 30
-    llm_curation_max_digest: int = 5
-    llm_curation_max_alert: int = 2
-    llm_curation_history_dedupe_days: int = 30
+    # Optional hard limits. 0 disables the limit and lets the LLM decide.
+    # When all three are 0, digest curation drains the full backlog in prompt-safe batches.
+    llm_curation_max_candidates: int = 0
+    llm_curation_max_digest: int = 0
+    llm_curation_max_alert: int = 0
+    # Optional deterministic anti-repeat before the LLM sees candidates.
+    # Default disabled so open self-host remains LLM-first.
+    llm_curation_input_dedupe_enabled: bool = False
+    llm_curation_history_dedupe_days: int = 0
+    # Prompt transport/runtime knob only; not a business relevance cap.
+    # 0 = auto chunking.
+    llm_curation_prompt_batch_size: int = 0
     # Reliability: when LLM curation is enabled but the backend is temporarily unavailable,
     # optionally "fail open" by selecting a small fallback digest so operators don't get silent days.
     llm_curation_fail_open: bool = False
@@ -261,7 +303,7 @@ class Settings(BaseSettings):
     # Optional "triage" stage before full curation:
     # - Use a cheaper mini model to pre-filter a larger candidate pool down to a smaller set
     #   that is then passed to the main reasoning model for final ignore|digest|alert decisions.
-    llm_curation_triage_enabled: bool = True
+    llm_curation_triage_enabled: bool = False
     llm_curation_triage_pool_max_candidates: int = 120
     # 0 = use llm_curation_max_candidates as the keep cap.
     llm_curation_triage_keep_candidates: int = 0

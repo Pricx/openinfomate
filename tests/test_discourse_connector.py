@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import httpx
+
 from tracker.connectors.discourse import DiscourseConnector
+from tracker.connectors.errors import TemporaryFetchBlockError
 
 
 def test_discourse_fetch_parses_topics(monkeypatch):
@@ -274,7 +277,215 @@ def test_discourse_fetch_falls_back_to_rss_on_cloudflare_challenge(monkeypatch):
     urls = {e.url for e in entries}
     assert "https://forum.example.com/t/test-topic/123" in urls
     assert "https://forum.example.com/t/topic/1615965" in urls
-    assert all(e.summary is None for e in entries)
+    first = next(e for e in entries if e.url == "https://forum.example.com/t/test-topic/123")
+    assert (first.summary or "").strip() == "hello"
+
+
+def test_discourse_fetch_falls_back_to_html_latest_when_json_blocked_and_rss_empty(monkeypatch):
+    monkeypatch.setattr("tracker.connectors.discourse._CF_CHALLENGED_NETLOCS", set())
+    monkeypatch.setattr("tracker.connectors.discourse._RSS_OPTIONAL_UNAVAILABLE_URLS", set())
+
+    latest_html = """
+<!DOCTYPE html>
+<html>
+  <body class="crawler">
+    <div class="topic-list-container">
+      <table class="topic-list">
+        <tbody>
+          <tr class="topic-list-item">
+            <td class="main-link">
+              <span class="link-top-line">
+                <a class="title raw-link raw-topic-link" href="https://forum.example.com/t/topic/1911417">调整帖子最小长度</a>
+              </span>
+              <p class="excerpt">这是一个可抓取的 HTML fallback 摘要。</p>
+            </td>
+            <td>2026 年4 月 11 日</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </body>
+</html>
+"""
+
+    class FakeResp:
+        def __init__(self, text: str, *, status_code: int, headers: dict[str, str] | None = None, url: str | None = None):
+            self.text = text
+            self.status_code = status_code
+            self.headers = headers or {}
+            self.url = url or "https://forum.example.com/latest"
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+            return None
+
+    seen_urls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url: str, headers: dict):
+            seen_urls.append(url)
+            if url.endswith(".json"):
+                return FakeResp(
+                    "<html>challenge</html>",
+                    status_code=403,
+                    headers={"cf-mitigated": "challenge"},
+                    url=url,
+                )
+            if url.endswith("/latest.rss"):
+                return FakeResp("", status_code=200, url=url)
+            if url.endswith("/new.rss"):
+                return FakeResp("<rss><channel></channel></rss>", status_code=200, url=url)
+            if url.endswith("/latest"):
+                return FakeResp(latest_html, status_code=200, url=url)
+            return FakeResp("<rss><channel></channel></rss>", status_code=200, url=url)
+
+    monkeypatch.setattr("tracker.connectors.discourse.httpx.AsyncClient", FakeClient)
+
+    connector = DiscourseConnector(timeout_seconds=1)
+    entries = asyncio.run(connector.fetch(url="https://forum.example.com/latest.json"))
+
+    assert any(u.endswith("/latest") for u in seen_urls)
+    assert any(u.endswith("/latest.rss") for u in seen_urls)
+    assert entries
+    assert entries[0].url == "https://forum.example.com/t/topic/1911417"
+    assert entries[0].title == "调整帖子最小长度"
+    assert "HTML fallback" in (entries[0].summary or "")
+
+
+def test_discourse_fetch_uses_requests_fallback_when_httpx_connect_fails(monkeypatch):
+    monkeypatch.setattr("tracker.connectors.discourse._CF_CHALLENGED_NETLOCS", set())
+    payload = (
+        Path(__file__).with_name("fixtures").joinpath("discourse_latest.json").read_text(encoding="utf-8")
+    )
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url: str, headers: dict):
+            raise httpx.ConnectError("boom")
+
+    class FakeRequestsResponse:
+        def __init__(self, text: str, *, status_code: int = 200, url: str):
+            self.text = text
+            self.status_code = status_code
+            self.headers = {}
+            self.url = url
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+            return None
+
+    def fake_requests_get(url: str, *, headers: dict, timeout: int, allow_redirects: bool):
+        assert timeout == 1
+        assert allow_redirects is True
+        return FakeRequestsResponse(payload, status_code=200, url=url)
+
+    monkeypatch.setattr("tracker.connectors.discourse.httpx.AsyncClient", FakeClient)
+    monkeypatch.setattr("tracker.connectors.discourse.requests.get", fake_requests_get)
+
+    connector = DiscourseConnector(timeout_seconds=1)
+    entries = asyncio.run(connector.fetch(url="https://forum.example.com/latest.json"))
+
+    assert len(entries) == 2
+    assert entries[0].url == "https://forum.example.com/t/ai-chips-new-accelerator/111"
+
+
+def test_discourse_fetch_uses_requests_fallback_across_json_rss_and_html(monkeypatch):
+    monkeypatch.setattr("tracker.connectors.discourse._CF_CHALLENGED_NETLOCS", set())
+    monkeypatch.setattr("tracker.connectors.discourse._RSS_OPTIONAL_UNAVAILABLE_URLS", set())
+
+    latest_html = """
+<!DOCTYPE html>
+<html>
+  <body class="crawler">
+    <table class="topic-list">
+      <tbody>
+        <tr class="topic-list-item">
+          <td class="main-link">
+            <a class="title raw-link raw-topic-link" href="https://forum.example.com/t/topic/1911417">HTML 通路恢复</a>
+            <p class="excerpt">requests fallback 解析到这条记录。</p>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </body>
+</html>
+"""
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url: str, headers: dict):
+            raise httpx.ConnectError("boom")
+
+    class FakeRequestsResponse:
+        def __init__(self, text: str, *, status_code: int, url: str, headers: dict[str, str] | None = None):
+            self.text = text
+            self.status_code = status_code
+            self.headers = headers or {}
+            self.url = url
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+            return None
+
+    seen_urls: list[str] = []
+
+    def fake_requests_get(url: str, *, headers: dict, timeout: int, allow_redirects: bool):
+        seen_urls.append(url)
+        if url.endswith(".json"):
+            return FakeRequestsResponse(
+                "<html>challenge</html>",
+                status_code=403,
+                headers={"cf-mitigated": "challenge"},
+                url=url,
+            )
+        if url.endswith("/latest.rss"):
+            return FakeRequestsResponse("", status_code=200, url=url)
+        if url.endswith("/new.rss"):
+            return FakeRequestsResponse("<rss><channel></channel></rss>", status_code=200, url=url)
+        if url.endswith("/latest"):
+            return FakeRequestsResponse(latest_html, status_code=200, url=url)
+        return FakeRequestsResponse("<rss><channel></channel></rss>", status_code=200, url=url)
+
+    monkeypatch.setattr("tracker.connectors.discourse.httpx.AsyncClient", FakeClient)
+    monkeypatch.setattr("tracker.connectors.discourse.requests.get", fake_requests_get)
+
+    connector = DiscourseConnector(timeout_seconds=1)
+    entries = asyncio.run(connector.fetch(url="https://forum.example.com/latest.json"))
+
+    assert any(u.endswith("/latest.json") for u in seen_urls)
+    assert any(u.endswith("/latest.rss") for u in seen_urls)
+    assert any(u.endswith("/latest") for u in seen_urls)
+    assert entries
+    assert entries[0].title == "HTML 通路恢复"
+    assert "requests fallback" in (entries[0].summary or "")
 
 
 def test_discourse_skips_optional_rss_feed_after_404(monkeypatch):
@@ -666,3 +877,43 @@ def test_discourse_fetch_uses_multi_page_latest_and_new_rss_recall_by_default(mo
     assert "https://forum.example.com/t/topic/1610998" in urls
     assert "https://forum.example.com/t/topic/1615965" in urls
     assert "https://forum.example.com/t/topic/1702035" in urls
+
+
+def test_discourse_fetch_raises_temporary_block_when_json_and_rss_are_both_blocked(monkeypatch):
+    monkeypatch.setattr("tracker.connectors.discourse._CF_CHALLENGED_NETLOCS", set())
+
+    class FakeResp:
+        def __init__(self, text: str, *, status_code: int, headers: dict[str, str] | None = None):
+            self.text = text
+            self.status_code = status_code
+            self.headers = headers or {}
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url: str, headers: dict):
+            if url.endswith(".json"):
+                return FakeResp("blocked", status_code=429, headers={"Retry-After": "120"})
+            return FakeResp("blocked", status_code=429)
+
+    monkeypatch.setattr("tracker.connectors.discourse.httpx.AsyncClient", FakeClient)
+
+    connector = DiscourseConnector(timeout_seconds=1)
+    try:
+        asyncio.run(connector.fetch(url="https://forum.example.com/latest.json"))
+        raise AssertionError("expected TemporaryFetchBlockError")
+    except TemporaryFetchBlockError as exc:
+        assert exc.status_code == 429
+        assert exc.retry_after_seconds == 120

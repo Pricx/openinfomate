@@ -14,8 +14,9 @@ import httpx
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
-from tracker.formatting import extract_llm_summary_why, format_digest_markdown, format_im_text
+from tracker.formatting import curated_priority_score, extract_llm_summary_why, format_digest_markdown, format_im_text
 from tracker.connectors.base import FetchedEntry
+from tracker.connectors.errors import TemporaryFetchBlockError
 from tracker.health_reporting import format_health_markdown
 from tracker.feed_discovery import discover_feed_urls_from_html
 from tracker.pipeline import (
@@ -24,8 +25,14 @@ from tracker.pipeline import (
     ingest_entries_for_topic_source,
     is_near_duplicate,
 )
+from tracker.collect_messages import CollectMessageRule
 from tracker.connectors.rss import RssConnector
-from tracker.connectors.searxng import build_searxng_search_url, normalize_searxng_base_url, normalize_searxng_search_url
+from tracker.connectors.searxng import (
+    build_searxng_search_url,
+    normalize_searxng_base_url,
+    normalize_searxng_search_url,
+    probe_searxng_backend,
+)
 from tracker.push_dispatch import (
     push_dingtalk_markdown,
     push_email_text,
@@ -53,13 +60,40 @@ from tracker.normalize import canonicalize_url, normalize_text
 from tracker.search_query import normalize_search_query
 from tracker.simhash import int_to_signed64, simhash64
 from tracker.story import story_dedupe_text
+from tracker.topic_gate_config import (
+    TopicGateConfig,
+    push_dedupe_story_distance,
+    topic_gate_score,
+)
 
 _T = TypeVar("_T")
 
 logger = logging.getLogger(__name__)
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+_FULLTEXT_SKIP_HOSTS = {"linux.do"}
+_TITLE_LOCALIZE_BATCH_SIZE = 24
 _URL_RE = re.compile(r"https?://[^\s<>\")\]]+", re.IGNORECASE)
+_SEARXNG_BACKEND_BLOCK_UNTIL_KEY = "searxng_search_backend_block_until_utc"
+_SEARXNG_BACKEND_BLOCK_REASON_KEY = "searxng_search_backend_block_reason"
+
+
+def _runner_exc_text(exc: BaseException) -> str:
+    detail = str(exc or "").strip()
+    return detail or repr(exc)
+
+
+def _parse_utc_naive(value: str | None) -> dt.datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return parsed
 
 
 def _is_local_url(url: str) -> bool:
@@ -96,6 +130,215 @@ def _rewrite_local_url_to_source_host(*, url: str, source_url: str) -> str:
         return urlunsplit((src_scheme, src.netloc or src_host, parts.path or "/", parts.query or "", parts.fragment or ""))
     except Exception:
         return raw
+
+
+def _host_for_url(url: str) -> str:
+    try:
+        return ((urlsplit((url or "").strip()).hostname or "").strip().lower()).rstrip(".")
+    except Exception:
+        return ""
+
+
+def _should_skip_fulltext_enrichment(url: str) -> bool:
+    host = _host_for_url(url)
+    if not host:
+        return False
+    return any(host == blocked or host.endswith(f".{blocked}") for blocked in _FULLTEXT_SKIP_HOSTS)
+
+
+def _should_force_fulltext_enrichment(url: str) -> bool:
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    host = _host_for_url(raw)
+    if host not in {"arxiv.org", "www.arxiv.org", "export.arxiv.org"}:
+        return False
+    try:
+        path = (urlsplit(raw).path or "").strip()
+    except Exception:
+        path = ""
+    return path.startswith("/abs/")
+
+
+def _has_persisted_fulltext(row) -> bool:
+    return bool((getattr(row, "content_text", "") or "").strip())
+
+
+def _topic_gate_score(
+    it_row: ItemTopic,
+    *,
+    source_score: int = 0,
+) -> int:
+    try:
+        relevance = max(0, min(100, int(getattr(it_row, "relevance_score", 0) or 0)))
+    except Exception:
+        relevance = 0
+    try:
+        novelty = max(0, min(100, int(getattr(it_row, "novelty_score", 0) or 0)))
+    except Exception:
+        novelty = 0
+    try:
+        quality = max(0, min(100, int(getattr(it_row, "quality_score", 0) or 0)))
+    except Exception:
+        quality = 0
+    return topic_gate_score(
+        source_score=source_score,
+        relevance_score=relevance,
+        novelty_score=novelty,
+        quality_score=quality,
+    )
+
+
+def _filter_topic_gate_candidate_rows(
+    rows: list[tuple[ItemTopic, Item]],
+    *,
+    min_score: int | None,
+    source_url_by_id: dict[int, str],
+    scores_by_source_id: dict[int, int] | None,
+    domain_policy: object | None,
+) -> tuple[list[tuple[ItemTopic, Item]], list[tuple[ItemTopic, Item]]]:
+    if min_score is None:
+        return rows, []
+    kept: list[tuple[ItemTopic, Item]] = []
+    dropped: list[tuple[ItemTopic, Item]] = []
+    for it_row, item in rows:
+        if str(getattr(it_row, "decision", "") or "").strip().lower() != "candidate":
+            kept.append((it_row, item))
+            continue
+        source_score = _effective_source_score(
+            source_id=int(getattr(item, "source_id", 0) or 0),
+            source_url=source_url_by_id.get(int(getattr(item, "source_id", 0) or 0), ""),
+            item_url=str(getattr(item, "canonical_url", "") or getattr(item, "url", "") or ""),
+            scores_by_source_id=scores_by_source_id,
+            domain_policy=domain_policy,
+        )
+        if _topic_gate_score(it_row, source_score=source_score) >= int(min_score):
+            kept.append((it_row, item))
+        else:
+            dropped.append((it_row, item))
+    return kept, dropped
+
+
+def _apply_topic_gate_push_filters(
+    rows: list[tuple[ItemTopic, Item]],
+    *,
+    min_score: int | None,
+    max_digest_items: int | None,
+    max_alert_items: int | None,
+    source_url_by_id: dict[int, str],
+    scores_by_source_id: dict[int, int] | None,
+    domain_policy: object | None,
+) -> list[tuple[ItemTopic, Item]]:
+    out: list[tuple[ItemTopic, Item]] = []
+    digest_count = 0
+    alert_count = 0
+    for it_row, item in rows:
+        decision = str(getattr(it_row, "decision", "") or "").strip().lower()
+        source_score = _effective_source_score(
+            source_id=int(getattr(item, "source_id", 0) or 0),
+            source_url=source_url_by_id.get(int(getattr(item, "source_id", 0) or 0), ""),
+            item_url=str(getattr(item, "canonical_url", "") or getattr(item, "url", "") or ""),
+            scores_by_source_id=scores_by_source_id,
+            domain_policy=domain_policy,
+        )
+        if min_score is not None and _topic_gate_score(it_row, source_score=source_score) < int(min_score):
+            continue
+        if decision == "alert":
+            if max_alert_items is not None and alert_count >= int(max_alert_items):
+                continue
+            alert_count += 1
+            out.append((it_row, item))
+            continue
+        if decision == "digest":
+            if max_digest_items is not None and digest_count >= int(max_digest_items):
+                continue
+            digest_count += 1
+            out.append((it_row, item))
+            continue
+        out.append((it_row, item))
+    return out
+
+
+def _topic_gate_candidate_runtime(
+    *,
+    settings: Settings,
+    gate: TopicGateConfig,
+) -> dict[str, int | bool]:
+    mini_available = bool((getattr(settings, "llm_model_mini", None) or "").strip())
+    base_candidate_cap = max(0, int(getattr(settings, "llm_curation_max_candidates", 0) or 0))
+    base_triage_enabled = bool(getattr(settings, "llm_curation_triage_enabled", False)) and mini_available
+    base_dedupe_enabled = _llm_curation_input_dedupe_enabled(settings)
+    base_history_days = max(0, int(getattr(settings, "llm_curation_history_dedupe_days", 0) or 0)) if base_dedupe_enabled else 0
+    base_triage_pool_max = max(0, int(getattr(settings, "llm_curation_triage_pool_max_candidates", 0) or 0))
+    base_triage_keep = max(0, int(getattr(settings, "llm_curation_triage_keep_candidates", 0) or 0))
+    if gate.candidate_convergence == "loose":
+        return {
+            "max_candidates": 0,
+            "triage_enabled": False,
+            "input_dedupe_enabled": False,
+            "history_dedupe_days": 0,
+            "triage_pool_max_candidates": 0,
+            "triage_keep_candidates": 0,
+        }
+    if gate.candidate_convergence == "balanced":
+        max_candidates = base_candidate_cap if base_candidate_cap > 0 else 60
+        return {
+            "max_candidates": max_candidates,
+            "triage_enabled": mini_available,
+            "input_dedupe_enabled": True,
+            "history_dedupe_days": max(base_history_days, 7),
+            "triage_pool_max_candidates": max(base_triage_pool_max, max_candidates * 2, 120),
+            "triage_keep_candidates": max(base_triage_keep, max(20, max_candidates // 2)),
+        }
+    if gate.candidate_convergence == "strict":
+        max_candidates = base_candidate_cap if base_candidate_cap > 0 else 30
+        return {
+            "max_candidates": max_candidates,
+            "triage_enabled": mini_available,
+            "input_dedupe_enabled": True,
+            "history_dedupe_days": max(base_history_days, 14),
+            "triage_pool_max_candidates": max(base_triage_pool_max, max_candidates * 2, 80),
+            "triage_keep_candidates": max(base_triage_keep, max(10, max_candidates // 2)),
+        }
+    return {
+        "max_candidates": base_candidate_cap,
+        "triage_enabled": base_triage_enabled,
+        "input_dedupe_enabled": base_dedupe_enabled,
+        "history_dedupe_days": base_history_days,
+        "triage_pool_max_candidates": base_triage_pool_max,
+        "triage_keep_candidates": base_triage_keep,
+    }
+
+
+def _trim_fulltext_error(exc: Exception) -> str:
+    err = str(exc or "").strip()
+    if len(err) > 400:
+        err = err[:400].rstrip() + "…"
+    return err
+
+
+def _llm_curation_input_dedupe_enabled(settings: Settings) -> bool:
+    try:
+        return bool(getattr(settings, "llm_curation_input_dedupe_enabled", False))
+    except Exception:
+        return False
+
+
+def _llm_curation_prompt_batch_size(settings: Settings) -> int:
+    try:
+        raw = int(getattr(settings, "llm_curation_prompt_batch_size", 0) or 0)
+    except Exception:
+        raw = 0
+    if raw > 0:
+        return max(1, min(100, raw))
+    return 25
+
+
+def _chunk_llm_curation_candidates(candidates: list[dict], *, settings: Settings) -> list[list[dict]]:
+    if not candidates:
+        return []
+    batch_size = _llm_curation_prompt_batch_size(settings)
+    return [candidates[i : i + batch_size] for i in range(0, len(candidates), batch_size)]
 
 
 def _best_push_url_for_item(*, item: Item, source: Source | None) -> str:
@@ -216,6 +459,44 @@ def _effective_source_score(
         except Exception:
             pass
     return max(0, min(100, adjusted))
+
+
+def _source_score_is_hard_gate_eligible(score_row: object) -> bool:
+    """
+    Only operator/LLM-managed source scores may participate in hard push gates.
+
+    Telegram like/dislike feedback is a soft hint for ranking/prompt context; a single
+    dislike on one post must not suppress an entire source from alerts/digests. If the
+    operator really wants a hard block, they should use an explicit mute rule or lock
+    a manual score.
+    """
+    origin = str(getattr(score_row, "origin", "") or "").strip().lower()
+    if origin != "feedback":
+        return True
+    try:
+        return bool(getattr(score_row, "locked", False))
+    except Exception:
+        return False
+
+
+def _collect_hard_gate_source_scores(*, repo: Repo) -> dict[int, int]:
+    scores: dict[int, int] = {}
+    try:
+        rows = repo.list_source_scores(limit=10_000)
+    except Exception:
+        return scores
+    for sc in rows:
+        try:
+            sid = int(getattr(sc, "source_id", 0) or 0)
+        except Exception:
+            continue
+        if sid <= 0 or (not _source_score_is_hard_gate_eligible(sc)):
+            continue
+        try:
+            scores[sid] = max(0, min(100, int(getattr(sc, "score", 0) or 0)))
+        except Exception:
+            continue
+    return scores
 
 
 def _should_keep_push_item(
@@ -428,6 +709,112 @@ def _local_day_iso(settings: Settings, *, when: dt.datetime | None = None) -> st
         return dt.datetime.utcnow().date().isoformat()
 
 
+def _dedupe_ranked_item_rows(
+    rows: list[tuple[ItemTopic, Item]],
+    *,
+    url_overrides_by_item_id: dict[int, str] | None = None,
+    dedupe_strength: str = "normal",
+) -> list[tuple[ItemTopic, Item]]:
+    """
+    Shared de-dupe for digest-like aggregation surfaces.
+
+    Rules:
+    - primary key: canonical URL
+    - fallback key: normalized title
+    - on conflicts: prefer alert > digest, then higher curated priority, then newer item
+    """
+    strength = (dedupe_strength or "normal").strip().lower()
+    if strength == "off":
+        return rows
+
+    story_distance = push_dedupe_story_distance(strength)
+    by_key: dict[str, tuple[ItemTopic, Item]] = {}
+    story_seen: list[int] = []
+    overrides = url_overrides_by_item_id or {}
+
+    def _pri(decision: str) -> int:
+        d = (decision or "").strip().lower()
+        return 0 if d == "alert" else 1
+
+    for it_row, item in rows:
+        try:
+            iid = int(getattr(item, "id", 0) or 0)
+        except Exception:
+            iid = 0
+
+        try:
+            url_raw = str(
+                overrides.get(iid)
+                or getattr(item, "canonical_url", None)
+                or getattr(item, "url", None)
+                or ""
+            ).strip()
+        except Exception:
+            url_raw = ""
+        url_key = canonicalize_url(url_raw) if url_raw else ""
+
+        try:
+            title_raw = str(getattr(item, "title", "") or "").strip()
+        except Exception:
+            title_raw = ""
+        title_key = normalize_text(title_raw).casefold() if title_raw else ""
+        key = url_key or (f"title:{title_key}" if title_key else f"id:{iid}")
+
+        if story_distance is not None:
+            try:
+                snippet = str(getattr(item, "content_text", "") or "").strip()
+            except Exception:
+                snippet = ""
+            story = story_dedupe_text(title=title_raw, url=url_raw, snippet=snippet)
+            if story:
+                sh = simhash64(story)
+                if is_near_duplicate(new_simhash=sh, existing_simhashes=story_seen, max_distance=story_distance):
+                    continue
+                story_seen.append(int_to_signed64(sh))
+
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = (it_row, item)
+            continue
+
+        ex_it, ex_item = existing
+        if _pri(str(getattr(it_row, "decision", "") or "")) < _pri(str(getattr(ex_it, "decision", "") or "")):
+            by_key[key] = (it_row, item)
+            continue
+        if _pri(str(getattr(it_row, "decision", "") or "")) > _pri(str(getattr(ex_it, "decision", "") or "")):
+            continue
+
+        rank_new = curated_priority_score(
+            reason=str(getattr(it_row, "reason", "") or ""),
+            decision=str(getattr(it_row, "decision", "") or ""),
+        )
+        rank_old = curated_priority_score(
+            reason=str(getattr(ex_it, "reason", "") or ""),
+            decision=str(getattr(ex_it, "decision", "") or ""),
+        )
+        if rank_new > rank_old:
+            by_key[key] = (it_row, item)
+            continue
+        if rank_new < rank_old:
+            continue
+
+        try:
+            ts_new = getattr(item, "published_at", None) or getattr(item, "created_at", None)
+        except Exception:
+            ts_new = None
+        try:
+            ts_old = getattr(ex_item, "published_at", None) or getattr(ex_item, "created_at", None)
+        except Exception:
+            ts_old = None
+        try:
+            if isinstance(ts_new, dt.datetime) and isinstance(ts_old, dt.datetime) and ts_new > ts_old:
+                by_key[key] = (it_row, item)
+        except Exception:
+            pass
+
+    return list(by_key.values())
+
+
 _CJK_TEXT_RE = re.compile(r"[\u4e00-\u9fff]")
 _TITLE_PATH_HINT_RE = re.compile(r"(?:^|/)(?:readme|docs?|blob|tree|src|packages?|apps?|examples?)(?:/|$)", re.IGNORECASE)
 _TITLE_FILE_HINT_RE = re.compile(r"\.(?:md|rst|txt|json|ya?ml|toml|ini|cfg|py|ts|tsx|js|jsx|go|rs|java|kt|sh|ps1)(?:\b|\s)", re.IGNORECASE)
@@ -497,7 +884,7 @@ async def _localize_item_display_titles(
 
     candidates: list[dict] = []
     fallback_titles: dict[int, str] = {}
-    fulltext_fetches = 0
+    fulltext_attempts = 0
     max_fulltext_fetches = 3
 
     for entry in entries:
@@ -529,8 +916,14 @@ async def _localize_item_display_titles(
             cached = (row.content_text if row and row.content_text else "").strip() if row else ""
             if cached:
                 snippet_parts.append(cached)
-            elif low_signal and fulltext_fetches < max_fulltext_fetches and url.startswith(("http://", "https://")):
+            elif (
+                low_signal
+                and fulltext_attempts < max_fulltext_fetches
+                and url.startswith(("http://", "https://"))
+                and not _should_skip_fulltext_enrichment(url)
+            ):
                 try:
+                    fulltext_attempts += 1
                     cookie = await _cookie_header_cb(url)
                     text = await fetch_fulltext_for_url(
                         url=url,
@@ -543,9 +936,8 @@ async def _localize_item_display_titles(
                     if text:
                         repo.upsert_item_content(item_id=item_id, url=url, content_text=text, error="")
                         snippet_parts.append(text)
-                        fulltext_fetches += 1
                 except Exception as exc:
-                    logger.info("title fulltext fetch failed: item_id=%s url=%s err=%s", item_id, url, exc)
+                    logger.info("title fulltext fetch failed (retry later): item_id=%s url=%s err=%s", item_id, url, exc)
 
         if summary and ((target_lang == "zh" and _contains_cjk_text(summary)) or (target_lang == "en" and not _contains_cjk_text(summary))):
             fallback_titles[item_id] = _short_title_fallback(text=summary, target_lang=target_lang)
@@ -567,18 +959,26 @@ async def _localize_item_display_titles(
 
     localized: dict[int, str] = {}
     if candidates:
-        try:
-            out = await llm_localize_item_titles(
-                repo=repo,
-                settings=settings,
-                target_lang=target_lang,
-                items=candidates,
-                usage_cb=usage_cb,
-            )
-            if out:
-                localized.update({int(k): str(v).strip() for k, v in out.items() if int(k) > 0 and str(v).strip()})
-        except Exception as exc:
-            logger.warning("title localization failed: %s", exc)
+        batch_size = max(1, int(_TITLE_LOCALIZE_BATCH_SIZE or 24))
+        for offset in range(0, len(candidates), batch_size):
+            batch = candidates[offset : offset + batch_size]
+            try:
+                out = await llm_localize_item_titles(
+                    repo=repo,
+                    settings=settings,
+                    target_lang=target_lang,
+                    items=batch,
+                    usage_cb=usage_cb,
+                )
+                if out:
+                    localized.update({int(k): str(v).strip() for k, v in out.items() if int(k) > 0 and str(v).strip()})
+            except Exception as exc:
+                logger.warning(
+                    "title localization failed: batch=%s-%s err=%s",
+                    offset,
+                    offset + len(batch),
+                    exc,
+                )
 
     for item_id, fallback in fallback_titles.items():
         if item_id not in localized and fallback:
@@ -586,15 +986,29 @@ async def _localize_item_display_titles(
     return localized
 
 
-def _format_llm_curation_reason(*, summary: str, why: str, hint: str | None = None) -> str:
+def _format_llm_curation_reason(
+    *,
+    summary: str,
+    why: str,
+    hint: str | None = None,
+    rank_score: int | None = None,
+) -> str:
     lines: list[str] = []
     s = (summary or "").strip()
     w = (why or "").strip()
     h = (hint or "").strip()
+    r = None
+    if rank_score is not None:
+        try:
+            r = max(0, min(100, int(rank_score)))
+        except Exception:
+            r = None
     if s:
         lines.append(f"llm_summary: {s}")
     if w:
         lines.append(f"llm_why: {w}")
+    if r is not None:
+        lines.append(f"llm_rank: {r}")
     if h:
         lines.append(f"llm_hint: {h}")
     return "\n".join(lines).strip()
@@ -787,7 +1201,26 @@ class HealthResult:
     markdown: str
 
 
-async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickResult:
+@dataclass(frozen=True)
+class CollectMessageResult:
+    rule_id: str
+    title: str
+    pushed: int
+    markdown: str
+    idempotency_key: str = ""
+
+
+@dataclass(frozen=True)
+class CollectMessageBatchResult:
+    group_id: str
+    rule_ids: tuple[str, ...]
+    title: str
+    pushed: int
+    markdown: str
+    idempotency_key: str = ""
+
+
+async def run_tick(*, session: Session, settings: Settings, push: bool, drain_backlog: bool = False) -> TickResult:
     repo = Repo(session)
     # Apply DB-backed dynamic overrides for non-secret Settings fields.
     try:
@@ -806,52 +1239,53 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
         searx_base = normalize_searxng_base_url((getattr(settings, "searxng_base_url", "") or "").strip())
     except Exception:
         searx_base = ""
+    if not searx_base:
+        try:
+            for src in repo.list_sources():
+                if (getattr(src, "type", "") or "").strip() != "searxng_search":
+                    continue
+                candidate_base = normalize_searxng_base_url(str(getattr(src, "url", "") or "").strip())
+                if candidate_base:
+                    searx_base = candidate_base
+                    break
+        except Exception:
+            searx_base = ""
+    searx_backend_block_until = _parse_utc_naive(repo.get_app_config(_SEARXNG_BACKEND_BLOCK_UNTIL_KEY))
+    searx_backend_block_reason = (repo.get_app_config(_SEARXNG_BACKEND_BLOCK_REASON_KEY) or "").strip()
     if searx_base:
         try:
             last_raw = (repo.get_app_config("searxng_search_repair_last_at_utc") or "").strip()
         except Exception:
             last_raw = ""
-        last_dt: dt.datetime | None = None
-        if last_raw:
-            try:
-                last_dt = dt.datetime.fromisoformat(last_raw.replace("Z", "+00:00"))
-                if last_dt.tzinfo is not None:
-                    last_dt = last_dt.astimezone(dt.timezone.utc).replace(tzinfo=None)
-            except Exception:
-                last_dt = None
+        last_dt = _parse_utc_naive(last_raw)
+        now2 = dt.datetime.utcnow()
+        block_active = searx_backend_block_until is not None and now2 < searx_backend_block_until
+        probe_now = False
+        if searx_backend_block_until is not None and now2 >= searx_backend_block_until:
+            probe_now = True
+        elif not block_active and (last_dt is None or (now2 - last_dt).total_seconds() > 600):
+            probe_now = True
 
-        # Avoid doing this too often; it's a tiny maintenance step.
-        if last_dt is None or (dt.datetime.utcnow() - last_dt).total_seconds() > 600:
-            now2 = dt.datetime.utcnow()
-            # Only auto-enable disabled search seeds when SearxNG itself is reachable.
-            # This avoids flip-flopping (enable → fail → auto-disable) during outages.
-            searx_ready = False
+        probe_healthy = False
+        if probe_now:
             try:
-                probe_url = build_searxng_search_url(
+                probe = await probe_searxng_backend(
                     base_url=searx_base,
-                    query="openinfomate",
-                    time_range="day",
-                    results=1,
+                    timeout_seconds=float(getattr(settings, "http_timeout_seconds", 20) or 20),
                 )
-                # SearxNG queries can take a couple seconds even on localhost (it fans out to
-                # multiple engines). Use a small-but-not-tiny timeout so we don't treat "slow"
-                # as "down" and keep seeds disabled forever.
-                probe_timeout = 5.0
-                try:
-                    probe_timeout = float(getattr(settings, "http_timeout_seconds", 20) or 20)
-                except Exception:
-                    probe_timeout = 20.0
-                probe_timeout = max(1.5, min(5.0, probe_timeout))
-                async with httpx.AsyncClient(timeout=probe_timeout, follow_redirects=True) as client:
-                    resp0 = await client.get(probe_url, headers={"User-Agent": "tracker/0.1"})
-                if int(getattr(resp0, "status_code", 0) or 0) == 200:
-                    try:
-                        obj0 = resp0.json()
-                    except Exception:
-                        obj0 = None
-                    searx_ready = isinstance(obj0, dict) and isinstance(obj0.get("results"), list)
             except Exception:
-                searx_ready = False
+                probe = None
+            if probe and probe.healthy:
+                probe_healthy = True
+                searx_backend_block_until = None
+                searx_backend_block_reason = ""
+            elif probe is not None:
+                cooldown_seconds = max(
+                    300,
+                    min(1800, max(600, int(getattr(settings, "searxng_min_interval_seconds", 3600) or 3600) // 2)),
+                )
+                searx_backend_block_until = now2 + dt.timedelta(seconds=cooldown_seconds)
+                searx_backend_block_reason = (probe.failure_summary or "searxng_backend_degraded")[:4000]
             changed_any = False
             try:
                 for src, health, meta in repo.list_sources_with_health_and_meta():
@@ -899,10 +1333,26 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                         src.url = new_url
                         changed_any = True
 
+                    last_err = str(getattr(health, "last_error", "") or "")
+                    temp_blocked = last_err.startswith("temporary_block")
+                    if health and temp_blocked and (probe_healthy or searx_backend_block_until is not None):
+                        if int(getattr(health, "error_count", 0) or 0) != 0:
+                            health.error_count = 0
+                            changed_any = True
+                        if last_err:
+                            health.last_error = ""
+                            changed_any = True
+                        if getattr(health, "last_error_at", None) is not None:
+                            health.last_error_at = None
+                            changed_any = True
+                        target_next_fetch = now2 if probe_healthy else None
+                        if getattr(health, "next_fetch_at", None) != target_next_fetch:
+                            health.next_fetch_at = target_next_fetch
+                            changed_any = True
+
                     if not bool(getattr(src, "enabled", True)):
                         tags = str(getattr(meta, "tags", "") or "")
                         notes = str(getattr(meta, "notes", "") or "")
-                        last_err = str(getattr(health, "last_error", "") or "")
                         err_count = int(getattr(health, "error_count", 0) or 0) if health else 0
 
                         # Detect likely auto-disabled sources (due to errors), and also handle
@@ -922,7 +1372,7 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
 
                         enable_note = ""
                         should_enable = False
-                        if searx_ready:
+                        if probe_healthy:
                             if url_changed:
                                 should_enable = True
                                 enable_note = "[auto-enabled:searxng-repair:url_changed]"
@@ -958,18 +1408,20 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
             except Exception:
                 changed_any = False
 
-            if changed_any:
-                try:
-                    session.commit()
-                except Exception:
-                    try:
-                        session.rollback()
-                    except Exception:
-                        pass
             try:
-                repo.set_app_config("searxng_search_repair_last_at_utc", now2.isoformat() + "Z")
-            except Exception:
-                pass
+                repo.set_app_config_many(
+                    {
+                        "searxng_search_repair_last_at_utc": now2.isoformat() + "Z",
+                        _SEARXNG_BACKEND_BLOCK_UNTIL_KEY: (
+                            searx_backend_block_until.isoformat() + "Z"
+                            if searx_backend_block_until is not None
+                            else ""
+                        ),
+                        _SEARXNG_BACKEND_BLOCK_REASON_KEY: searx_backend_block_reason or "",
+                    }
+                )
+            except Exception as exc:
+                logger.warning("topic digest telegram push failed: key=%s err=%s", digest_key, _runner_exc_text(exc))
 
     out_lang = _output_lang(repo=repo, settings=settings)
     try:
@@ -1019,18 +1471,7 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
     except Exception:
         min_source_score = 0
     min_source_score = max(0, min(100, int(min_source_score)))
-    scores_by_source_id: dict[int, int] = {}
-    locked_by_source_id: dict[int, bool] = {}
-    try:
-        for sc in repo.list_source_scores(limit=10_000):
-            sid = int(getattr(sc, "source_id", 0) or 0)
-            if sid <= 0:
-                continue
-            scores_by_source_id[sid] = int(getattr(sc, "score", 0) or 0)
-            locked_by_source_id[sid] = bool(getattr(sc, "locked", False))
-    except Exception:
-        scores_by_source_id = {}
-        locked_by_source_id = {}
+    scores_by_source_id = _collect_hard_gate_source_scores(repo=repo)
 
 
     has_dingtalk = bool(settings.dingtalk_webhook_url)
@@ -1097,6 +1538,23 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
         source, bindings = by_source[source_id]
         prev_checked_at = source.last_checked_at
         now = dt.datetime.utcnow()
+
+        if (
+            source.type == "searxng_search"
+            and searx_backend_block_until is not None
+            and now < searx_backend_block_until
+        ):
+            for topic, _ts in bindings:
+                per_source.append(
+                    TickSourceResult(
+                        topic_name=topic.name,
+                        source_url=source.url,
+                        created=0,
+                        pushed_alerts=0,
+                        error=f"skipped: searxng backend degraded until {searx_backend_block_until.isoformat()}",
+                    )
+                )
+            continue
 
         min_interval = {
             "rss": settings.rss_min_interval_seconds,
@@ -1230,6 +1688,8 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                     return src.id, entries, None, None
                 except AuthRequiredError as exc:
                     return src.id, None, "auth_required", exc.meta()
+                except TemporaryFetchBlockError as exc:
+                    return src.id, None, "temporary_block", exc.meta()
                 except Exception as exc:
                     return src.id, None, str(exc), None
 
@@ -1403,6 +1863,91 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                     )
                 continue
 
+            if isinstance(update, dict) and update.get("error_type") == "temporary_block":
+                host = (update.get("host") or "").strip() or _url_host(source.url)
+                try:
+                    retry_after_seconds = max(0, int(update.get("retry_after_seconds") or 0))
+                except Exception:
+                    retry_after_seconds = 0
+                min_interval = {
+                    "rss": settings.rss_min_interval_seconds,
+                    "hn_search": settings.hn_min_interval_seconds,
+                    "searxng_search": settings.searxng_min_interval_seconds,
+                    "discourse": settings.discourse_min_interval_seconds,
+                    "html_list": settings.rss_min_interval_seconds,
+                }.get(source.type, settings.rss_min_interval_seconds)
+                default_backoff = max(
+                    int(min_interval or 0) * 2,
+                    int(getattr(settings, "source_backoff_base_seconds", 60) or 60) * 8,
+                    30 * 60,
+                )
+                backoff_seconds = min(
+                    int(getattr(settings, "source_backoff_max_seconds", 3600) or 3600),
+                    retry_after_seconds if retry_after_seconds > 0 else default_backoff,
+                )
+                if source.type == "searxng_search":
+                    searx_backend_block_until = now + dt.timedelta(seconds=max(300, min(1800, backoff_seconds)))
+                    raw_block_reason = str(update.get("reason") or "").strip() or str(error or "").strip()
+                    searx_backend_block_reason = (raw_block_reason or f"temporary_block: {host}")[:4000]
+                    health = repo.get_or_create_source_health(source_id=source.id)
+                    health.error_count = 0
+                    health.last_error = ""
+                    health.last_error_at = None
+                    health.next_fetch_at = None
+                    repo.set_app_config_many(
+                        {
+                            _SEARXNG_BACKEND_BLOCK_UNTIL_KEY: searx_backend_block_until.isoformat() + "Z",
+                            _SEARXNG_BACKEND_BLOCK_REASON_KEY: searx_backend_block_reason,
+                        }
+                    )
+                    logger.warning(
+                        "searxng backend circuit open: source_id=%s url=%s next_probe_after=%s reason=%s",
+                        source.id,
+                        source.url,
+                        searx_backend_block_until.isoformat(),
+                        searx_backend_block_reason,
+                    )
+                    for topic, _ts in bindings:
+                        per_source.append(
+                            TickSourceResult(
+                                topic_name=topic.name,
+                                source_url=source.url,
+                                created=0,
+                                pushed_alerts=0,
+                                error="temporary_block",
+                            )
+                        )
+                    continue
+                health = repo.get_or_create_source_health(source_id=source.id)
+                health.error_count = min(
+                    max(1, int(health.error_count or 0) + 1),
+                    max(1, int(getattr(settings, "source_disable_after_errors", 10) or 10) - 1),
+                )
+                health.last_error = (f"temporary_block: {host}" if not error else str(error))[:4000]
+                health.last_error_at = now
+                health.next_fetch_at = now + dt.timedelta(seconds=max(60, backoff_seconds))
+                session.commit()
+                logger.warning(
+                    "source fetch temporary_block: id=%s type=%s url=%s host=%s retry_after=%s next_fetch_at=%s",
+                    source.id,
+                    source.type,
+                    source.url,
+                    host,
+                    retry_after_seconds or "",
+                    health.next_fetch_at.isoformat() if health.next_fetch_at else "",
+                )
+                for topic, _ts in bindings:
+                    per_source.append(
+                        TickSourceResult(
+                            topic_name=topic.name,
+                            source_url=source.url,
+                            created=0,
+                            pushed_alerts=0,
+                            error="temporary_block",
+                        )
+                    )
+                continue
+
             logger.warning("source fetch failed: id=%s type=%s url=%s err=%s", source.id, source.type, source.url, error)
             health = repo.get_or_create_source_health(source_id=source.id)
             health.error_count += 1
@@ -1549,6 +2094,7 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                     exclude_domains=getattr(settings, "exclude_domains", ""),
                     simhash_lookback_days=settings.simhash_lookback_days,
                     match_mode=match_mode,
+                    immediate_alert_rules_json=str(getattr(settings, "immediate_alert_rules_json", "") or ""),
                 )
                 for d in created:
                     try:
@@ -1776,7 +2322,9 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
             if not policy or not policy.llm_curation_enabled:
                 continue
 
-            # Mix: new candidates + backlog "uncurated" candidates (e.g. downtime/backfill).
+            # Default: only process candidates created in THIS tick.
+            # Historical candidate backlog is intentionally excluded unless an operator
+            # explicitly requests backlog drain from a manual tick entrypoint.
             new_item_ids = list(new_candidate_ids_by_topic.get(topic_id) or [])
 
             items: list[Item] = []
@@ -1808,70 +2356,68 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                 pool_max_candidates = min(pool_max_candidates, 500)
 
             history_days = max(0, int(getattr(settings, "llm_curation_history_dedupe_days", 0) or 0))
-            backlog_days = max(7, history_days) if history_days > 0 else 7
-            backlog_since = dt.datetime.utcnow() - dt.timedelta(days=backlog_days)
-            # Always drain a little "uncurated" backlog even when new candidates are plentiful.
-            # Otherwise long-running topics (e.g. Profile streams) can starve backfilled candidates
-            # indefinitely and never surface important older items.
             items_new = list(items)
             items_new.sort(key=_item_key, reverse=True)
+            if drain_backlog:
+                backlog_days = max(7, history_days) if history_days > 0 else 7
+                backlog_since = dt.datetime.utcnow() - dt.timedelta(days=backlog_days)
 
-            backlog_quota = min(pool_max_candidates, max(1, min(5, pool_max_candidates // 4)))
-            backlog_items: list[Item] = []
-            try:
-                extra = repo.list_uncurated_item_topics_for_topic(
-                    topic=topic,
-                    since=backlog_since,
-                    limit=max(backlog_quota, 1),
-                    exclude_item_ids=set(seen_item_ids),
-                )
-            except Exception:
-                extra = []
-            for _it_row, it in extra:
-                if not it or it.id in seen_item_ids:
-                    continue
-                backlog_items.append(it)
-                seen_item_ids.add(int(it.id))
-                if len(backlog_items) >= backlog_quota:
-                    break
-
-            # Fairness: also drain at least one oldest uncurated candidate so long-running streams
-            # don't starve older-but-important backlog items forever.
-            if backlog_quota > 1 and len(backlog_items) < backlog_quota:
+                backlog_quota = min(pool_max_candidates, max(1, min(5, pool_max_candidates // 4)))
+                backlog_items: list[Item] = []
                 try:
-                    oldest = repo.list_uncurated_item_topics_for_topic(
+                    extra = repo.list_uncurated_item_topics_for_topic(
                         topic=topic,
                         since=backlog_since,
-                        limit=1,
+                        limit=max(backlog_quota, 1),
                         exclude_item_ids=set(seen_item_ids),
-                        order="asc",
                     )
                 except Exception:
-                    oldest = []
-                for _it_row, it in oldest:
+                    extra = []
+                for _it_row, it in extra:
                     if not it or it.id in seen_item_ids:
                         continue
                     backlog_items.append(it)
                     seen_item_ids.add(int(it.id))
-                    break
+                    if len(backlog_items) >= backlog_quota:
+                        break
 
-            new_quota = max(0, pool_max_candidates - len(backlog_items))
-            items = items_new[:new_quota] + backlog_items
-            if len(items) < pool_max_candidates:
-                needed = pool_max_candidates - len(items)
-                try:
-                    extra2 = repo.list_uncurated_item_topics_for_topic(
-                        topic=topic,
-                        since=backlog_since,
-                        limit=needed,
-                        exclude_item_ids=set(seen_item_ids),
-                    )
-                except Exception:
-                    extra2 = []
-                for _it_row, it in extra2:
-                    if it and it.id not in seen_item_ids:
-                        items.append(it)
+                if backlog_quota > 1 and len(backlog_items) < backlog_quota:
+                    try:
+                        oldest = repo.list_uncurated_item_topics_for_topic(
+                            topic=topic,
+                            since=backlog_since,
+                            limit=1,
+                            exclude_item_ids=set(seen_item_ids),
+                            order="asc",
+                        )
+                    except Exception:
+                        oldest = []
+                    for _it_row, it in oldest:
+                        if not it or it.id in seen_item_ids:
+                            continue
+                        backlog_items.append(it)
                         seen_item_ids.add(int(it.id))
+                        break
+
+                new_quota = max(0, pool_max_candidates - len(backlog_items))
+                items = items_new[:new_quota] + backlog_items
+                if len(items) < pool_max_candidates:
+                    needed = pool_max_candidates - len(items)
+                    try:
+                        extra2 = repo.list_uncurated_item_topics_for_topic(
+                            topic=topic,
+                            since=backlog_since,
+                            limit=needed,
+                            exclude_item_ids=set(seen_item_ids),
+                        )
+                    except Exception:
+                        extra2 = []
+                    for _it_row, it in extra2:
+                        if it and it.id not in seen_item_ids:
+                            items.append(it)
+                            seen_item_ids.add(int(it.id))
+            else:
+                items = items_new[:pool_max_candidates]
 
             if not items:
                 continue
@@ -1893,29 +2439,29 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
             # Optional full-text enrichment for better alert-time curation.
             if settings.fulltext_enabled:
                 max_fetches = max(0, int(settings.fulltext_max_fetches_per_topic or 0))
-                fetched = 0
+                attempted = 0
                 for it in items:
-                    if fetched >= max_fetches:
-                        break
                     url = (it.url or it.canonical_url or "").strip()
                     if not url.startswith(("http://", "https://")):
                         continue
+                    force_fetch = _should_force_fulltext_enrichment(url)
+                    if attempted >= max_fetches and not force_fetch:
+                        continue
                     try:
-                        parts = urlsplit(url)
-                        host = (parts.netloc or "").lower()
-                        path = parts.path or ""
+                        path = (urlsplit(url).path or "")
                     except Exception:
-                        host = ""
                         path = ""
-                    if host.endswith("nodeseek.com"):
+                    if _should_skip_fulltext_enrichment(url):
                         continue
                     # Internal API-like endpoints aren't meaningful to fulltext-enrich.
                     if path.startswith("/v1/models"):
                         continue
                     existing = repo.get_item_content(item_id=it.id)
-                    if existing and (existing.content_text or (existing.error or "").strip()):
+                    if _has_persisted_fulltext(existing):
                         continue
                     try:
+                        if not force_fetch:
+                            attempted += 1
                         cookie = await _cookie_header_cb(url)
                         text = await fetch_fulltext_for_url(
                             url=url,
@@ -1925,19 +2471,15 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                             cookie_header=cookie,
                         )
                     except Exception as exc:
-                        logger.info("fulltext fetch failed: url=%s err=%s", url, exc)
+                        logger.info("fulltext fetch failed (retry later): url=%s err=%s", url, exc)
                         try:
-                            err = str(exc or "").strip()
-                            if len(err) > 400:
-                                err = err[:400] + "…"
-                            repo.upsert_item_content(item_id=it.id, url=url, content_text="", error=err)
+                            repo.upsert_item_content(item_id=it.id, url=url, content_text="", error=_trim_fulltext_error(exc))
                         except Exception:
                             pass
                         continue
                     try:
                         repo.upsert_item_content(item_id=it.id, url=url, content_text=text, error="")
                         content_cache[it.id] = text.strip()
-                        fetched += 1
                     except Exception as exc:
                         logger.info("fulltext store failed: item_id=%s err=%s", it.id, exc)
 
@@ -2128,7 +2670,12 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                 else:
                     it_row.decision = "ignore"
                     hint = "ignored"
-                it_row.reason = _format_llm_curation_reason(summary=d.summary, why=d.why, hint=hint)
+                it_row.reason = _format_llm_curation_reason(
+                    summary=d.summary,
+                    why=d.why,
+                    hint=hint,
+                    rank_score=d.rank_score,
+                )
             session.commit()
 
             if push and alert_item_ids and has_any_channel:
@@ -2317,7 +2864,9 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                     continue
                 if item_id_i <= 0:
                     continue
-                if last_seen_item_id > 0 and item_id_i <= last_seen_item_id and item_id_i not in created_item_ids:
+                if not drain_backlog and item_id_i not in created_item_ids:
+                    continue
+                if drain_backlog and last_seen_item_id > 0 and item_id_i <= last_seen_item_id and item_id_i not in created_item_ids:
                     continue
 
                 topics_by_item_id.setdefault(item_id_i, set()).add(int(getattr(topic, "id", 0) or 0))
@@ -2552,6 +3101,7 @@ async def run_tick(*, session: Session, settings: Settings, push: bool) -> TickR
                                 summary=d.summary,
                                 why=d.why,
                                 hint="priority_lane_alert",
+                                rank_score=d.rank_score,
                             )
                             session.commit()
 
@@ -3435,6 +3985,7 @@ async def run_digest(
     topic_ids: list[int] | None = None,
     key_suffix: str | None = None,
     now: dt.datetime | None = None,
+    finalize_on_llm_failure: bool = False,
 ) -> DigestResult:
     repo = Repo(session)
     # Apply DB-backed dynamic overrides for non-secret Settings fields.
@@ -3493,15 +4044,7 @@ async def run_digest(
     except Exception:
         min_source_score = 0
     min_source_score = max(0, min(100, int(min_source_score)))
-    scores_by_source_id: dict[int, int] = {}
-    try:
-        for sc in repo.list_source_scores(limit=10_000):
-            sid = int(getattr(sc, "source_id", 0) or 0)
-            if sid <= 0:
-                continue
-            scores_by_source_id[sid] = int(getattr(sc, "score", 0) or 0)
-    except Exception:
-        scores_by_source_id = {}
+    scores_by_source_id = _collect_hard_gate_source_scores(repo=repo)
 
 
     def _safe_url_for_item(item: Item) -> str:
@@ -3518,6 +4061,274 @@ async def run_digest(
         # Static cookie jar only.
         static_cookie = cookie_header_for_url(url=url, cookie_jar=cookie_jar)
         return static_cookie or None
+
+    def _ignore_candidates_after_llm_failure(
+        *,
+        topic: Topic,
+        batch: list[dict],
+        exc: Exception | None,
+    ) -> int:
+        item_ids: list[int] = []
+        seen: set[int] = set()
+        err = str(exc or "").strip()
+        if len(err) > 300:
+            err = err[:300].rstrip() + "…"
+        reason = (
+            f"autorepair_skip: unresolved after llm curation failure ({err})"
+            if err
+            else "autorepair_skip: unresolved after llm curation failure"
+        )
+        while True:
+            pending_rows = repo.list_uncurated_item_topics_for_topic(
+                topic=topic,
+                since=since,
+                until=now_utc,
+                limit=500,
+                order="asc",
+            )
+            if not pending_rows:
+                break
+            batch_ignored: list[int] = []
+            for it_row, item in pending_rows:
+                item_id = int(getattr(item, "id", 0) or 0)
+                if item_id <= 0 or item_id in seen:
+                    continue
+                seen.add(item_id)
+                reason_i = reason
+                try:
+                    content_row = repo.get_item_content(item_id=item_id)
+                except Exception:
+                    content_row = None
+                if content_row is not None and not _has_persisted_fulltext(content_row):
+                    content_err = (getattr(content_row, "error", "") or "").strip()
+                    reason_i = (
+                        f"autorepair_skip: unresolved after fulltext fetch failure ({content_err})"
+                        if content_err
+                        else "autorepair_skip: unresolved after fulltext fetch failure"
+                    )
+                it_row.decision = "ignore"
+                it_row.reason = reason_i
+                batch_ignored.append(item_id)
+            if not batch_ignored:
+                break
+            session.commit()
+            item_ids.extend(batch_ignored)
+            try:
+                session.expire_all()
+            except Exception:
+                pass
+        if not item_ids:
+            session.rollback()
+            return 0
+        logger.warning(
+            "llm curation auto-repair skipped unresolved candidates after LLM failure: topic=%s count=%s sample=%s err=%s",
+            topic.name,
+            len(item_ids),
+            ",".join(str(x) for x in item_ids[:20]),
+            err or type(exc).__name__,
+        )
+        return len(item_ids)
+
+    async def _drain_topic_candidates_without_hard_caps(
+        *,
+        topic: Topic,
+        policy_prompt: str,
+        gate: TopicGateConfig,
+    ) -> None:
+        content_cache: dict[int, str] = {}
+
+        def _best_text(item_id: int, fallback: str) -> str:
+            cached = content_cache.get(item_id)
+            if cached is not None:
+                return cached
+            row = repo.get_item_content(item_id=item_id)
+            txt = (row.content_text if row and row.content_text else fallback).strip()
+            content_cache[item_id] = txt
+            return txt
+
+        while True:
+            pool_rows = repo.list_item_topics_for_curation(
+                topic=topic,
+                since=since,
+                until=now_utc,
+                limit=500,
+                decisions=["candidate"],
+            )
+            if not pool_rows:
+                break
+
+            progress = False
+            pool_rows, dropped_rows = _filter_topic_gate_candidate_rows(
+                pool_rows,
+                min_score=gate.candidate_min_score,
+                source_url_by_id=source_url_by_id,
+                scores_by_source_id=scores_by_source_id,
+                domain_policy=domain_policy,
+            )
+            if dropped_rows:
+                threshold = int(gate.candidate_min_score or 0)
+                for it_row, item in dropped_rows:
+                    source_score = _effective_source_score(
+                        source_id=int(getattr(item, "source_id", 0) or 0),
+                        source_url=source_url_by_id.get(int(getattr(item, "source_id", 0) or 0), ""),
+                        item_url=str(getattr(item, "canonical_url", "") or getattr(item, "url", "") or ""),
+                        scores_by_source_id=scores_by_source_id,
+                        domain_policy=domain_policy,
+                    )
+                    it_row.decision = "ignore"
+                    it_row.reason = (
+                        f"topic_gate: candidate_min_score={threshold} "
+                        f"score={_topic_gate_score(it_row, source_score=source_score)}"
+                    )
+                session.commit()
+                progress = True
+            if not pool_rows:
+                if progress:
+                    continue
+                break
+
+            if settings.fulltext_enabled:
+                max_fetches = max(0, int(settings.fulltext_max_fetches_per_topic or 0))
+                attempted = 0
+                for _it_row, item in pool_rows:
+                    url = (item.url or item.canonical_url or "").strip()
+                    if not url.startswith(("http://", "https://")):
+                        continue
+                    force_fetch = _should_force_fulltext_enrichment(url)
+                    if attempted >= max_fetches and not force_fetch:
+                        continue
+                    try:
+                        path = (urlsplit(url).path or "")
+                    except Exception:
+                        path = ""
+                    if _should_skip_fulltext_enrichment(url):
+                        continue
+                    if path.startswith("/v1/models"):
+                        continue
+                    existing = repo.get_item_content(item_id=item.id)
+                    if _has_persisted_fulltext(existing):
+                        continue
+                    try:
+                        if not force_fetch:
+                            attempted += 1
+                        cookie = await _cookie_header_cb(url)
+                        text = await fetch_fulltext_for_url(
+                            url=url,
+                            timeout_seconds=int(settings.fulltext_timeout_seconds or settings.http_timeout_seconds),
+                            max_chars=int(settings.fulltext_max_chars or 1),
+                            discourse_cookie=((settings.discourse_cookie or "").strip() or cookie or None),
+                            cookie_header=cookie,
+                        )
+                    except Exception as exc:
+                        logger.info("fulltext fetch failed (retry later): url=%s err=%s", url, exc)
+                        try:
+                            repo.upsert_item_content(item_id=item.id, url=url, content_text="", error=_trim_fulltext_error(exc))
+                        except Exception:
+                            pass
+                        continue
+                    try:
+                        repo.upsert_item_content(item_id=item.id, url=url, content_text=text, error="")
+                        content_cache[item.id] = text.strip()
+                    except Exception as exc:
+                        logger.info("fulltext store failed: item_id=%s err=%s", item.id, exc)
+
+            candidates: list[dict] = []
+            for _it, item in pool_rows:
+                candidates.append(
+                    {
+                        "item_id": item.id,
+                        "title": item.title,
+                        "url": item.canonical_url,
+                        "snippet": _best_text(item.id, (item.content_text or "")),
+                    }
+                )
+            _annotate_candidates_domain_feedback(repo=repo, candidates=candidates, domain_policy=domain_policy)
+            candidate_batches = _chunk_llm_curation_candidates(candidates, settings=settings)
+
+            for batch in candidate_batches:
+                llm_failure: Exception | None = None
+                try:
+                    decisions = await llm_curate_topic_items(
+                        repo=repo,
+                        settings=settings_out,
+                        topic=topic,
+                        policy_prompt=policy_prompt,
+                        candidates=batch,
+                        recent_sent=[],
+                        max_digest=len(batch),
+                        max_alert=len(batch),
+                        usage_cb=llm_usage_cb,
+                    )
+                except Exception as exc:
+                    session.rollback()
+                    decisions = None
+                    llm_failure = exc
+                    logger.warning("llm curation failed (digest llm-first): topic=%s err=%r", topic.name, exc)
+
+                if decisions is None:
+                    if bool(getattr(settings, "llm_curation_fail_open", False)):
+                        try:
+                            max_fb = max(0, int(getattr(settings, "llm_curation_fail_open_max_digest", 3) or 3))
+                            max_fb = max(0, min(max_fb, len(batch)))
+                            if max_fb > 0:
+                                keep_ids: list[int] | None = None
+                                try:
+                                    keep_ids = await llm_triage_topic_items(
+                                        repo=repo,
+                                        settings=settings_out,
+                                        topic=topic,
+                                        policy_prompt=policy_prompt,
+                                        candidates=batch,
+                                        recent_sent=[],
+                                        max_keep=max_fb,
+                                        usage_cb=llm_usage_cb,
+                                    )
+                                except Exception as exc:
+                                    logger.info("llm triage failed (llm-first fail-open): topic=%s err=%s", topic.name, exc)
+                                    keep_ids = None
+                                if keep_ids:
+                                    by_id = {int(c["item_id"]): c for c in batch if int(c.get("item_id") or 0) > 0}
+                                    picked: list[int] = []
+                                    for iid in keep_ids:
+                                        if iid in by_id and iid not in picked:
+                                            picked.append(iid)
+                                        if len(picked) >= max_fb:
+                                            break
+                                    for iid in picked:
+                                        it_row = repo.get_item_topic(item_id=iid, topic_id=topic.id)
+                                        if not it_row:
+                                            continue
+                                        it_row.decision = "digest"
+                                        it_row.reason = "llm_fallback: llm curation failed; triage-only digest"
+                                    session.commit()
+                                    progress = True
+                                    continue
+                        except Exception as exc:
+                            session.rollback()
+                            logger.info("llm-first fail-open fallback failed: topic=%s err=%s", topic.name, exc)
+                    if finalize_on_llm_failure:
+                        ignored = _ignore_candidates_after_llm_failure(topic=topic, batch=batch, exc=llm_failure)
+                        if ignored > 0:
+                            progress = True
+                            continue
+                    return
+
+                for d in decisions:
+                    it_row = repo.get_item_topic(item_id=d.item_id, topic_id=topic.id)
+                    if not it_row:
+                        continue
+                    it_row.decision = d.decision
+                    it_row.reason = _format_llm_curation_reason(
+                        summary=d.summary,
+                        why=d.why,
+                        hint="digest",
+                        rank_score=d.rank_score,
+                    )
+                session.commit()
+                progress = True
+
+            if not progress:
+                break
 
     per_topic: list[DigestTopicResult] = []
 
@@ -3538,16 +4349,76 @@ async def run_digest(
             and policy
             and policy.llm_curation_enabled
         )
+        gate = repo.get_effective_topic_gate_config(topic_id=topic.id)
+        candidate_runtime = _topic_gate_candidate_runtime(settings=settings, gate=gate)
+        hard_cap_candidates = max(0, int(candidate_runtime.get("max_candidates", 0) or 0))
+        hard_cap_digest = (
+            max(0, int(gate.max_digest_items or 0))
+            if gate.max_digest_items is not None
+            else max(0, int(getattr(settings, "llm_curation_max_digest", 0) or 0))
+        )
+        hard_cap_alert = (
+            max(0, int(gate.max_alert_items or 0))
+            if gate.max_alert_items is not None
+            else max(0, int(getattr(settings, "llm_curation_max_alert", 0) or 0))
+        )
+        triage_enabled = bool(candidate_runtime.get("triage_enabled", False))
+        llm_first_unbounded_mode = bool(
+            use_llm_curation
+            and hard_cap_candidates <= 0
+            and hard_cap_digest <= 0
+            and hard_cap_alert <= 0
+            and (not triage_enabled)
+            and (not bool(candidate_runtime.get("input_dedupe_enabled", False)))
+        )
         if use_llm_curation:
-            # Include legacy heuristic "digest" decisions so LLM curation can cap the daily digest
-            # even if the topic was enabled mid-day.
-            pool_rows = repo.list_item_topics_for_curation(
-                topic=topic,
-                since=since,
-                limit=500,
-                decisions=["candidate", "digest"],
-            )
-            if pool_rows:
+            if llm_first_unbounded_mode:
+                await _drain_topic_candidates_without_hard_caps(
+                    topic=topic,
+                    policy_prompt=policy.llm_curation_prompt,
+                    gate=gate,
+                )
+                items = repo.list_item_topics_for_digest(topic=topic, since=since, until=now_utc)
+                if not items:
+                    logger.info("digest llm-first drain produced no final items: topic=%s", topic.name)
+
+            # Legacy constrained mode: include pre-existing "digest" rows so operator caps can
+            # re-balance a bounded daily digest. In llm-first mode we drain candidate backlog
+            # above and intentionally do not rewrite existing finals here.
+            pool_rows = []
+            if not llm_first_unbounded_mode:
+                pool_rows = repo.list_item_topics_for_curation(
+                    topic=topic,
+                    since=since,
+                    until=now_utc,
+                    limit=500,
+                    decisions=["candidate", "digest"],
+                )
+            if pool_rows and (not llm_first_unbounded_mode):
+                pool_rows, dropped_rows = _filter_topic_gate_candidate_rows(
+                    pool_rows,
+                    min_score=gate.candidate_min_score,
+                    source_url_by_id=source_url_by_id,
+                    scores_by_source_id=scores_by_source_id,
+                    domain_policy=domain_policy,
+                )
+                if dropped_rows:
+                    threshold = int(gate.candidate_min_score or 0)
+                    for it_row, item in dropped_rows:
+                        source_score = _effective_source_score(
+                            source_id=int(getattr(item, "source_id", 0) or 0),
+                            source_url=source_url_by_id.get(int(getattr(item, "source_id", 0) or 0), ""),
+                            item_url=str(getattr(item, "canonical_url", "") or getattr(item, "url", "") or ""),
+                            scores_by_source_id=scores_by_source_id,
+                            domain_policy=domain_policy,
+                        )
+                        it_row.decision = "ignore"
+                        it_row.reason = (
+                            f"topic_gate: candidate_min_score={threshold} "
+                            f"score={_topic_gate_score(it_row, source_score=source_score)}"
+                        )
+                    session.commit()
+
                 content_cache: dict[int, str] = {}
 
                 def _best_text(item_id: int, fallback: str) -> str:
@@ -3563,29 +4434,29 @@ async def run_digest(
                 if settings.fulltext_enabled:
                     max_fetches = max(0, int(settings.fulltext_max_fetches_per_topic or 0))
                     prefetch_max_candidates = max(1, int(settings.llm_curation_max_candidates or 1))
-                    fetched = 0
+                    attempted = 0
                     for _it_row, item in pool_rows[:prefetch_max_candidates]:
-                        if fetched >= max_fetches:
-                            break
                         url = (item.url or item.canonical_url or "").strip()
                         if not url.startswith(("http://", "https://")):
                             continue
+                        force_fetch = _should_force_fulltext_enrichment(url)
+                        if attempted >= max_fetches and not force_fetch:
+                            continue
                         try:
-                            parts = urlsplit(url)
-                            host = (parts.netloc or "").lower()
-                            path = parts.path or ""
+                            path = (urlsplit(url).path or "")
                         except Exception:
-                            host = ""
                             path = ""
-                        if host.endswith("nodeseek.com"):
+                        if _should_skip_fulltext_enrichment(url):
                             continue
                         # Internal API-like endpoints aren't meaningful to fulltext-enrich.
                         if path.startswith("/v1/models"):
                             continue
                         existing = repo.get_item_content(item_id=item.id)
-                        if existing and (existing.content_text or (existing.error or "").strip()):
+                        if _has_persisted_fulltext(existing):
                             continue
                         try:
+                            if not force_fetch:
+                                attempted += 1
                             cookie = await _cookie_header_cb(url)
                             text = await fetch_fulltext_for_url(
                                 url=url,
@@ -3595,19 +4466,15 @@ async def run_digest(
                                 cookie_header=cookie,
                             )
                         except Exception as exc:
-                            logger.info("fulltext fetch failed: url=%s err=%s", url, exc)
+                            logger.info("fulltext fetch failed (retry later): url=%s err=%s", url, exc)
                             try:
-                                err = str(exc or "").strip()
-                                if len(err) > 400:
-                                    err = err[:400] + "…"
-                                repo.upsert_item_content(item_id=item.id, url=url, content_text="", error=err)
+                                repo.upsert_item_content(item_id=item.id, url=url, content_text="", error=_trim_fulltext_error(exc))
                             except Exception:
                                 pass
                             continue
                         try:
                             repo.upsert_item_content(item_id=item.id, url=url, content_text=text, error="")
                             content_cache[item.id] = text.strip()
-                            fetched += 1
                         except Exception as exc:
                             logger.info("fulltext store failed: item_id=%s err=%s", item.id, exc)
 
@@ -3616,8 +4483,9 @@ async def run_digest(
                 #
                 # Note: we only look at items *before* the current digest window (`until=since`),
                 # so we don't accidentally filter the current pool against itself.
+                dedupe_enabled = bool(candidate_runtime.get("input_dedupe_enabled", False))
                 history_seen: list[int] = []
-                history_days = max(0, int(settings.llm_curation_history_dedupe_days or 0))
+                history_days = max(0, int(candidate_runtime.get("history_dedupe_days", 0) or 0)) if dedupe_enabled else 0
                 recent_sent: list[dict[str, str]] = []
                 if history_days > 0:
                     hist_since = dt.datetime.utcnow() - dt.timedelta(days=history_days)
@@ -3647,18 +4515,16 @@ async def run_digest(
                 for it_row, _item in pool_rows:
                     it_row.decision = "candidate"
 
-                final_max_candidates = max(1, int(settings.llm_curation_max_candidates or 1))
-                triage_enabled = bool(getattr(settings, "llm_curation_triage_enabled", False)) and bool(
-                    (getattr(settings, "llm_model_mini", None) or "").strip()
-                )
+                final_max_candidates = hard_cap_candidates if hard_cap_candidates > 0 else len(pool_rows)
+                final_max_candidates = max(1, int(final_max_candidates or 1))
                 pool_max_candidates = final_max_candidates
                 if triage_enabled:
                     try:
-                        pool_max_candidates = int(getattr(settings, "llm_curation_triage_pool_max_candidates", 0) or 0)
+                        pool_max_candidates = int(candidate_runtime.get("triage_pool_max_candidates", 0) or 0)
                     except Exception:
                         pool_max_candidates = 0
                     if pool_max_candidates <= 0:
-                        pool_max_candidates = final_max_candidates
+                        pool_max_candidates = len(pool_rows) if hard_cap_candidates <= 0 else final_max_candidates
                     pool_max_candidates = max(pool_max_candidates, final_max_candidates)
                     pool_max_candidates = min(pool_max_candidates, 500)
 
@@ -3709,11 +4575,11 @@ async def run_digest(
                 for _it, item in pool_rows:
                     if len(candidates) >= pool_max_candidates:
                         break
-                    if str(item.canonical_url or "").strip() in history_urls:
-                        continue
                     snippet = _best_text(item.id, (item.content_text or ""))
+                    if dedupe_enabled and str(item.canonical_url or "").strip() in history_urls:
+                        continue
                     text_for_dedupe = (snippet or "").strip() or (item.title or "").strip()
-                    if text_for_dedupe:
+                    if dedupe_enabled and text_for_dedupe:
                         sh = simhash64(text_for_dedupe)
                         if is_near_duplicate(new_simhash=sh, existing_simhashes=seen):
                             continue
@@ -3723,7 +4589,7 @@ async def run_digest(
                         url=str(item.canonical_url or "").strip(),
                         snippet=(snippet or "").strip(),
                     )
-                    if story:
+                    if dedupe_enabled and story:
                         sh = simhash64(story)
                         if is_near_duplicate(new_simhash=sh, existing_simhashes=seen_story, max_distance=6):
                             continue
@@ -3749,7 +4615,7 @@ async def run_digest(
                 if triage_enabled and len(candidates) > final_max_candidates:
                     keep_max = 0
                     try:
-                        keep_max = int(getattr(settings, "llm_curation_triage_keep_candidates", 0) or 0)
+                        keep_max = int(candidate_runtime.get("triage_keep_candidates", 0) or 0)
                     except Exception:
                         keep_max = 0
                     if keep_max <= 0:
@@ -3781,22 +4647,29 @@ async def run_digest(
                                 by_id[cid] = c
                         candidates = [by_id[i] for i in triage_keep_ids if i in by_id]
 
-                try:
-                    decisions = await llm_curate_topic_items(
-                        repo=repo,
-                        settings=settings_out,
-                        topic=topic,
-                        policy_prompt=policy.llm_curation_prompt,
-                        candidates=candidates,
-                        recent_sent=recent_sent,
-                        max_digest=max(0, int(settings.llm_curation_max_digest or 0)),
-                        max_alert=max(0, int(settings.llm_curation_max_alert or 0)),
-                        usage_cb=llm_usage_cb,
-                    )
-                except Exception as exc:
-                    session.rollback()
-                    decisions = None
-                    logger.warning("llm curation failed (digest): topic=%s err=%r", topic.name, exc)
+                llm_failure: Exception | None = None
+                if not candidates:
+                    decisions = []
+                else:
+                    try:
+                        prompt_max_digest = hard_cap_digest if hard_cap_digest > 0 else len(candidates)
+                        prompt_max_alert = hard_cap_alert if hard_cap_alert > 0 else len(candidates)
+                        decisions = await llm_curate_topic_items(
+                            repo=repo,
+                            settings=settings_out,
+                            topic=topic,
+                            policy_prompt=policy.llm_curation_prompt,
+                            candidates=candidates,
+                            recent_sent=recent_sent,
+                            max_digest=max(0, int(prompt_max_digest or 0)),
+                            max_alert=max(0, int(prompt_max_alert or 0)),
+                            usage_cb=llm_usage_cb,
+                        )
+                    except Exception as exc:
+                        session.rollback()
+                        decisions = None
+                        llm_failure = exc
+                        logger.warning("llm curation failed (digest): topic=%s err=%r", topic.name, exc)
 
                 if decisions is None:
                     session.rollback()
@@ -3806,7 +4679,7 @@ async def run_digest(
                         try:
                             fail_open_max = max(0, int(getattr(settings, "llm_curation_fail_open_max_digest", 3) or 3))
                             cap = max(0, int(settings.llm_curation_max_digest or 0))
-                            max_fb = min(fail_open_max, cap) if cap > 0 else 0
+                            max_fb = min(fail_open_max, cap) if cap > 0 else min(fail_open_max, len(candidates))
                             max_fb = max(0, min(max_fb, len(candidates)))
                             if max_fb > 0 and candidates:
                                 # AI-only fallback: attempt to use the mini triage model to pick a tiny set.
@@ -3854,16 +4727,23 @@ async def run_digest(
                         except Exception as exc:
                             session.rollback()
                             logger.info("llm curation fail-open fallback failed: topic=%s err=%s", topic.name, exc)
+                    if finalize_on_llm_failure:
+                        _ignore_candidates_after_llm_failure(topic=topic, batch=candidates, exc=llm_failure)
                 else:
                     for d in decisions:
                         it_row = repo.get_item_topic(item_id=d.item_id, topic_id=topic.id)
                         if not it_row:
                             continue
                         it_row.decision = d.decision
-                        it_row.reason = _format_llm_curation_reason(summary=d.summary, why=d.why, hint="digest")
+                        it_row.reason = _format_llm_curation_reason(
+                            summary=d.summary,
+                            why=d.why,
+                            hint="digest",
+                            rank_score=d.rank_score,
+                        )
                     session.commit()
 
-        items = repo.list_item_topics_for_digest(topic=topic, since=since)
+        items = repo.list_item_topics_for_digest(topic=topic, since=since, until=now_utc)
 
         prev_since = since - dt.timedelta(hours=hours)
         prev_items = repo.list_item_topics_for_digest_window(topic=topic, since=prev_since, until=since)
@@ -3916,77 +4796,25 @@ async def run_digest(
                 )
             ]
 
-        def _dedupe_digest_rows(rows: list[tuple[ItemTopic, Item]]) -> list[tuple[ItemTopic, Item]]:
-            """
-            Curated Info is a de-dupe surface.
-
-            Deduping is intentionally conservative:
-            - primary key: canonicalized URL (if present)
-            - fallback key: normalized title (only when URL is missing)
-            """
-            by_key: dict[str, tuple[ItemTopic, Item]] = {}
-
-            def _pri(decision: str) -> int:
-                d = (decision or "").strip().lower()
-                return 0 if d == "alert" else 1
-
-            for it_row, item in rows:
-                try:
-                    iid = int(getattr(item, "id", 0) or 0)
-                except Exception:
-                    iid = 0
-
-                url_raw = ""
-                try:
-                    url_raw = str(
-                        url_overrides.get(iid)
-                        or getattr(item, "canonical_url", None)
-                        or getattr(item, "url", None)
-                        or ""
-                    ).strip()
-                except Exception:
-                    url_raw = ""
-                url_key = canonicalize_url(url_raw) if url_raw else ""
-
-                title_raw = ""
-                try:
-                    title_raw = str(getattr(item, "title", "") or "").strip()
-                except Exception:
-                    title_raw = ""
-                title_key = normalize_text(title_raw).casefold() if title_raw else ""
-
-                key = url_key or (f"title:{title_key}" if title_key else f"id:{iid}")
-                existing = by_key.get(key)
-                if existing is None:
-                    by_key[key] = (it_row, item)
-                    continue
-
-                ex_it, ex_item = existing
-                if _pri(str(getattr(it_row, "decision", "") or "")) < _pri(str(getattr(ex_it, "decision", "") or "")):
-                    by_key[key] = (it_row, item)
-                    continue
-                if _pri(str(getattr(it_row, "decision", "") or "")) > _pri(str(getattr(ex_it, "decision", "") or "")):
-                    continue
-
-                # Same priority: keep the newer published/created timestamp.
-                try:
-                    ts_new = getattr(item, "published_at", None) or getattr(item, "created_at", None)
-                except Exception:
-                    ts_new = None
-                try:
-                    ts_old = getattr(ex_item, "published_at", None) or getattr(ex_item, "created_at", None)
-                except Exception:
-                    ts_old = None
-                try:
-                    if isinstance(ts_new, dt.datetime) and isinstance(ts_old, dt.datetime) and ts_new > ts_old:
-                        by_key[key] = (it_row, item)
-                except Exception:
-                    pass
-
-            return list(by_key.values())
-
-        items = _dedupe_digest_rows(items)
-        prev_items = _dedupe_digest_rows(prev_items)
+        items = _dedupe_ranked_item_rows(
+            items,
+            url_overrides_by_item_id=url_overrides,
+            dedupe_strength=gate.push_dedupe_strength,
+        )
+        prev_items = _dedupe_ranked_item_rows(
+            prev_items,
+            url_overrides_by_item_id=url_overrides,
+            dedupe_strength=gate.push_dedupe_strength,
+        )
+        items = _apply_topic_gate_push_filters(
+            items,
+            min_score=gate.push_min_score,
+            max_digest_items=gate.max_digest_items,
+            max_alert_items=gate.max_alert_items,
+            source_url_by_id=source_url_by_id,
+            scores_by_source_id=scores_by_source_id,
+            domain_policy=domain_policy,
+        )
 
         prev_total = len(prev_items)
         prev_alerts = sum(1 for it, _item in prev_items if it.decision == "alert")
@@ -4109,6 +4937,7 @@ async def run_curated_info(
     key_suffix: str | None = None,
     now: dt.datetime | None = None,
     allow_recovery_enqueue: bool = True,
+    allow_auto_repair: bool = True,
 ) -> CuratedInfoResult:
     """
     Build ONE cross-topic Curated Info batch (de-dupe only; no interpretation).
@@ -4144,14 +4973,72 @@ async def run_curated_info(
             for topic in repo.list_topics():
                 if not getattr(topic, "enabled", True):
                     continue
-                pending = repo.list_uncurated_item_topics_for_topic(topic=topic, since=since, limit=1)
+                pending = repo.list_uncurated_item_topics_for_topic(
+                    topic=topic,
+                    since=since,
+                    until=now_utc,
+                    limit=1,
+                )
                 if pending:
                     out.append(int(topic.id))
         except Exception:
             return []
         return out
 
-    def _recovery_pending_markdown() -> str:
+    def _skip_terminal_fulltext_failures_after_auto_repair(*, topic_ids: list[int]) -> list[int]:
+        wanted_topic_ids = {int(tid) for tid in (topic_ids or []) if int(tid or 0) > 0}
+        if not wanted_topic_ids:
+            return []
+
+        skipped_item_ids: list[int] = []
+        try:
+            for topic in repo.list_topics():
+                topic_id = int(getattr(topic, "id", 0) or 0)
+                if topic_id not in wanted_topic_ids or not getattr(topic, "enabled", True):
+                    continue
+                while True:
+                    pending_rows = repo.list_uncurated_item_topics_for_topic(
+                        topic=topic,
+                        since=since,
+                        until=now_utc,
+                        limit=200,
+                        order="asc",
+                    )
+                    batch_skipped: list[int] = []
+                    for it_row, item in pending_rows:
+                        content_row = repo.get_item_content(item_id=int(item.id))
+                        if content_row is None:
+                            continue
+                        if _has_persisted_fulltext(content_row):
+                            continue
+                        it_row.decision = "ignore"
+                        err = (getattr(content_row, "error", "") or "").strip()
+                        it_row.reason = (
+                            f"autorepair_skip: unresolved after fulltext fetch failure ({err})"
+                            if err
+                            else "autorepair_skip: unresolved after fulltext fetch failure"
+                        )
+                        batch_skipped.append(int(item.id))
+                    if not batch_skipped:
+                        break
+                    session.commit()
+                    skipped_item_ids.extend(batch_skipped)
+                    logger.warning(
+                        "curated info auto-repair skipped terminal fulltext failures: topic=%s items=%s",
+                        getattr(topic, "name", topic_id),
+                        ",".join(str(x) for x in batch_skipped),
+                    )
+                    try:
+                        session.expire_all()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            session.rollback()
+            logger.warning("curated info failed to skip terminal fulltext failures: %s", exc)
+            return []
+        return skipped_item_ids
+
+    def _recovery_pending_markdown(*, queued: bool) -> str:
         is_zh = bool((out_lang or "").strip().lower().startswith("zh")) or (out_lang or "").strip() in {
             "中文",
             "简体中文",
@@ -4171,15 +5058,25 @@ async def run_curated_info(
         except Exception:
             window_text = f"{since.isoformat(timespec='minutes')}–{now_utc.isoformat(timespec='minutes')} UTC"
         if is_zh:
+            reason = (
+                "- 原因: 当前窗口仍有未完成的候选项，已加入后台恢复队列；恢复后会自动重放当前窗口。\n"
+                if queued
+                else "- 原因: 当前窗口仍有未完成的候选项；本轮不会推送，直到该窗口处理完成。\n"
+            )
             return (
                 "# 参考消息暂缓\n\n"
                 f"- 窗口: {window_text}\n"
-                "- 原因: LLM 供应商当前不可用，已加入后台恢复队列；恢复后会自动重放当前窗口。\n"
+                f"{reason}"
             )
+        reason = (
+            "- Reason: the current window still has unfinished candidates; it has been queued for background replay.\n"
+            if queued
+            else "- Reason: the current window still has unfinished candidates; this run will not push until the window is fully processed.\n"
+        )
         return (
             "# Curated Info delayed\n\n"
             f"- Window: {window_text}\n"
-            "- Reason: the LLM provider is currently unavailable; this window has been queued for background replay.\n"
+            f"{reason}"
         )
 
     def _recent_curated_rows() -> list[tuple[object, object, object, object]]:
@@ -4187,6 +5084,7 @@ async def run_curated_info(
             topic=None,
             decisions=["alert", "digest"],
             since=since,
+            until=now_utc,
             limit=5000,
         )
 
@@ -4195,7 +5093,7 @@ async def run_curated_info(
     recovery_pending_topic_ids: list[int] = []
     recovery_enqueued = False
 
-    if stalled_topic_ids:
+    if stalled_topic_ids and allow_auto_repair:
         log_fn = logger.warning if not rows else logger.info
         log_fn(
             "curated info found pending candidate backlog; auto-running digest repair: hours=%s topics=%s preexisting_rows=%s",
@@ -4212,11 +5110,18 @@ async def run_curated_info(
                 topic_ids=stalled_topic_ids,
                 key_suffix=f"autorepair-{now_utc.strftime('%Y%m%d%H%M%S')}",
                 now=now_utc,
+                finalize_on_llm_failure=True,
             )
             try:
                 session.expire_all()
             except Exception:
                 pass
+            skipped_terminal_item_ids = _skip_terminal_fulltext_failures_after_auto_repair(topic_ids=stalled_topic_ids)
+            if skipped_terminal_item_ids:
+                try:
+                    session.expire_all()
+                except Exception:
+                    pass
             rows = _recent_curated_rows()
         except Exception as exc:
             logger.warning("curated info auto-repair failed: %s", exc)
@@ -4228,7 +5133,8 @@ async def run_curated_info(
                 ",".join(str(x) for x in recovery_pending_topic_ids),
                 len(rows),
             )
-            if allow_recovery_enqueue:
+            auto_enqueue_enabled = bool(getattr(settings, "curated_recovery_auto_enqueue_enabled", False))
+            if allow_recovery_enqueue and auto_enqueue_enabled:
                 try:
                     from tracker.curated_recovery_queue import enqueue_curated_recovery_job
 
@@ -4242,14 +5148,30 @@ async def run_curated_info(
                     )
                 except Exception as exc:
                     logger.warning("curated recovery enqueue failed: %s", exc)
-            if (not allow_recovery_enqueue) or (not rows and recovery_enqueued):
+            if push:
                 return CuratedInfoResult(
                     since=since,
                     pushed=0,
-                    markdown=_recovery_pending_markdown(),
+                    markdown=_recovery_pending_markdown(queued=bool(recovery_enqueued)),
                     recovery_pending=True,
                     pending_topic_ids=tuple(recovery_pending_topic_ids),
                 )
+    elif stalled_topic_ids:
+        recovery_pending_topic_ids = list(stalled_topic_ids)
+        logger.info(
+            "curated info read-only mode: skipping auto-repair for pending candidate backlog: hours=%s topics=%s preexisting_rows=%s",
+            h,
+            ",".join(str(x) for x in stalled_topic_ids),
+            len(rows),
+        )
+        if push:
+            return CuratedInfoResult(
+                since=since,
+                pushed=0,
+                markdown=_recovery_pending_markdown(queued=False),
+                recovery_pending=True,
+                pending_topic_ids=tuple(recovery_pending_topic_ids),
+            )
     # Explicit operator feedback: muted domains should not appear in Curated Info.
     active_mute_domains: set[str] = set()
     try:
@@ -4281,15 +5203,7 @@ async def run_curated_info(
     except Exception:
         min_source_score = 0
     min_source_score = max(0, min(100, int(min_source_score)))
-    scores_by_source_id: dict[int, int] = {}
-    try:
-        for sc in repo.list_source_scores(limit=10_000):
-            sid = int(getattr(sc, "source_id", 0) or 0)
-            if sid <= 0:
-                continue
-            scores_by_source_id[sid] = int(getattr(sc, "score", 0) or 0)
-    except Exception:
-        scores_by_source_id = {}
+    scores_by_source_id = _collect_hard_gate_source_scores(repo=repo)
 
     # Build a cross-topic item map.
     #
@@ -4331,7 +5245,9 @@ async def run_curated_info(
         if dec not in {"alert", "digest"}:
             dec = "digest"
 
-        summary, why = extract_llm_summary_why((getattr(it_row, "reason", "") or ""))
+        reason_text = str(getattr(it_row, "reason", "") or "")
+        summary, why = extract_llm_summary_why(reason_text)
+        rank_score = curated_priority_score(reason=reason_text, decision=dec)
         entry = by_item_id.get(iid)
         if entry is None:
             entry = {
@@ -4343,14 +5259,15 @@ async def run_curated_info(
                 "topics": set(),
                 "summary": summary,
                 "why": why,
+                "rank_score": rank_score,
                 "content_text": (item.content_text or "").strip(),
             }
             by_item_id[iid] = entry
         # Merge topics and decision priority (alert beats digest).
         try:
             entry["topics"].add((topic.name or "").strip())
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("cross-topic digest telegram push failed: key=%s err=%s", key, _runner_exc_text(exc))
         if dec == "alert":
             entry["decision"] = "alert"
         # Keep the freshest title/url if the item row changes (best-effort).
@@ -4360,6 +5277,8 @@ async def run_curated_info(
                 entry["title"] = (item.title or "").strip()
             if url:
                 entry["url"] = url
+        if rank_score > int(entry.get("rank_score") or 0):
+            entry["rank_score"] = rank_score
         if summary and not str(entry.get("summary") or "").strip():
             entry["summary"] = summary
         if why and not str(entry.get("why") or "").strip():
@@ -4450,6 +5369,11 @@ async def run_curated_info(
             pass
         if str(e.get("decision") or "").strip().lower() == "alert":
             existing["decision"] = "alert"
+        if int(e.get("rank_score") or 0) > int(existing.get("rank_score") or 0):
+            existing["rank_score"] = int(e.get("rank_score") or 0)
+            for key2 in ("summary", "why", "content_text"):
+                if str(e.get(key2) or "").strip():
+                    existing[key2] = e.get(key2, existing.get(key2, ""))
 
         # Prefer the newest representative title/url.
         try:
@@ -4468,6 +5392,7 @@ async def run_curated_info(
     items_all = list(by_url.values())
     items_all.sort(
         key=lambda e: (
+            -int(e.get("rank_score") or 0),
             0 if str(e.get("decision") or "") == "alert" else 1,
             -int(e.get("ts") or 0),
             str(e.get("title") or ""),
@@ -4620,6 +5545,18 @@ async def run_curated_info(
         except Exception:
             pass
 
+    try:
+        from tracker.curated_recovery_queue import complete_curated_recovery_job_for_window
+
+        complete_curated_recovery_job_for_window(
+            repo=repo,
+            window_end_utc=now_utc.replace(microsecond=0).isoformat() + "Z",
+            hours=h,
+            push=push,
+        )
+    except Exception:
+        pass
+
     return CuratedInfoResult(
         since=since,
         pushed=pushed,
@@ -4627,6 +5564,209 @@ async def run_curated_info(
         idempotency_key=key,
         recovery_pending=bool(recovery_pending_topic_ids),
         pending_topic_ids=tuple(recovery_pending_topic_ids),
+    )
+
+
+async def run_collect_message(
+    *,
+    session: Session,
+    settings: Settings,
+    rule: CollectMessageRule,
+    push: bool,
+    now: dt.datetime | None = None,
+    key_suffix: str | None = None,
+) -> CollectMessageResult:
+    batch = await run_collect_message_batch(
+        session=session,
+        settings=settings,
+        rules=[rule],
+        push=push,
+        now=now,
+        key_suffix=key_suffix,
+    )
+    return CollectMessageResult(
+        rule_id=rule.rule_id,
+        title=batch.title,
+        pushed=batch.pushed,
+        markdown=batch.markdown,
+        idempotency_key=batch.idempotency_key,
+    )
+
+
+async def run_collect_message_batch(
+    *,
+    session: Session,
+    settings: Settings,
+    rules: list[CollectMessageRule],
+    push: bool,
+    now: dt.datetime | None = None,
+    key_suffix: str | None = None,
+) -> CollectMessageBatchResult:
+    repo = Repo(session)
+    try:
+        from tracker.dynamic_config import effective_settings
+
+        settings = effective_settings(repo=repo, settings=settings)
+    except Exception:
+        pass
+
+    now_utc = now or dt.datetime.utcnow()
+    if now_utc.tzinfo is not None:
+        now_utc = now_utc.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    out_lang = _output_lang(repo=repo, settings=settings)
+
+    enabled_rules = [row for row in (rules or []) if row.enabled]
+    if not enabled_rules:
+        return CollectMessageBatchResult(
+            group_id="collect",
+            rule_ids=(),
+            title=("Collect" if out_lang != "zh" else "专题回收"),
+            pushed=0,
+            markdown="",
+            idempotency_key="",
+        )
+
+    ordered_rules = sorted(enabled_rules, key=lambda row: (row.rule_id, row.title))
+    group_id = ordered_rules[0].rule_id
+    if len(ordered_rules) > 1:
+        raw = ",".join(rule.rule_id for rule in ordered_rules)
+        group_id = f"batch-{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:10]}"
+
+    since = now_utc
+    rows: list[tuple[ItemTopic, Item]] = []
+    primary_windows: list[tuple[CollectMessageRule, dt.datetime]] = []
+    for current_rule in ordered_rules:
+        rule_since = now_utc - dt.timedelta(hours=max(1, int(current_rule.lookback_hours or 24)))
+        primary_windows.append((current_rule, rule_since))
+        if rule_since < since:
+            since = rule_since
+        rows.extend(
+            repo.list_item_topics_for_sources_window(
+                source_ids=list(current_rule.source_ids),
+                since=rule_since,
+                until=now_utc,
+                decisions=["digest", "alert"],
+            )
+        )
+    rows = _dedupe_ranked_item_rows(rows, dedupe_strength="normal")
+
+    if not rows:
+        fallback_since = now_utc
+        fallback_rows: list[tuple[ItemTopic, Item]] = []
+        for current_rule, primary_since in primary_windows:
+            fallback_hours = max(
+                int(current_rule.lookback_hours or 24),
+                int(getattr(current_rule, "fallback_lookback_hours", current_rule.lookback_hours or 24) or 24),
+            )
+            if fallback_hours <= int(current_rule.lookback_hours or 24):
+                continue
+            rule_since = now_utc - dt.timedelta(hours=fallback_hours)
+            if rule_since >= primary_since:
+                continue
+            if rule_since < fallback_since:
+                fallback_since = rule_since
+            fallback_rows.extend(
+                repo.list_item_topics_for_sources_window(
+                    source_ids=list(current_rule.source_ids),
+                    since=rule_since,
+                    until=now_utc,
+                    decisions=["digest", "alert"],
+                )
+            )
+        fallback_rows = _dedupe_ranked_item_rows(fallback_rows, dedupe_strength="normal")
+        if fallback_rows:
+            rows = fallback_rows
+            since = fallback_since
+
+    display_title = ordered_rules[0].title
+    if len(ordered_rules) > 1:
+        display_title = "Collect" if out_lang != "zh" else "专题回收"
+
+    display_title_entries: list[dict[str, str | int]] = []
+    for item_topic, item in rows:
+        summary, why = extract_llm_summary_why(item_topic.reason or "")
+        display_title_entries.append(
+            {
+                "item_id": int(getattr(item, "id", 0) or 0),
+                "title": str(getattr(item, "title", "") or "").strip(),
+                "url": str((getattr(item, "canonical_url", None) or getattr(item, "url", None) or "")).strip(),
+                "summary": summary,
+                "why": why,
+                "content_text": str(getattr(item, "content_text", "") or "").strip(),
+            }
+        )
+    display_titles_by_item_id = await _localize_item_display_titles(
+        repo=repo,
+        settings=settings,
+        entries=display_title_entries,
+        out_lang=out_lang,
+    )
+
+    topic = Topic(name=display_title, query="", digest_cron=ordered_rules[0].cron)
+    markdown = format_digest_markdown(
+        topic=topic,
+        items=rows,
+        since=since,
+        until=now_utc,
+        tz_name=settings.cron_timezone,
+        lang=out_lang,
+        title_overrides_by_item_id=display_titles_by_item_id,
+        llm_summary=None,
+    )
+    markdown = _append_login_required_section(markdown=markdown, repo=repo, settings=settings, lang=out_lang)
+
+    day = _local_day_iso(settings, when=now_utc.replace(tzinfo=dt.timezone.utc))
+    key = f"digest:collect.{group_id}:{day}"
+    suffix = (key_suffix or "").strip()
+    if not suffix:
+        try:
+            tz, tz_ok = resolve_cron_timezone((settings.cron_timezone or "UTC").strip() or "UTC")
+            if not tz_ok:
+                tz = dt.timezone.utc
+            suffix = now_utc.replace(tzinfo=dt.timezone.utc).astimezone(tz).strftime("%H%M")
+        except Exception:
+            suffix = now_utc.strftime("%H%M")
+    if suffix:
+        safe = suffix.replace(":", "-").replace("/", "-").replace("\\", "-").strip()
+        if safe:
+            key = f"{key}:{safe[:40]}"
+
+    title = f"Collect: {display_title}" if out_lang != "zh" else f"专题回收：{display_title}"
+    repo.upsert_report(
+        kind="digest",
+        idempotency_key=key,
+        topic_id=None,
+        title=title,
+        markdown=markdown,
+    )
+
+    pushed = 0
+    if push and rows:
+        try:
+            if bool(getattr(settings, "telegram_digest_reader_enabled", True)):
+                pushed += 1 if await push_telegram_report_reader(
+                    repo=repo,
+                    settings=settings,
+                    idempotency_key=key,
+                    markdown=markdown,
+                ) else 0
+            else:
+                pushed += 1 if await push_telegram_text(
+                    repo=repo,
+                    settings=settings,
+                    idempotency_key=key,
+                    text=format_im_text(markdown),
+                ) else 0
+        except Exception:
+            pass
+
+    return CollectMessageBatchResult(
+        group_id=group_id,
+        rule_ids=tuple(rule.rule_id for rule in ordered_rules),
+        title=display_title,
+        pushed=pushed,
+        markdown=markdown,
+        idempotency_key=key,
     )
 
 async def run_health_report(*, session: Session, settings: Settings, push: bool) -> HealthResult:

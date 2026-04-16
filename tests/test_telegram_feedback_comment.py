@@ -5,7 +5,7 @@ import json
 import pytest
 from sqlalchemy import func, select
 
-from tracker.models import FeedbackEvent, Item, Source
+from tracker.models import FeedbackEvent, Item, Source, SourceScore
 from tracker.repo import Repo
 from tracker.settings import Settings
 from tracker.telegram_connect import telegram_poll
@@ -207,6 +207,7 @@ async def test_telegram_comment_menu_button_creates_dislike_and_marks_comment_ap
     monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
     monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
     monkeypatch.setattr("tracker.telegram_connect.telegram_answer_callback_query", fake_answer_callback_query)
+    monkeypatch.setattr("tracker.dynamic_config.effective_settings", lambda repo, settings: settings)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
 
@@ -225,7 +226,8 @@ async def test_telegram_comment_menu_button_creates_dislike_and_marks_comment_ap
     assert evs[1].applied_at is None
     assert evs[2].kind == "dislike"
     assert evs[2].applied_at is None
-    assert answered == ["cq1"]
+    score_cnt = int(db_session.scalar(select(func.count()).select_from(SourceScore)) or 0)
+    assert score_cnt == 0
     assert sent_acks  # we ack the action
 
 
@@ -321,6 +323,7 @@ async def test_telegram_comment_menu_button_mute_creates_rule_and_marks_comment_
     monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
     monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
     monkeypatch.setattr("tracker.telegram_connect.telegram_answer_callback_query", fake_answer_callback_query)
+    monkeypatch.setattr("tracker.dynamic_config.effective_settings", lambda repo, settings: settings)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
 
@@ -333,4 +336,6 @@ async def test_telegram_comment_menu_button_mute_creates_rule_and_marks_comment_
     assert row2 is not None
     assert row2.applied_at is not None
     assert repo.is_muted(scope="domain", key="example.com")
+    score_cnt = int(db_session.scalar(select(func.count()).select_from(SourceScore)) or 0)
+    assert score_cnt == 0
     assert sent_acks

@@ -15,15 +15,21 @@ from tracker.logging_config import configure_logging
 from tracker.maintenance import run_backup, run_prune_ignored
 from tracker.models import Base
 from tracker.repo import Repo
-from tracker.runner import run_digest, run_discover_sources, run_health_report, run_tick
+from tracker.runner import run_collect_message_batch, run_digest, run_discover_sources, run_health_report, run_tick
 from tracker.push_ops import retry_failed_pushes
-from tracker.settings import get_settings
+from tracker.settings import Settings, get_settings
 from tracker.config_agent_core import apply_config_agent_plan, plan_config_agent_request
 from tracker.timezones import resolve_cron_timezone
+from tracker.collect_messages import group_collect_message_rules, parse_collect_message_rules
 
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_TASK_STALE_SECONDS = 30 * 60
+
+
+def _service_exc_text(exc: BaseException) -> str:
+    detail = str(exc or "").strip()
+    return detail or repr(exc)
 
 
 def _service_job_lock_name(kind: str, *, topic_id: int | None = None) -> str:
@@ -175,6 +181,56 @@ def _effective_runtime_settings(make_session, settings):
     except Exception as exc:
         logger.debug("runtime settings fallback to startup snapshot: %s", exc)
         return settings
+
+
+def _bounded_curated_recovery_settings(settings: Settings) -> Settings:
+    """
+    Keep recovery replays prompt and frequent.
+
+    Recovery runs are historical catch-up jobs triggered after LLM outages. They should drain the
+    queued window quickly so the queue can retry frequently again, instead of spending many minutes
+    on best-effort fulltext enrichment or unbounded candidate draining for every pending topic.
+    """
+    updates: dict[str, int] = {}
+    if bool(getattr(settings, "fulltext_enabled", False)):
+        try:
+            current_fetches = max(0, int(getattr(settings, "fulltext_max_fetches_per_topic", 0) or 0))
+        except Exception:
+            current_fetches = 0
+        if current_fetches > 1:
+            updates["fulltext_max_fetches_per_topic"] = 1
+
+        try:
+            current_timeout = max(1, int(getattr(settings, "fulltext_timeout_seconds", 0) or 0))
+        except Exception:
+            current_timeout = 20
+        if current_timeout > 5:
+            updates["fulltext_timeout_seconds"] = 5
+
+    try:
+        current_max_candidates = max(0, int(getattr(settings, "llm_curation_max_candidates", 0) or 0))
+    except Exception:
+        current_max_candidates = 0
+    if current_max_candidates <= 0 or current_max_candidates > 20:
+        updates["llm_curation_max_candidates"] = 20
+
+    if not updates:
+        return settings
+
+    try:
+        bounded = settings.model_copy(update=updates)
+    except Exception:
+        bounded = settings
+    logger.info(
+        (
+            "curated recovery replay using bounded budget: "
+            "llm_max_candidates=%s fulltext_timeout=%ss max_fetches_per_topic=%s"
+        ),
+        getattr(bounded, "llm_curation_max_candidates", getattr(settings, "llm_curation_max_candidates", 0)),
+        getattr(bounded, "fulltext_timeout_seconds", getattr(settings, "fulltext_timeout_seconds", 0)),
+        getattr(bounded, "fulltext_max_fetches_per_topic", getattr(settings, "fulltext_max_fetches_per_topic", 0)),
+    )
+    return bounded
 
 
 async def _maybe_notify_source_candidates_batch(make_session, settings) -> None:
@@ -382,11 +438,22 @@ def _last_fire_time_within(*, trigger: CronTrigger, now: dt.datetime, lookback_s
     return prev
 
 
+def _curated_report_key_for_window_end(settings, *, window_end: dt.datetime) -> str:
+    tz = _cron_timezone(settings)
+    ref = window_end
+    if ref.tzinfo is None:
+        ref_local = ref.replace(tzinfo=tz)
+    else:
+        ref_local = ref.astimezone(tz)
+    return f"digest:0:{ref_local.date().isoformat()}:{ref_local.strftime('%H%M')}"
+
+
 async def _run_tick_job(make_session, settings):
     try:
-        async with job_lock_async(name=_service_job_lock_name("tick"), timeout_seconds=300):
-            with make_session() as session:
-                await run_tick(session=session, settings=settings, push=True)
+        async with job_lock_async(name=_service_job_lock_name("pipeline"), timeout_seconds=300):
+            async with job_lock_async(name=_service_job_lock_name("tick"), timeout_seconds=300):
+                with make_session() as session:
+                    await run_tick(session=session, settings=settings, push=True)
     except TimeoutError as exc:
         logger.warning("job lock busy (tick skipped): %s", exc)
 
@@ -582,7 +649,7 @@ async def _run_curated_recovery_queue_job(make_session, settings):
     except Exception:
         return
 
-    eff_settings = _effective_runtime_settings(make_session, settings)
+    eff_settings = _bounded_curated_recovery_settings(_effective_runtime_settings(make_session, settings))
     try:
         async with job_lock_async(name=_service_job_lock_name("curated"), timeout_seconds=0.0):
             with make_session() as session:
@@ -706,8 +773,6 @@ async def _run_curated_recovery_queue_job(make_session, settings):
                 )
         except Exception:
             pass
-
-
 async def _run_source_candidates_notify_job(make_session, settings) -> None:
     """
     Periodic notifier for the SourceCandidate review queue.
@@ -753,6 +818,9 @@ async def _run_telegram_connect_poll_job(make_session, settings):
                     poll_seconds = int(getattr(settings, "telegram_connect_poll_seconds", 0) or 0)
                     if poll_seconds <= 0:
                         return
+                    external_bind_enabled = bool(
+                        (getattr(settings, "telegram_external_bind_base_url", None) or "").strip()
+                    )
 
                     from tracker.telegram_connect import telegram_poll
 
@@ -761,15 +829,15 @@ async def _run_telegram_connect_poll_job(make_session, settings):
                     # Note: some operators configure `TRACKER_TELEGRAM_CHAT_ID` via `.env` instead of
                     # the /start connect flow (DB app_config). We still want polling enabled for
                     # inline buttons + replies in that mode.
-                    if not (repo.get_app_config("telegram_setup_code") or "").strip() and not (
+                    if not external_bind_enabled and not (repo.get_app_config("telegram_setup_code") or "").strip() and not (
                         (repo.get_app_config("telegram_chat_id") or "").strip()
                         or (getattr(settings, "telegram_chat_id", "") or "").strip()
                     ):
                         return
-                    await telegram_poll(repo=repo, settings=settings)
+                    await telegram_poll(repo=repo, settings=settings, make_session=make_session)
                 except Exception as exc:
-                    logger.warning("telegram poll job failed: %s", exc)
-                    return
+                    logger.warning("telegram poll job failed: %s", _service_exc_text(exc))
+                    raise
     except TimeoutError:
         return
 
@@ -801,13 +869,16 @@ async def _telegram_connect_long_poll_loop(make_session, settings):
                     if poll_seconds <= 0:
                         await asyncio.sleep(2.0)
                         continue
+                    external_bind_enabled = bool(
+                        (getattr(eff, "telegram_external_bind_base_url", None) or "").strip()
+                    )
 
                     has_code = bool((repo.get_app_config("telegram_setup_code") or "").strip())
                     has_chat = bool(
                         (repo.get_app_config("telegram_chat_id") or "").strip()
                         or (getattr(eff, "telegram_chat_id", "") or "").strip()
                     )
-                    if not (has_code or has_chat):
+                    if not (has_code or has_chat or external_bind_enabled):
                         await asyncio.sleep(2.0)
                         continue
             except Exception:
@@ -822,7 +893,7 @@ async def _telegram_connect_long_poll_loop(make_session, settings):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("telegram long-poll loop failed: %s", exc)
+            logger.warning("telegram long-poll loop failed: %s", _service_exc_text(exc))
             await asyncio.sleep(backoff_seconds)
             backoff_seconds = min(10.0, backoff_seconds * 2.0)
 
@@ -844,7 +915,7 @@ async def _run_telegram_profile_delta_worker_job(make_session, settings):
     ):
         return
 
-    # Dedicated lock: keep this isolated from portfolio/deep-research locks.
+    # Dedicated lock: keep this isolated from other long-running LLM workers.
     try:
         async with job_lock_async(name="profile_interactive", timeout_seconds=1):
             # Claim a task quickly under the DB lock.
@@ -1460,7 +1531,7 @@ async def _run_telegram_prompt_delta_worker_job(make_session, settings):
     Background worker for Telegram-driven, feedback-based Prompt delta updates.
 
     Scope (v1):
-    - Update `research.engine.synth.operator_delta` (small, auditable tail appended to synthesis prompt).
+    - Update an operator-controlled prompt delta slot (small, auditable tail appended to a base prompt).
     - Only runs when a `telegram_tasks(kind="prompt_delta")` task exists (explicit operator intent).
     """
     settings = _effective_runtime_settings(make_session, settings)
@@ -1493,7 +1564,11 @@ async def _run_telegram_prompt_delta_worker_job(make_session, settings):
                             obj = json.loads((task.query or "").strip() or "{}")
                         except Exception:
                             obj = {}
-                        target_slot_id = "research.engine.synth.operator_delta"
+                        target_slot_id = (
+                            (repo.get_app_config("telegram_prompt_delta_target_slot_id") or "").strip()
+                            or (getattr(settings, "telegram_prompt_delta_target_slot_id", "") or "").strip()
+                            or "llm.curate_items.operator_delta"
+                        )
                         fb_ids: list[int] = []
                         if isinstance(obj, dict):
                             ts = str(obj.get("target_slot_id") or "").strip()
@@ -1755,6 +1830,42 @@ async def _run_telegram_prompt_delta_worker_job(make_session, settings):
         return
 
 
+async def _run_curated_job_once(
+    make_session,
+    settings,
+    digest_sem: asyncio.Semaphore,
+    *,
+    now: dt.datetime | None = None,
+):
+    async with digest_sem:
+        eff_settings = _effective_runtime_settings(make_session, settings)
+
+        try:
+            async with job_lock_async(name=_service_job_lock_name("pipeline"), timeout_seconds=300):
+                async with job_lock_async(name=_service_job_lock_name("curated"), timeout_seconds=300):
+                    with make_session() as session:
+                        await run_tick(session=session, settings=eff_settings, push=True)
+
+                        hours = 24
+                        try:
+                            hours = int(getattr(eff_settings, "digest_hours", 24))
+                        except Exception:
+                            hours = 24
+                        if hours <= 0:
+                            hours = 24
+                        from tracker.runner import run_curated_info
+
+                        await run_curated_info(
+                            session=session,
+                            settings=eff_settings,
+                            hours=hours,
+                            push=bool(getattr(eff_settings, "digest_push_enabled", True)),
+                            now=now,
+                        )
+        except TimeoutError as exc:
+            logger.warning("job lock busy (curated skipped): %s", exc)
+
+
 async def _run_curated_job(make_session, settings, digest_sem: asyncio.Semaphore):
     """
     Run ONE cross-topic Curated Info batch.
@@ -1763,40 +1874,66 @@ async def _run_curated_job(make_session, settings, digest_sem: asyncio.Semaphore
     - De-dupe only (no interpretation)
     - Stable snapshot (new message per run on Telegram)
     """
-    async with digest_sem:
-        # Curated window/push settings should honor DB-backed overrides without restart,
-        # so compute an effective Settings snapshot per run.
-        eff_settings = settings
-        try:
-            with make_session() as session:
-                repo0 = Repo(session)
-                from tracker.dynamic_config import effective_settings
+    await _run_curated_job_once(make_session, settings, digest_sem)
 
-                eff_settings = effective_settings(repo=repo0, settings=settings)
-        except Exception:
-            eff_settings = settings
 
-        try:
-            async with job_lock_async(name=_service_job_lock_name("curated"), timeout_seconds=300):
-                with make_session() as session:
-                    # Guard against stringy values like "0" coming from dynamic config.
-                    hours = 24
-                    try:
-                        hours = int(getattr(eff_settings, "digest_hours", 24))
-                    except Exception:
-                        hours = 24
-                    if hours <= 0:
-                        hours = 24
-                    from tracker.runner import run_curated_info
+async def _run_curated_startup_catchup_job(
+    make_session,
+    settings,
+    digest_sem: asyncio.Semaphore,
+    *,
+    now: dt.datetime | None = None,
+) -> bool:
+    eff_settings = _effective_runtime_settings(make_session, settings)
+    misfire = _misfire_grace_seconds(eff_settings)
+    if not misfire:
+        return False
 
-                    await run_curated_info(
-                        session=session,
-                        settings=eff_settings,
-                        hours=hours,
-                        push=bool(getattr(eff_settings, "digest_push_enabled", True)),
-                    )
-        except TimeoutError as exc:
-            logger.warning("job lock busy (curated skipped): %s", exc)
+    try:
+        hours = int(getattr(eff_settings, "digest_hours", 24) or 24)
+    except Exception:
+        hours = 24
+    if hours <= 0:
+        hours = 24
+
+    tz = _cron_timezone(eff_settings)
+    try:
+        trigger = CronTrigger.from_crontab(_curated_cron_for_hours(hours), timezone=tz)
+    except Exception:
+        return False
+
+    current = now
+    if current is None:
+        current = dt.datetime.now(tz=tz)
+    elif current.tzinfo is None:
+        current = current.replace(tzinfo=tz)
+    else:
+        current = current.astimezone(tz)
+
+    fire_time = _last_fire_time_within(trigger=trigger, now=current, lookback_seconds=misfire)
+    if fire_time is None:
+        return False
+
+    report_key = _curated_report_key_for_window_end(eff_settings, window_end=fire_time)
+    push_enabled = bool(getattr(eff_settings, "digest_push_enabled", True))
+    try:
+        with make_session() as session:
+            repo = Repo(session)
+            if push_enabled:
+                if repo.any_push_sent(idempotency_key=report_key):
+                    return False
+            elif repo.get_report_by_key(kind="digest", idempotency_key=report_key):
+                return False
+    except Exception:
+        pass
+
+    logger.warning(
+        "startup catch-up running missed curated slot: key=%s window_end=%s",
+        report_key,
+        fire_time.isoformat(),
+    )
+    await _run_curated_job_once(make_session, settings, digest_sem, now=fire_time)
+    return True
 
 
 async def _run_digest_job(make_session, settings, topic_id: int, *, push_override: bool | None = None):
@@ -1840,6 +1977,26 @@ async def _run_digest_job(make_session, settings, topic_id: int, *, push_overrid
 async def _run_digest_job_limited(make_session, settings, topic_id: int, digest_sem: asyncio.Semaphore, push_override: bool | None = None):
     async with digest_sem:
         await _run_digest_job(make_session, settings, topic_id, push_override=push_override)
+
+
+async def _run_collect_job(make_session, settings, group_id: str, digest_sem: asyncio.Semaphore):
+    eff_settings = _effective_runtime_settings(make_session, settings)
+    rules = [r for r in parse_collect_message_rules(getattr(eff_settings, "collect_message_rules_json", "") or "") if r.enabled]
+    group = next((g for g in group_collect_message_rules(rules) if g.group_id == group_id), None)
+    if not group:
+        return
+    async with digest_sem:
+        try:
+            async with job_lock_async(name=_service_job_lock_name(f"collect.{group_id}"), timeout_seconds=300):
+                with make_session() as session:
+                    await run_collect_message_batch(
+                        session=session,
+                        settings=eff_settings,
+                        rules=list(group.rules),
+                        push=bool(getattr(eff_settings, "digest_push_enabled", True)),
+                    )
+        except TimeoutError as exc:
+            logger.warning("job lock busy (collect skipped): %s", exc)
 
 
 async def _sync_digest_jobs(
@@ -1904,6 +2061,59 @@ async def _sync_digest_jobs(
             len(digest_cron_map),
             enabled_topic_count,
         )
+
+
+async def _sync_collect_jobs(
+    scheduler: AsyncIOScheduler,
+    make_session,
+    settings,
+    collect_cron_map: dict[str, str],
+    digest_sem: asyncio.Semaphore,
+):
+    tz = _cron_timezone(settings)
+    misfire = _misfire_grace_seconds(settings)
+
+    eff_settings = _effective_runtime_settings(make_session, settings)
+    rules = [r for r in parse_collect_message_rules(getattr(eff_settings, "collect_message_rules_json", "") or "") if r.enabled]
+    groups = group_collect_message_rules(rules)
+
+    desired: dict[str, tuple[str, str]] = {}
+    for group in groups:
+        job_id = f"collect:{group.group_id}"
+        desired[job_id] = (group.group_id, group.cron)
+
+    for job_id in list(collect_cron_map.keys()):
+        if job_id not in desired:
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
+            collect_cron_map.pop(job_id, None)
+
+    for job_id, (rule_id, cron) in desired.items():
+        if collect_cron_map.get(job_id) == cron and scheduler.get_job(job_id):
+            continue
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+        try:
+            trigger = CronTrigger.from_crontab(cron, timezone=tz)
+        except Exception:
+            collect_cron_map.pop(job_id, None)
+            continue
+        scheduler.add_job(
+            _run_collect_job,
+            trigger=trigger,
+            args=[make_session, settings, rule_id, digest_sem],
+            id=job_id,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=misfire,
+        )
+        collect_cron_map[job_id] = cron
+
+    _record_scheduler_heartbeat(
+        make_session,
+        lane='collect_sync',
+        extra={'enabled_rules': len(desired), 'scheduled_rules': len(collect_cron_map)},
+    )
 
 
 def _curated_cron_for_hours(hours: int) -> str:
@@ -2010,6 +2220,7 @@ async def _install_digest_scheduler_jobs(
 
     digest_cron_map: dict[str, str] = {}
     curated_cron_map: dict[str, str] = {}
+    collect_cron_map: dict[str, str] = {}
 
     # Keep the per-topic digest scheduler alive so candidate -> digest promotion continues,
     # but force scheduled digest runs to be curation-only (push=False). Otherwise Curated Info
@@ -2034,6 +2245,18 @@ async def _install_digest_scheduler_jobs(
         seconds=300,
         args=[scheduler, make_session, settings, curated_cron_map, digest_sem],
         id="curated:sync",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=misfire,
+    )
+
+    await _sync_collect_jobs(scheduler, make_session, settings, collect_cron_map, digest_sem)
+    scheduler.add_job(
+        _sync_collect_jobs,
+        "interval",
+        seconds=300,
+        args=[scheduler, make_session, settings, collect_cron_map, digest_sem],
+        id="collect:sync",
         max_instances=1,
         coalesce=True,
         misfire_grace_time=misfire,
@@ -2230,6 +2453,11 @@ async def serve_forever() -> None:
         settings,
         misfire=misfire,
     )
+
+    try:
+        await _run_curated_startup_catchup_job(make_session, settings, digest_sem)
+    except Exception:
+        pass
 
     scheduler.start()
 

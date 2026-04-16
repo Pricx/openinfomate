@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import func, select
 
-from tracker.models import FeedbackEvent, Item, ItemTopic, Source, Topic
+from tracker.models import FeedbackEvent, Item, ItemTopic, Source, SourceScore, Topic
 from tracker.repo import Repo
 from tracker.settings import Settings
 from tracker.telegram_connect import telegram_poll
@@ -13,6 +13,7 @@ from tracker.telegram_connect import telegram_poll
 async def test_telegram_why_reply_to_alert_shows_item_topic_reason(db_session, monkeypatch):
     repo = Repo(db_session)
     repo.set_app_config("telegram_chat_id", "123")
+    repo.set_app_config("telegram_bot_token", "TEST")
     repo.set_app_config("telegram_connected_notified", "1")
     repo.set_app_config("output_language", "zh")
 
@@ -81,6 +82,7 @@ async def test_telegram_why_reply_to_alert_shows_item_topic_reason(db_session, m
 
     monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
     monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
+    monkeypatch.setattr("tracker.dynamic_config.effective_settings", lambda repo, settings: settings)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
 
     await telegram_poll(repo=repo, settings=settings)
@@ -98,6 +100,7 @@ async def test_telegram_why_reply_to_alert_shows_item_topic_reason(db_session, m
 async def test_telegram_dislike_reaction_offers_one_tap_mute_suggestion(db_session, monkeypatch):
     repo = Repo(db_session)
     repo.set_app_config("telegram_chat_id", "123")
+    repo.set_app_config("telegram_bot_token", "TEST")
     repo.set_app_config("telegram_connected_notified", "1")
     repo.set_app_config("output_language", "zh")
 
@@ -158,6 +161,7 @@ async def test_telegram_dislike_reaction_offers_one_tap_mute_suggestion(db_sessi
 
     monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
     monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
+    monkeypatch.setattr("tracker.dynamic_config.effective_settings", lambda repo, settings: settings)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
 
     await telegram_poll(repo=repo, settings=settings)
@@ -168,19 +172,23 @@ async def test_telegram_dislike_reaction_offers_one_tap_mute_suggestion(db_sessi
     kb = markup.get("inline_keyboard")
     assert isinstance(kb, list) and kb
 
-    # Verify callback points at fb:mute:<event_id>.
+    # Verify callback points at smart-fix + domain actions.
     flat = [btn.get("callback_data") for row in kb for btn in (row or []) if isinstance(btn, dict)]
+    assert any(str(x or "").startswith("fb:config_fix:") for x in flat)
     assert any(str(x or "").startswith("fb:mute:") for x in flat)
 
     # The dislike feedback event should remain pending (so profile updates can consume it).
     cnt = db_session.scalar(select(func.count()).select_from(FeedbackEvent))
     assert int(cnt or 0) == 1
+    score_cnt = db_session.scalar(select(func.count()).select_from(SourceScore))
+    assert int(score_cnt or 0) == 0
 
 
 @pytest.mark.asyncio
 async def test_telegram_dislike_reply_message_offers_one_tap_domain_actions(db_session, monkeypatch):
     repo = Repo(db_session)
     repo.set_app_config("telegram_chat_id", "123")
+    repo.set_app_config("telegram_bot_token", "TEST")
     repo.set_app_config("telegram_connected_notified", "1")
     repo.set_app_config("output_language", "zh")
 
@@ -246,6 +254,7 @@ async def test_telegram_dislike_reply_message_offers_one_tap_domain_actions(db_s
 
     monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
     monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
+    monkeypatch.setattr("tracker.dynamic_config.effective_settings", lambda repo, settings: settings)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
 
@@ -258,6 +267,7 @@ async def test_telegram_dislike_reply_message_offers_one_tap_domain_actions(db_s
     assert isinstance(kb, list) and kb
 
     flat = [btn.get("callback_data") for row in kb for btn in (row or []) if isinstance(btn, dict)]
+    assert any(str(x or "").startswith("fb:config_fix:") for x in flat)
     assert any(str(x or "").startswith("fb:mute:") for x in flat)
     assert any(str(x or "").startswith("fb:exclude_domain:") for x in flat)
 
@@ -269,6 +279,7 @@ async def test_telegram_dislike_reply_message_offers_one_tap_domain_actions(db_s
 async def test_telegram_fb_mute_callback_creates_mute_rule_for_dislike_event(db_session, monkeypatch):
     repo = Repo(db_session)
     repo.set_app_config("telegram_chat_id", "123")
+    repo.set_app_config("telegram_bot_token", "TEST")
     repo.set_app_config("telegram_connected_notified", "1")
     repo.set_app_config("output_language", "zh")
 
@@ -356,6 +367,7 @@ async def test_telegram_fb_mute_callback_creates_mute_rule_for_dislike_event(db_
     monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
     monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
     monkeypatch.setattr("tracker.telegram_connect.telegram_answer_callback_query", fake_answer_callback_query)
+    monkeypatch.setattr("tracker.dynamic_config.effective_settings", lambda repo, settings: settings)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
 
@@ -368,6 +380,8 @@ async def test_telegram_fb_mute_callback_creates_mute_rule_for_dislike_event(db_
     ev = db_session.scalar(select(FeedbackEvent).where(FeedbackEvent.kind == "dislike").order_by(FeedbackEvent.id.desc()))
     assert ev is not None
     assert ev.applied_at is None  # do not swallow dislike; profile updater will consume it later.
+    score_cnt = db_session.scalar(select(func.count()).select_from(SourceScore))
+    assert int(score_cnt or 0) == 0
     assert any("静音" in m or "muted" in m.lower() for m in sent_acks)
 
 
@@ -375,6 +389,7 @@ async def test_telegram_fb_mute_callback_creates_mute_rule_for_dislike_event(db_
 async def test_telegram_fb_exclude_domain_callback_updates_exclude_domains(db_session, monkeypatch):
     repo = Repo(db_session)
     repo.set_app_config("telegram_chat_id", "123")
+    repo.set_app_config("telegram_bot_token", "TEST")
     repo.set_app_config("telegram_connected_notified", "1")
     repo.set_app_config("output_language", "zh")
 
@@ -439,6 +454,7 @@ async def test_telegram_fb_exclude_domain_callback_updates_exclude_domains(db_se
     monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
     monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
     monkeypatch.setattr("tracker.telegram_connect.telegram_answer_callback_query", fake_answer_callback_query)
+    monkeypatch.setattr("tracker.dynamic_config.effective_settings", lambda repo, settings: settings)
     monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_text", fake_send_text)
 
     await telegram_poll(repo=repo, settings=settings)
@@ -448,3 +464,99 @@ async def test_telegram_fb_exclude_domain_callback_updates_exclude_domains(db_se
     assert ev2 is not None
     assert ev2.applied_at is None
     assert any("屏蔽域名" in m or "excluded domain" in m.lower() for m in sent_acks)
+
+
+@pytest.mark.asyncio
+async def test_telegram_fb_config_fix_callback_queues_config_agent_task(db_session, monkeypatch):
+    repo = Repo(db_session)
+    repo.set_app_config("telegram_chat_id", "123")
+    repo.set_app_config("telegram_bot_token", "TEST")
+    repo.set_app_config("telegram_connected_notified", "1")
+    repo.set_app_config("output_language", "zh")
+    repo.set_app_config("llm_base_url", "http://127.0.0.1:18410/v1")
+    repo.set_app_config("llm_model", "gpt-5.4")
+
+    src = Source(type="rss", url="https://example.com/feed.xml")
+    db_session.add(src)
+    db_session.flush()
+    item = Item(
+        source_id=int(src.id),
+        url="https://example.com/p",
+        canonical_url="https://example.com/p",
+        title="这条不该 alert",
+    )
+    db_session.add(item)
+    db_session.commit()
+
+    ev = repo.add_feedback_event(
+        channel="telegram",
+        user_id="123",
+        chat_id="123",
+        message_id=42,
+        kind="dislike",
+        value_int=0,
+        item_id=int(item.id),
+        url=item.canonical_url,
+        domain="example.com",
+        note="reaction:👎",
+        raw="{}",
+    )
+
+    settings = Settings(
+        telegram_bot_token="TEST",
+        llm_base_url="http://127.0.0.1:18410/v1",
+        llm_model="gpt-5.4",
+    )
+
+    batches = [
+        [
+            {
+                "update_id": 1,
+                "callback_query": {
+                    "id": "cq1",
+                    "from": {"id": 123},
+                    "data": f"fb:config_fix:{int(ev.id)}",
+                    "message": {"message_id": 200, "chat": {"id": 123}},
+                },
+            }
+        ]
+    ]
+
+    async def fake_delete_webhook(*, bot_token: str, client_timeout_seconds: int) -> None:  # noqa: ARG001
+        return
+
+    async def fake_get_updates(*, bot_token: str, offset, timeout_seconds: int, client_timeout_seconds: int):  # noqa: ANN001, ARG001
+        return batches.pop(0) if batches else []
+
+    async def fake_answer_callback_query(*, bot_token: str, callback_query_id: str, text: str = "", show_alert: bool = False, client_timeout_seconds: int = 20):  # noqa: ANN001, ARG001
+        return
+
+    sent_raw: list[dict] = []
+
+    async def fake_send_raw_text(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        disable_preview: bool = True,
+        reply_markup: dict | None = None,
+    ) -> int:  # noqa: ARG001
+        sent_raw.append({"text": text, "reply_markup": reply_markup})
+        return 200
+
+    monkeypatch.setattr("tracker.telegram_connect.telegram_delete_webhook", fake_delete_webhook)
+    monkeypatch.setattr("tracker.telegram_connect.telegram_get_updates", fake_get_updates)
+    monkeypatch.setattr("tracker.telegram_connect.telegram_answer_callback_query", fake_answer_callback_query)
+    monkeypatch.setattr("tracker.dynamic_config.effective_settings", lambda repo, settings: settings)
+    monkeypatch.setattr("tracker.push.telegram.TelegramPusher.send_raw_text", fake_send_raw_text)
+
+    await telegram_poll(repo=repo, settings=settings)
+
+    tasks = repo.list_telegram_tasks(chat_id="123", kind="config_agent", limit=5)
+    assert tasks
+    task = tasks[0]
+    assert task.status == "pending"
+    assert "用户刚刚对一条 Telegram Alert 点了 👎" in (task.query or "")
+    assert "这条不该 alert" in (task.query or "")
+    assert "example.com" in (task.query or "")
+    assert sent_raw

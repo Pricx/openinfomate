@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import httpx
 
 
@@ -22,6 +23,13 @@ def _telegram_api_url(*, bot_token: str, method: str) -> str:
 
 _TG_PUSH_HTTP_CLIENT: httpx.AsyncClient | None = None
 _TG_PUSH_HTTP_CLIENT_LOCK = asyncio.Lock()
+logger = logging.getLogger(__name__)
+_RETRYABLE_TELEGRAM_PUSH_ERRORS = (
+    httpx.TransportError,
+    httpx.TimeoutException,
+    asyncio.TimeoutError,
+    OSError,
+)
 
 
 async def _tg_push_http_client() -> httpx.AsyncClient:
@@ -40,6 +48,40 @@ async def _tg_push_http_client() -> httpx.AsyncClient:
         limits = httpx.Limits(max_connections=40, max_keepalive_connections=20)
         _TG_PUSH_HTTP_CLIENT = httpx.AsyncClient(follow_redirects=True, limits=limits)
         return _TG_PUSH_HTTP_CLIENT
+
+
+def _telegram_exc_text(error: BaseException) -> str:
+    text = str(error or "").strip()
+    return text or repr(error)
+
+
+async def _reset_tg_push_http_client() -> None:
+    global _TG_PUSH_HTTP_CLIENT
+    async with _TG_PUSH_HTTP_CLIENT_LOCK:
+        client = _TG_PUSH_HTTP_CLIENT
+        _TG_PUSH_HTTP_CLIENT = None
+    if client and not client.is_closed:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
+async def _tg_push_post(*, op_name: str, timeout_seconds: int, **kwargs) -> httpx.Response:
+    for attempt in range(2):
+        client = await _tg_push_http_client()
+        try:
+            return await client.post(timeout=timeout_seconds, **kwargs)
+        except _RETRYABLE_TELEGRAM_PUSH_ERRORS as exc:
+            if attempt >= 1:
+                raise
+            logger.warning(
+                "telegram push transport failed; resetting shared client: op=%s err=%s",
+                op_name,
+                _telegram_exc_text(exc),
+            )
+            await _reset_tg_push_http_client()
+    raise RuntimeError(f"telegram push request failed without response: {op_name}")
 
 
 def is_stale_telegram_edit_error(error: object) -> bool:
@@ -131,8 +173,12 @@ class TelegramPusher:
             payload["parse_mode"] = str(parse_mode or "").strip()
         if isinstance(reply_markup, dict) and reply_markup:
             payload["reply_markup"] = reply_markup
-        client = await _tg_push_http_client()
-        resp = await client.post(url, json=payload, timeout=self.timeout_seconds)
+        resp = await _tg_push_post(
+            op_name="editMessageText",
+            timeout_seconds=self.timeout_seconds,
+            url=url,
+            json=payload,
+        )
         data: object | None = None
         try:
             data = resp.json()
@@ -168,8 +214,12 @@ class TelegramPusher:
         mid = int(message_id or 0)
         if not (cid and mid > 0):
             raise ValueError("missing chat_id or message_id")
-        client = await _tg_push_http_client()
-        resp = await client.post(url, json={"chat_id": cid, "message_id": mid}, timeout=self.timeout_seconds)
+        resp = await _tg_push_post(
+            op_name="deleteMessage",
+            timeout_seconds=self.timeout_seconds,
+            url=url,
+            json={"chat_id": cid, "message_id": mid},
+        )
         resp.raise_for_status()
         data = resp.json()
         return bool(data.get("ok")) if isinstance(data, dict) else False
@@ -200,8 +250,12 @@ class TelegramPusher:
             payload["parse_mode"] = str(parse_mode or "").strip()
         if isinstance(reply_markup, dict) and reply_markup:
             payload["reply_markup"] = reply_markup
-        client = await _tg_push_http_client()
-        resp = await client.post(url, json=payload, timeout=self.timeout_seconds)
+        resp = await _tg_push_post(
+            op_name="editMessageText.raw",
+            timeout_seconds=self.timeout_seconds,
+            url=url,
+            json=payload,
+        )
         data: object | None = None
         try:
             data = resp.json()
@@ -247,8 +301,12 @@ class TelegramPusher:
             payload["parse_mode"] = str(parse_mode or "").strip()
         if isinstance(reply_markup, dict) and reply_markup:
             payload["reply_markup"] = reply_markup
-        client = await _tg_push_http_client()
-        resp = await client.post(url, json=payload, timeout=self.timeout_seconds)
+        resp = await _tg_push_post(
+            op_name="sendMessage.raw",
+            timeout_seconds=self.timeout_seconds,
+            url=url,
+            json=payload,
+        )
         data: object | None = None
         try:
             data = resp.json()
@@ -284,9 +342,8 @@ class TelegramPusher:
         if not parts:
             raise ValueError("empty text")
 
-        client = await _tg_push_http_client()
         if len(parts) == 1:
-            mid = await self._send_part(client, url=url, chat_id=cid, text=parts[0], disable_preview=disable_preview)
+            mid = await self._send_part(url=url, chat_id=cid, text=parts[0], disable_preview=disable_preview)
             return [mid] if mid > 0 else []
 
         total = len(parts)
@@ -296,7 +353,7 @@ class TelegramPusher:
             payload_text = prefix + part
             try:
                 mid = await self._send_part(
-                    client, url=url, chat_id=cid, text=payload_text, disable_preview=disable_preview
+                    url=url, chat_id=cid, text=payload_text, disable_preview=disable_preview
                 )
             except Exception as exc:
                 # Best-effort rollback: avoid leaving partial multi-part messages in chat.
@@ -325,7 +382,6 @@ class TelegramPusher:
 
     async def _send_part(
         self,
-        client: httpx.AsyncClient,
         *,
         url: str,
         chat_id: str,
@@ -337,7 +393,12 @@ class TelegramPusher:
             "text": text,
             "disable_web_page_preview": bool(disable_preview),
         }
-        resp = await client.post(url, json=payload, timeout=self.timeout_seconds)
+        resp = await _tg_push_post(
+            op_name="sendMessage.part",
+            timeout_seconds=self.timeout_seconds,
+            url=url,
+            json=payload,
+        )
         data: object | None = None
         try:
             data = resp.json()
@@ -386,8 +447,13 @@ class TelegramPusher:
             data["caption"] = cap[:1024]
 
         files = {"document": (name, bytes(content))}
-        client = await _tg_push_http_client()
-        resp = await client.post(url, data=data, files=files, timeout=self.timeout_seconds)
+        resp = await _tg_push_post(
+            op_name="sendDocument",
+            timeout_seconds=self.timeout_seconds,
+            url=url,
+            data=data,
+            files=files,
+        )
         resp.raise_for_status()
         payload = resp.json()
         if not isinstance(payload, dict) or not payload.get("ok"):

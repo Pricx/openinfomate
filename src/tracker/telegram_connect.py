@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import secrets
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -21,6 +22,39 @@ logger = logging.getLogger(__name__)
 
 _TG_HTTP_CLIENT: httpx.AsyncClient | None = None
 _TG_HTTP_CLIENT_LOCK = asyncio.Lock()
+_READER_NAV_TASKS_LOCK = asyncio.Lock()
+_READER_NAV_DEBOUNCE_SECONDS = 0.08
+_RETRYABLE_TELEGRAM_HTTP_ERRORS = (
+    httpx.TransportError,
+    httpx.TimeoutException,
+    asyncio.TimeoutError,
+    OSError,
+)
+
+
+@dataclass
+class _ReaderNavRequest:
+    bot_token: str
+    timeout_seconds: int
+    chat_id: str
+    message_id: int
+    report_key: str
+    markdown: str
+    action: str
+    parts: tuple[str, ...]
+    out_lang: str
+    show_feedback: bool
+    mute_days: int = 7
+
+
+@dataclass
+class _ReaderNavState:
+    latest: _ReaderNavRequest
+    version: int
+    task: asyncio.Task[None] | None = None
+
+
+_READER_NAV_STATES: dict[tuple[str, int], _ReaderNavState] = {}
 
 
 async def _tg_http_client() -> httpx.AsyncClient:
@@ -40,6 +74,498 @@ async def _tg_http_client() -> httpx.AsyncClient:
         limits = httpx.Limits(max_connections=40, max_keepalive_connections=20)
         _TG_HTTP_CLIENT = httpx.AsyncClient(follow_redirects=True, limits=limits)
         return _TG_HTTP_CLIENT
+
+
+def _telegram_exc_text(exc: BaseException) -> str:
+    detail = str(exc or "").strip()
+    return detail or repr(exc)
+
+
+def _telegram_http_timeout_seconds(settings: Settings, *, default: int = 20) -> int:
+    try:
+        value = int(getattr(settings, "http_timeout_seconds", default) or default)
+    except Exception:
+        value = default
+    return max(1, value)
+
+
+def _telegram_interaction_timeout_seconds(settings: Settings) -> int:
+    base = _telegram_http_timeout_seconds(settings, default=20)
+    return max(4, min(base, 12))
+
+
+def _telegram_poll_client_timeout_seconds(settings: Settings, *, poll_timeout_seconds: int) -> httpx.Timeout:
+    connect_timeout = min(5.0, float(_telegram_interaction_timeout_seconds(settings)))
+    read_timeout = max(4.0, float(max(0, int(poll_timeout_seconds or 0))) + 2.0)
+    write_timeout = max(2.0, min(5.0, float(_telegram_interaction_timeout_seconds(settings))))
+    return httpx.Timeout(
+        connect=connect_timeout,
+        read=read_timeout,
+        write=write_timeout,
+        pool=2.0,
+    )
+
+
+async def _reset_tg_http_client() -> None:
+    global _TG_HTTP_CLIENT
+    async with _TG_HTTP_CLIENT_LOCK:
+        client = _TG_HTTP_CLIENT
+        _TG_HTTP_CLIENT = None
+    if client and not client.is_closed:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
+async def _tg_http_request(
+    method: str,
+    url: str,
+    *,
+    op_name: str,
+    retry_transport_errors: bool = True,
+    reset_client_on_error: bool = True,
+    **kwargs,
+) -> httpx.Response:
+    max_attempts = 2 if retry_transport_errors else 1
+    for attempt in range(max_attempts):
+        client = await _tg_http_client()
+        try:
+            return await client.request(method=method, url=url, **kwargs)
+        except _RETRYABLE_TELEGRAM_HTTP_ERRORS as exc:
+            if attempt + 1 >= max_attempts:
+                if reset_client_on_error:
+                    await _reset_tg_http_client()
+                raise
+            logger.warning(
+                "telegram http transport failed; resetting shared client: op=%s err=%s",
+                op_name,
+                _telegram_exc_text(exc),
+            )
+            if reset_client_on_error:
+                await _reset_tg_http_client()
+    raise RuntimeError(f"telegram http request failed without response: {op_name}")
+
+
+def _strip_reader_icon_prefix(line: str) -> str:
+    s = (line or "").strip()
+    for prefix in ("🧠", "⏱", "📦"):
+        if s.startswith(prefix):
+            return s[len(prefix) :].strip()
+    return s
+
+
+def _recover_digest_report_from_message(*, repo: Repo, message: dict[str, Any] | None):
+    if not isinstance(message, dict):
+        return None
+    text = str(message.get("text") or message.get("caption") or "").strip()
+    if not text:
+        return None
+
+    title = ""
+    window_line = ""
+    counts_line = ""
+    for raw in text.splitlines()[:20]:
+        s = _strip_reader_icon_prefix(raw)
+        if not s:
+            continue
+        low = s.casefold()
+        if not title:
+            title = s
+            continue
+        if not window_line and (low.startswith("window:") or low.startswith("since:") or s.startswith("窗口:") or s.startswith("起始:")):
+            window_line = s
+            continue
+        if not counts_line and (low.startswith("items:") or s.startswith("条目:")):
+            counts_line = s
+    if not (window_line or counts_line or title):
+        return None
+
+    generic_titles = {"参考消息", "curated info", "report", "报告"}
+    title_key = title if title.casefold() not in generic_titles else ""
+    for rep, _topic in repo.list_reports(kind="digest", limit=400):
+        markdown = (getattr(rep, "markdown", "") or "").strip()
+        report_title = (getattr(rep, "title", "") or "").strip()
+        if window_line and window_line not in markdown:
+            continue
+        if counts_line and counts_line not in markdown:
+            continue
+        if title_key and title_key != report_title and title_key not in markdown:
+            continue
+        return rep
+    return None
+
+
+def _parse_reader_callback_payload(data: str) -> tuple[str, list[str]]:
+    raw = (data or "").strip()
+    parts = [p for p in raw.split(":") if p]
+    if not parts:
+        return "", []
+    if parts[0] != "brk":
+        return "", parts
+    token = parts[1] if len(parts) >= 2 else ""
+    try:
+        from tracker.telegram_report_reader import decode_reader_callback_key
+
+        report_key = decode_reader_callback_key(token)
+    except Exception:
+        report_key = ""
+    legacy_parts = ["br", *parts[2:]] if len(parts) >= 3 else ["br"]
+    return report_key, legacy_parts
+
+
+def _reader_feedback_is_page_only(parts: list[str] | tuple[str, ...]) -> bool:
+    sub = (parts[2] if len(parts) >= 3 else "0").strip()
+    return sub.isdigit()
+
+
+def _reader_action_is_coalescible(*, action: str, parts: list[str] | tuple[str, ...]) -> bool:
+    act = (action or "").strip().lower()
+    if act in {"toc", "menu", "sec", "refs", "ref", "full"}:
+        return True
+    if act == "fb" and _reader_feedback_is_page_only(parts):
+        return True
+    return False
+
+
+def _render_reader_navigation_view(
+    *,
+    markdown: str,
+    report_key: str,
+    action: str,
+    parts: list[str] | tuple[str, ...],
+    out_lang: str,
+    show_feedback: bool,
+    mute_days: int = 7,
+) -> tuple[str, dict] | None:
+    act = (action or "").strip().lower()
+    if report_key.startswith("digest:") and act == "sec":
+        act = "toc"
+
+    if act in {"toc", "menu"}:
+        try:
+            toc_page = int(parts[2]) if len(parts) >= 3 else 0
+        except Exception:
+            toc_page = 0
+        from tracker.telegram_report_reader import render_cover_html
+
+        return render_cover_html(
+            markdown=markdown,
+            idempotency_key=report_key,
+            lang=out_lang,
+            toc_page=toc_page,
+            show_feedback=show_feedback,
+        )
+
+    if act == "sec":
+        try:
+            sec_idx = int(parts[2]) if len(parts) >= 3 else 0
+        except Exception:
+            sec_idx = 0
+        try:
+            page_i = int(parts[3]) if len(parts) >= 4 else 0
+        except Exception:
+            page_i = 0
+        from tracker.telegram_report_reader import render_section_html
+
+        return render_section_html(
+            markdown=markdown,
+            section_index=sec_idx,
+            page=page_i,
+            lang=out_lang,
+            show_feedback=show_feedback,
+            report_key=report_key,
+        )
+
+    if act in {"refs", "ref"}:
+        try:
+            page_i = int(parts[2]) if len(parts) >= 3 else 0
+        except Exception:
+            page_i = 0
+        from tracker.telegram_report_reader import render_references_html
+
+        return render_references_html(
+            markdown=markdown,
+            page=page_i,
+            lang=out_lang,
+            show_feedback=show_feedback,
+            report_key=report_key,
+        )
+
+    if act == "full":
+        try:
+            page_i = int(parts[2]) if len(parts) >= 3 else 0
+        except Exception:
+            page_i = 0
+        if report_key.startswith("digest:"):
+            from tracker.telegram_report_reader import render_digest_full_html
+
+            return render_digest_full_html(
+                markdown=markdown,
+                page=page_i,
+                lang=out_lang,
+                show_feedback=show_feedback,
+                report_key=report_key,
+            )
+        from tracker.telegram_report_reader import render_full_html
+
+        return render_full_html(
+            markdown=markdown,
+            page=page_i,
+            lang=out_lang,
+            show_feedback=show_feedback,
+            report_key=report_key,
+        )
+
+    if act == "fb" and _reader_feedback_is_page_only(parts):
+        try:
+            page_i = int(parts[2]) if len(parts) >= 3 else 0
+        except Exception:
+            page_i = 0
+        from tracker.telegram_report_reader import render_feedback_html
+
+        return render_feedback_html(
+            markdown=markdown,
+            page=page_i,
+            lang=out_lang,
+            mute_days=max(1, int(mute_days or 7)),
+            status="",
+            report_key=report_key,
+        )
+
+    return None
+
+
+async def _persist_reader_message_mapping(
+    *,
+    make_session,
+    chat_id: str,
+    report_key: str,
+    message_id: int,
+) -> None:
+    if make_session is None or int(message_id or 0) <= 0:
+        return
+    try:
+        with make_session() as session:
+            Repo(session).ensure_telegram_messages_recorded(
+                chat_id=(chat_id or "").strip(),
+                idempotency_key=(report_key or "").strip(),
+                message_ids=[int(message_id)],
+                kind="digest",
+                item_id=None,
+            )
+    except Exception as exc:
+        logger.warning(
+            "telegram reader async mapping persist failed: key=%s chat_id=%s mid=%s err=%s",
+            report_key,
+            chat_id,
+            int(message_id or 0),
+            exc,
+        )
+
+
+def _rollback_repo_session(repo: Repo, *, reason: str) -> None:
+    try:
+        repo.session.rollback()
+    except Exception as exc:
+        logger.debug("telegram repo rollback failed: reason=%s err=%s", reason, exc)
+
+
+def _set_app_config_best_effort(repo: Repo, *, key: str, value: str) -> bool:
+    try:
+        repo.set_app_config(key, value)
+        return True
+    except Exception as exc:
+        _rollback_repo_session(repo, reason=f"set_app_config:{key}")
+        logger.debug("telegram app_config write skipped: key=%s err=%s", key, exc)
+        return False
+
+
+def _get_telegram_message_with_fallback(
+    *,
+    repo: Repo,
+    make_session,
+    chat_id: str,
+    message_id: int,
+):
+    cid = (chat_id or "").strip()
+    mid = int(message_id or 0)
+    if not (cid and mid > 0):
+        return None
+
+    try:
+        hit = repo.get_telegram_message(chat_id=cid, message_id=mid)
+    except Exception as exc:
+        _rollback_repo_session(repo, reason=f"telegram_message_lookup:{cid}:{mid}")
+        logger.warning(
+            "telegram message lookup failed in active session: chat_id=%s message_id=%s err=%s",
+            cid,
+            mid,
+            exc,
+        )
+        hit = None
+
+    if hit is not None or make_session is None:
+        return hit
+
+    try:
+        with make_session() as session:
+            return Repo(session).get_telegram_message(chat_id=cid, message_id=mid)
+    except Exception as exc:
+        logger.warning(
+            "telegram message lookup failed in fresh session: chat_id=%s message_id=%s err=%s",
+            cid,
+            mid,
+            exc,
+        )
+        return None
+
+
+async def _apply_reader_navigation_request(req: _ReaderNavRequest, *, make_session=None) -> None:
+    rendered = _render_reader_navigation_view(
+        markdown=req.markdown,
+        report_key=req.report_key,
+        action=req.action,
+        parts=req.parts,
+        out_lang=req.out_lang,
+        show_feedback=req.show_feedback,
+        mute_days=req.mute_days,
+    )
+    if not rendered:
+        return
+    text_html, kb = rendered
+    if not (text_html and isinstance(kb, dict)):
+        return
+
+    from tracker.push.telegram import TelegramPusher, is_stale_telegram_edit_error
+
+    p = TelegramPusher(req.bot_token, timeout_seconds=max(1, int(req.timeout_seconds or 20)))
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    try:
+        await p.edit_text(
+            chat_id=req.chat_id,
+            message_id=req.message_id,
+            text=text_html,
+            parse_mode="HTML",
+            disable_preview=True,
+            reply_markup=kb,
+        )
+        elapsed_ms = int((loop.time() - started_at) * 1000)
+        if elapsed_ms >= 1500:
+            logger.warning(
+                "telegram reader edit slow: key=%s chat_id=%s mid=%s action=%s elapsed_ms=%s",
+                req.report_key,
+                req.chat_id,
+                req.message_id,
+                req.action,
+                elapsed_ms,
+            )
+        return
+    except Exception as exc:
+        if not is_stale_telegram_edit_error(exc):
+            raise
+
+    mid2 = await p.send_raw_text(
+        chat_id=req.chat_id,
+        text=text_html,
+        parse_mode="HTML",
+        disable_preview=True,
+        reply_markup=kb,
+    )
+    elapsed_ms = int((loop.time() - started_at) * 1000)
+    if elapsed_ms >= 1500:
+        logger.warning(
+            "telegram reader resend slow: key=%s chat_id=%s mid=%s action=%s elapsed_ms=%s",
+            req.report_key,
+            req.chat_id,
+            req.message_id,
+            req.action,
+            elapsed_ms,
+        )
+    if int(mid2 or 0) > 0:
+        await _persist_reader_message_mapping(
+            make_session=make_session,
+            chat_id=req.chat_id,
+            report_key=req.report_key,
+            message_id=int(mid2),
+        )
+
+
+async def _run_reader_nav_worker(key: tuple[str, int], *, make_session=None) -> None:
+    last_applied_version = 0
+    current_task = asyncio.current_task()
+    try:
+        while True:
+            await asyncio.sleep(_READER_NAV_DEBOUNCE_SECONDS)
+            async with _READER_NAV_TASKS_LOCK:
+                state = _READER_NAV_STATES.get(key)
+                if not state:
+                    return
+                version = int(state.version or 0)
+                req = state.latest
+            if version <= last_applied_version:
+                async with _READER_NAV_TASKS_LOCK:
+                    state = _READER_NAV_STATES.get(key)
+                    if state and state.version <= last_applied_version and state.task is current_task:
+                        _READER_NAV_STATES.pop(key, None)
+                return
+            try:
+                await _apply_reader_navigation_request(req, make_session=make_session)
+            except Exception as exc:
+                logger.warning(
+                    "telegram reader async edit failed: key=%s chat_id=%s mid=%s action=%s err=%s",
+                    req.report_key,
+                    req.chat_id,
+                    req.message_id,
+                    req.action,
+                    _telegram_exc_text(exc),
+                )
+            last_applied_version = version
+            async with _READER_NAV_TASKS_LOCK:
+                state = _READER_NAV_STATES.get(key)
+                if not state:
+                    return
+                if state.version <= last_applied_version and state.task is current_task:
+                    _READER_NAV_STATES.pop(key, None)
+                    return
+    finally:
+        async with _READER_NAV_TASKS_LOCK:
+            state = _READER_NAV_STATES.get(key)
+            if not state or state.task is not current_task:
+                return
+            if state.version > last_applied_version:
+                state.task = asyncio.create_task(_run_reader_nav_worker(key, make_session=make_session))
+            else:
+                _READER_NAV_STATES.pop(key, None)
+
+
+async def _queue_reader_navigation_request(req: _ReaderNavRequest, *, make_session=None) -> None:
+    key = ((req.chat_id or "").strip(), int(req.message_id or 0))
+    if not key[0] or key[1] <= 0:
+        return
+    async with _READER_NAV_TASKS_LOCK:
+        state = _READER_NAV_STATES.get(key)
+        if state is None:
+            state = _ReaderNavState(latest=req, version=1, task=None)
+            _READER_NAV_STATES[key] = state
+        else:
+            state.latest = req
+            state.version = int(state.version or 0) + 1
+        if state.task is None or state.task.done():
+            state.task = asyncio.create_task(_run_reader_nav_worker(key, make_session=make_session))
+
+
+async def _wait_for_reader_nav_idle_for_tests(*, chat_id: str, message_id: int, timeout_seconds: float = 1.5) -> bool:
+    key = ((chat_id or "").strip(), int(message_id or 0))
+    deadline = asyncio.get_running_loop().time() + max(0.05, float(timeout_seconds))
+    while asyncio.get_running_loop().time() < deadline:
+        async with _READER_NAV_TASKS_LOCK:
+            state = _READER_NAV_STATES.get(key)
+            if not state or state.task is None or state.task.done():
+                return True
+        await asyncio.sleep(0.01)
+    return False
 
 
 _REACTION_LIKE = {"👍", "❤️", "🔥", "⭐", "🌟"}
@@ -132,12 +658,101 @@ def telegram_extract_start_payload(text: str) -> str | None:
     return parts[1].strip()
 
 
+def _external_bind_code_prefix(settings: Settings) -> str:
+    prefix = (getattr(settings, "telegram_external_bind_code_prefix", None) or "").strip()
+    return prefix or "oim_"
+
+
+def _external_bind_base_url(settings: Settings) -> str:
+    return (getattr(settings, "telegram_external_bind_base_url", None) or "").strip().rstrip("/")
+
+
+def _extract_external_bind_code(text: str, settings: Settings) -> str | None:
+    prefix = _external_bind_code_prefix(settings)
+    if not prefix:
+        return None
+    start_payload = telegram_extract_start_payload(text)
+    if start_payload is not None:
+        payload = start_payload.strip()
+        if payload.startswith(prefix):
+            return payload
+    direct = (text or "").strip()
+    if direct.startswith(prefix):
+        return direct
+    return None
+
+
+async def _forward_external_bind_code(
+    *,
+    settings: Settings,
+    code: str,
+    telegram_chat_id: str,
+    telegram_user_id: str,
+    username: str,
+    text: str,
+    locale: str,
+) -> dict[str, Any]:
+    base_url = _external_bind_base_url(settings)
+    if not base_url:
+        return {"ok": False, "reply_text": ""}
+
+    headers: dict[str, str] = {
+        "content-type": "application/json",
+        "x-openinfomate-locale": ("en" if (locale or "").lower().startswith("en") else "zh-CN"),
+    }
+    bridge_token = (getattr(settings, "telegram_external_bind_token", None) or "").strip()
+    if bridge_token:
+        headers["authorization"] = f"Bearer {bridge_token}"
+
+    payload = {
+        "code": code,
+        "telegramChatId": telegram_chat_id,
+        "telegramUserId": telegram_user_id,
+        "username": username,
+        "text": text,
+        "locale": headers["x-openinfomate-locale"],
+    }
+    endpoint = f"{base_url}/api/internal/telegram/upstream-bind/consume"
+
+    try:
+        response = await _tg_http_request(
+            "POST",
+            endpoint,
+            op_name="external-bind",
+            headers=headers,
+            json=payload,
+            timeout=max(5.0, float(getattr(settings, "http_timeout_seconds", 20) or 20)),
+        )
+    except Exception as exc:
+        logger.warning("telegram external bind forwarding failed: %s", _telegram_exc_text(exc))
+        return {
+            "ok": False,
+            "reply_text": ("暂时无法完成绑定，请稍后重试。" if not (locale or "").lower().startswith("en") else "Binding is temporarily unavailable. Please try again later."),
+        }
+
+    try:
+        body = response.json() if response.content else {}
+    except Exception:
+        body = {}
+    reply_text = str((body or {}).get("replyText") or (body or {}).get("error") or "").strip()
+    if not reply_text:
+        if response.is_success:
+            reply_text = "✅ 绑定请求已处理。" if not (locale or "").lower().startswith("en") else "✅ Binding request processed."
+        else:
+            reply_text = "绑定失败，请检查绑定码是否仍然有效。" if not (locale or "").lower().startswith("en") else "Binding failed. Check whether the code is still valid."
+    return {
+        "ok": response.is_success,
+        "reply_text": reply_text,
+        "workspace_id": str((body or {}).get("workspaceId") or "").strip(),
+    }
+
+
 async def telegram_get_updates(
     *,
     bot_token: str,
     offset: int | None,
     timeout_seconds: int,
-    client_timeout_seconds: int,
+    client_timeout_seconds: httpx.Timeout | float | int,
 ) -> list[dict[str, Any]]:
     url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
     params: dict[str, str | int] = {
@@ -148,10 +763,27 @@ async def telegram_get_updates(
     if offset is not None:
         params["offset"] = int(offset)
 
-    client = await _tg_http_client()
-    resp = await client.get(url, params=params, timeout=client_timeout_seconds)
-    resp.raise_for_status()
-    data = resp.json()
+    resp = await _tg_http_request(
+        "GET",
+        url,
+        op_name="getUpdates",
+        retry_transport_errors=False,
+        reset_client_on_error=False,
+        params=params,
+        timeout=client_timeout_seconds,
+    )
+    data: object | None = None
+    try:
+        data = resp.json()
+    except Exception:
+        data = None
+    if resp.status_code >= 400:
+        if isinstance(data, dict):
+            desc = (data.get("description") or "").strip()
+            raise RuntimeError(desc or f"telegram api error (status={resp.status_code})")
+        resp.raise_for_status()
+    if data is None:
+        data = resp.json()
 
     if not isinstance(data, dict) or not data.get("ok"):
         desc = (data.get("description") if isinstance(data, dict) else None) or "telegram api error"
@@ -180,13 +812,66 @@ async def telegram_answer_callback_query(
     payload: dict[str, object] = {"callback_query_id": qid, "show_alert": bool(show_alert)}
     if (text or "").strip():
         payload["text"] = (text or "").strip()[:180]
-    client = await _tg_http_client()
-    resp = await client.post(url, json=payload, timeout=client_timeout_seconds)
-    resp.raise_for_status()
-    data = resp.json()
+    resp = await _tg_http_request(
+        "POST",
+        url,
+        op_name="answerCallbackQuery",
+        json=payload,
+        timeout=client_timeout_seconds,
+    )
+    data: object | None = None
+    try:
+        data = resp.json()
+    except Exception:
+        data = None
+    if resp.status_code >= 400:
+        if isinstance(data, dict):
+            desc = (data.get("description") or "").strip()
+            raise RuntimeError(desc or f"telegram api error (status={resp.status_code})")
+        resp.raise_for_status()
+    if data is None:
+        data = resp.json()
     if not isinstance(data, dict) or not data.get("ok"):
         desc = (data.get("description") if isinstance(data, dict) else None) or "telegram api error"
         raise RuntimeError(str(desc))
+
+
+async def _answer_callback_query_best_effort(
+    *,
+    bot_token: str,
+    callback_query_id: str,
+    text: str,
+    show_alert: bool,
+    client_timeout_seconds: int,
+) -> None:
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    ack_wait_timeout = max(0.05, min(0.2, float(client_timeout_seconds)))
+    try:
+        await asyncio.wait_for(
+            telegram_answer_callback_query(
+                bot_token=bot_token,
+                callback_query_id=callback_query_id,
+                text=text,
+                show_alert=show_alert,
+                client_timeout_seconds=client_timeout_seconds,
+            ),
+            timeout=ack_wait_timeout,
+        )
+    except Exception as exc:
+        logger.debug(
+            "telegram callback ack failed: callback_query_id=%s err=%s",
+            callback_query_id,
+            _telegram_exc_text(exc),
+        )
+        return
+    elapsed_ms = int((loop.time() - started_at) * 1000)
+    if elapsed_ms >= 1500:
+        logger.warning(
+            "telegram callback ack slow: callback_query_id=%s elapsed_ms=%s",
+            callback_query_id,
+            elapsed_ms,
+        )
 
 
 async def telegram_delete_webhook(*, bot_token: str, client_timeout_seconds: int) -> None:
@@ -197,10 +882,24 @@ async def telegram_delete_webhook(*, bot_token: str, client_timeout_seconds: int
     `deleteWebhook` is idempotent and safe to call in connect flows.
     """
     url = f"https://api.telegram.org/bot{bot_token}/deleteWebhook"
-    client = await _tg_http_client()
-    resp = await client.post(url, timeout=client_timeout_seconds)
-    resp.raise_for_status()
-    data = resp.json()
+    resp = await _tg_http_request(
+        "POST",
+        url,
+        op_name="deleteWebhook",
+        timeout=client_timeout_seconds,
+    )
+    data: object | None = None
+    try:
+        data = resp.json()
+    except Exception:
+        data = None
+    if resp.status_code >= 400:
+        if isinstance(data, dict):
+            desc = (data.get("description") or "").strip()
+            raise RuntimeError(desc or f"telegram api error (status={resp.status_code})")
+        resp.raise_for_status()
+    if data is None:
+        data = resp.json()
     if not isinstance(data, dict) or not data.get("ok"):
         desc = (data.get("description") if isinstance(data, dict) else None) or "telegram api error"
         raise RuntimeError(str(desc))
@@ -258,7 +957,7 @@ def telegram_link(
     return {"code": code, "link": link, "bot_username": bot_username}
 
 
-async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = None) -> dict[str, Any]:
+async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = None, make_session=None) -> dict[str, Any]:
     # Apply runtime-effective settings so `.env` edits take effect without restart.
     try:
         from tracker.dynamic_config import effective_settings
@@ -293,14 +992,14 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                 cid_i = 0
             if cid_i > 0:
                 owner_user_id = str(cid_i)
-                repo.set_app_config("telegram_owner_user_id", owner_user_id)
+                _set_app_config_best_effort(repo, key="telegram_owner_user_id", value=owner_user_id)
 
         # One-time welcome (best-effort).
         notified = (repo.get_app_config("telegram_connected_notified") or "").strip()
         if notified != "1":
             try:
                 await _telegram_send_welcome(settings=settings, chat_id=existing_chat_id)
-                repo.set_app_config("telegram_connected_notified", "1")
+                _set_app_config_best_effort(repo, key="telegram_connected_notified", value="1")
             except Exception:
                 # Never block connect status on a welcome message failure.
                 pass
@@ -314,13 +1013,17 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
 
         poll_timeout = int(getattr(settings, "telegram_connect_poll_seconds", 0) or 0)
         poll_timeout = max(0, min(25, poll_timeout))
+        poll_client_timeout = _telegram_poll_client_timeout_seconds(
+            settings,
+            poll_timeout_seconds=poll_timeout,
+        )
 
         # Clear webhook only when needed (avoid adding an extra Telegram RTT per poll).
         try:
             cleared = (repo.get_app_config("telegram_webhook_cleared") or "").strip()
             if cleared != "1":
-                await telegram_delete_webhook(bot_token=token, client_timeout_seconds=settings.http_timeout_seconds)
-                repo.set_app_config("telegram_webhook_cleared", "1")
+                await telegram_delete_webhook(bot_token=token, client_timeout_seconds=poll_client_timeout)
+                _set_app_config_best_effort(repo, key="telegram_webhook_cleared", value="1")
         except Exception:
             pass
 
@@ -329,10 +1032,14 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                 bot_token=token,
                 offset=offset,
                 timeout_seconds=poll_timeout,
-                client_timeout_seconds=settings.http_timeout_seconds,
+                client_timeout_seconds=poll_client_timeout,
             )
             try:
-                repo.set_app_config("telegram_last_polled_at_utc", dt.datetime.utcnow().isoformat() + "Z")
+                _set_app_config_best_effort(
+                    repo,
+                    key="telegram_last_polled_at_utc",
+                    value=dt.datetime.utcnow().isoformat() + "Z",
+                )
             except Exception:
                 pass
         except RuntimeError as exc:
@@ -340,15 +1047,15 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
             msg = str(exc or "")
             if "webhook" in msg.lower():
                 try:
-                    await telegram_delete_webhook(bot_token=token, client_timeout_seconds=settings.http_timeout_seconds)
-                    repo.set_app_config("telegram_webhook_cleared", "1")
+                    await telegram_delete_webhook(bot_token=token, client_timeout_seconds=poll_client_timeout)
+                    _set_app_config_best_effort(repo, key="telegram_webhook_cleared", value="1")
                 except Exception:
                     pass
                 updates = await telegram_get_updates(
                     bot_token=token,
                     offset=offset,
                     timeout_seconds=poll_timeout,
-                    client_timeout_seconds=settings.http_timeout_seconds,
+                    client_timeout_seconds=poll_client_timeout,
                 )
             else:
                 raise
@@ -379,80 +1086,6 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                 return host
             except Exception:
                 return ""
-
-        def _apply_source_score_feedback(*, item_id: int | None, feedback_event_id: int | None, kind: str) -> None:
-            """
-            Best-effort source score adjustment from TG feedback.
-
-            Notes:
-            - Does NOT mark feedback events as applied (profile delta can still consume them).
-            - Respects operator locks (SourceScore.locked).
-            - Uses a small deterministic delta to keep behavior predictable.
-            """
-            try:
-                iid = int(item_id or 0)
-            except Exception:
-                iid = 0
-            try:
-                fid = int(feedback_event_id or 0)
-            except Exception:
-                fid = 0
-            if iid <= 0 or fid <= 0:
-                return
-            item = None
-            try:
-                item = repo.get_item_by_id(iid)
-            except Exception:
-                item = None
-            if not item:
-                return
-            try:
-                sid = int(getattr(item, "source_id", 0) or 0)
-            except Exception:
-                sid = 0
-            if sid <= 0:
-                return
-
-            marker = f"fb_id={fid}"
-            cur = None
-            try:
-                cur = repo.get_source_score(source_id=sid)
-            except Exception:
-                cur = None
-            prev_note = str(getattr(cur, "note", "") or "") if cur else ""
-            if marker in prev_note:
-                return
-
-            base = 50
-            try:
-                if cur:
-                    base = int(getattr(cur, "score", 50) or 50)
-            except Exception:
-                base = 50
-            base = max(0, min(100, int(base)))
-
-            k = (kind or "").strip().lower()
-            delta = 0
-            if k == "like":
-                delta = 5
-            elif k == "dislike":
-                delta = -12
-            elif k == "mute":
-                delta = -40
-            new_score = max(0, min(100, int(base + delta)))
-
-            note_line = f"[feedback] {marker} kind={k} delta={delta} new_score={new_score}"
-            merged = (prev_note.strip() + ("\n" if prev_note.strip() else "") + note_line).strip()
-            try:
-                repo.upsert_source_score(
-                    source_id=sid,
-                    score=new_score,
-                    origin="feedback",
-                    note=merged[:4000],
-                    force=False,
-                )
-            except Exception:
-                pass
 
         def _extract_first_url(text: str) -> str:
             # Very small heuristic: look for the first http(s):// token.
@@ -625,6 +1258,19 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
             except Exception:
                 return
 
+        async def _send_ack_to_chat(*, chat_id: str, text: str) -> None:
+            msg = (text or "").strip()
+            cid = (chat_id or "").strip()
+            if not (msg and cid):
+                return
+            try:
+                from tracker.push.telegram import TelegramPusher
+
+                p = TelegramPusher(token, timeout_seconds=int(settings.http_timeout_seconds or 20))
+                await p.send_text(chat_id=cid, text=msg, disable_preview=True)
+            except Exception:
+                return
+
         async def _send_with_markup(*, text: str, reply_markup: dict | None) -> int:
             msg = (text or "").strip()
             if not msg:
@@ -658,6 +1304,164 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                 f"Elapsed: {max(0, int(elapsed or 0))}s\n"
                 "I will write the result back into this same message when it is ready."
             )
+
+        def _feedback_item_context(*, item_id: int, fallback_url: str = "", fallback_domain: str = "") -> dict[str, str]:
+            title = ""
+            url = (fallback_url or "").strip()
+            domain = (fallback_domain or "").strip()
+            source_url = ""
+            try:
+                from tracker.models import Item, Source
+
+                item = repo.session.get(Item, int(item_id))
+                if item:
+                    title = (getattr(item, "title", "") or "").strip()
+                    if not url:
+                        url = (getattr(item, "canonical_url", "") or "").strip() or (getattr(item, "url", "") or "").strip()
+                    if not domain:
+                        domain = _domain_from_url(url)
+                    source_id = int(getattr(item, "source_id", 0) or 0)
+                    if source_id > 0:
+                        src = repo.session.get(Source, int(source_id))
+                        if src:
+                            source_url = (getattr(src, "url", "") or "").strip()
+            except Exception:
+                pass
+            return {
+                "title": title,
+                "url": url,
+                "domain": domain,
+                "source_url": source_url,
+            }
+
+        async def _queue_feedback_config_agent_task(*, ev, request_message_id: int) -> bool:  # noqa: ANN001
+            if not (
+                getattr(settings, "llm_base_url", None)
+                and (getattr(settings, "llm_model_reasoning", None) or getattr(settings, "llm_model", None))
+            ):
+                if _out_lang() == "zh":
+                    await _send_ack("⚠️ 未配置 LLM；暂时无法生成智能修正计划")
+                else:
+                    await _send_ack("⚠️ LLM is not configured; cannot generate a smart fix plan")
+                return False
+
+            item_id = int(getattr(ev, "item_id", 0) or 0)
+            url = str(getattr(ev, "url", "") or "").strip()
+            domain = str(getattr(ev, "domain", "") or "").strip()
+            note = str(getattr(ev, "note", "") or "").strip()
+            ctx = _feedback_item_context(item_id=item_id, fallback_url=url, fallback_domain=domain)
+            title = (ctx.get("title") or "").strip()
+            url = (ctx.get("url") or "").strip()
+            domain = (ctx.get("domain") or "").strip()
+            source_url = (ctx.get("source_url") or "").strip()
+
+            if _out_lang() == "zh":
+                lines = [
+                    "用户刚刚对一条 Telegram Alert 点了 👎。",
+                    "请生成一份“智能配置计划”，目标是减少这类误报。",
+                    "",
+                    "要求：",
+                    "- 优先调整 Profile / Topic Gates / Alert 判定 / Prompt 相关配置。",
+                    "- 不要默认静音或屏蔽整个域名；只有证据足够强时才考虑域名级动作。",
+                    "- 方案必须最小、可审计、可回滚。",
+                    "",
+                    "证据：",
+                    f"- title: {title or '(unknown)'}",
+                    f"- domain: {domain or '(unknown)'}",
+                    f"- url: {url or '(unknown)'}",
+                ]
+                if source_url:
+                    lines.append(f"- source_url: {source_url}")
+                if note:
+                    lines.append(f"- feedback_note: {note}")
+            else:
+                lines = [
+                    "The user just reacted 👎 to a Telegram alert.",
+                    "Generate a smart configuration plan to reduce similar false-positive alerts.",
+                    "",
+                    "Requirements:",
+                    "- Prefer Profile / Topic Gates / alert decision / prompt-related changes first.",
+                    "- Do not default to muting or excluding the whole domain unless evidence is strong.",
+                    "- Keep the plan minimal, auditable, and reversible.",
+                    "",
+                    "Evidence:",
+                    f"- title: {title or '(unknown)'}",
+                    f"- domain: {domain or '(unknown)'}",
+                    f"- url: {url or '(unknown)'}",
+                ]
+                if source_url:
+                    lines.append(f"- source_url: {source_url}")
+                if note:
+                    lines.append(f"- feedback_note: {note}")
+            query = "\n".join(lines).strip()
+
+            repo.cancel_telegram_tasks(chat_id=existing_chat_id, kind="config_agent", status="pending", reason="superseded_by_feedback_fix")
+            repo.cancel_telegram_tasks(chat_id=existing_chat_id, kind="config_agent", status="awaiting", reason="superseded_by_feedback_fix")
+            ack_mid = int(await _send_with_markup(text=_config_agent_pending_text(refine=False, elapsed=0, tick=0), reply_markup=None) or 0)
+            prompt_mid = ack_mid if ack_mid > 0 else -int(dt.datetime.utcnow().timestamp() * 1_000_000)
+            repo.create_telegram_task(
+                chat_id=existing_chat_id,
+                user_id=uid,
+                kind="config_agent",
+                status="pending",
+                prompt_message_id=prompt_mid,
+                request_message_id=(request_message_id if int(request_message_id or 0) > 0 else 0),
+                item_id=(item_id if item_id > 0 else None),
+                url=url,
+                query=query,
+            )
+            return True
+
+        async def _send_dislike_followup_menu(*, ev, request_message_id: int) -> None:  # noqa: ANN001
+            ev_id = int(getattr(ev, "id", 0) or 0)
+            if ev_id <= 0:
+                return
+            item_id = int(getattr(ev, "item_id", 0) or 0)
+            url = str(getattr(ev, "url", "") or "").strip()
+            domain = str(getattr(ev, "domain", "") or "").strip()
+            ctx = _feedback_item_context(item_id=item_id, fallback_url=url, fallback_domain=domain)
+            domain = (ctx.get("domain") or "").strip()
+            try:
+                muted = bool(domain) and repo.is_muted(scope="domain", key=domain, when=dt.datetime.utcnow())
+            except Exception:
+                muted = False
+
+            is_zh = _out_lang() == "zh"
+            text2 = (
+                "已记录：👎\n如果这条不该被升级成 Alert，优先点「🧠 智能修正画像/Prompt」；只有这个域名整体噪音大时，再用静音/降级/屏蔽。"
+                if is_zh
+                else (
+                    "Recorded: 👎\nIf this should not have been upgraded to an alert, use "
+                    "\"🧠 Smart fix profile/prompt\" first; only mute/downrank/exclude when the whole domain is noisy."
+                )
+            )
+
+            kb_rows: list[list[dict[str, str]]] = [
+                [
+                    {
+                        "text": ("🧠 智能修正画像/Prompt" if is_zh else "🧠 Smart fix profile/prompt"),
+                        "callback_data": f"fb:config_fix:{ev_id}",
+                    }
+                ]
+            ]
+            if domain:
+                row2: list[dict[str, str]] = []
+                if not muted:
+                    days2 = _default_mute_days()
+                    row2.append({"text": (f"🔕 静音 {days2} 天" if is_zh else f"🔕 Mute {days2}d"), "callback_data": f"fb:mute:{ev_id}"})
+                row2.append({"text": ("⬇️ 降级域名" if is_zh else "⬇️ Downrank domain"), "callback_data": f"fb:downrank_domain:{ev_id}"})
+                kb_rows.append(row2)
+                kb_rows.append(
+                    [
+                        {"text": ("🚫 屏蔽域名" if is_zh else "🚫 Exclude domain"), "callback_data": f"fb:exclude_domain:{ev_id}"},
+                    ]
+                )
+            kb_rows.append(
+                [
+                    {"text": ("忽略" if is_zh else "Ignore"), "callback_data": f"fb:ignore:{ev_id}"},
+                ]
+            )
+            await _send_with_markup(text=text2, reply_markup={"inline_keyboard": kb_rows})
 
         def _env_path() -> str:
             from pathlib import Path
@@ -2065,6 +2869,12 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
             if isinstance(cq, dict):
                 cq_id = str(cq.get("id") or "").strip()
                 data = str(cq.get("data") or "").strip()
+                reader_embedded_key = ""
+                reader_parts: list[str] = []
+                reader_action_hint = ""
+                if data.startswith(("br:", "brk:")):
+                    reader_embedded_key, reader_parts = _parse_reader_callback_payload(data)
+                    reader_action_hint = (reader_parts[1] if len(reader_parts) >= 2 else "").strip().lower()
                 from_obj = cq.get("from")
                 uid = str(from_obj.get("id") or "").strip() if isinstance(from_obj, dict) else ""
 
@@ -2092,19 +2902,24 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                 # Best-effort: stop the client spinner early.
                 try:
                     ack_text = "OK"
-                    if data.startswith("br:rerun"):
+                    if reader_action_hint == "rerun":
                         ack_text = "正在生成新一份参考消息…" if _out_lang() == "zh" else "Generating a new batch…"
+                    elif data.startswith(("br:", "brk:")):
+                        ack_text = "正在翻页…" if _out_lang() == "zh" else "Loading…"
                     elif data.startswith("cfgag:apply"):
                         ack_text = "正在应用智能配置…" if _out_lang() == "zh" else "Applying config…"
                     elif data.startswith("cfgag:cancel"):
                         ack_text = "已取消" if _out_lang() == "zh" else "Canceled"
-                    await telegram_answer_callback_query(
-                        bot_token=token,
-                        callback_query_id=cq_id,
-                        text=ack_text,
-                        show_alert=False,
-                        client_timeout_seconds=settings.http_timeout_seconds,
+                    asyncio.create_task(
+                        _answer_callback_query_best_effort(
+                            bot_token=token,
+                            callback_query_id=cq_id,
+                            text=ack_text,
+                            show_alert=False,
+                            client_timeout_seconds=_telegram_interaction_timeout_seconds(settings),
+                        )
                     )
+                    await asyncio.sleep(0)
                 except Exception:
                     pass
 
@@ -2264,12 +3079,42 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                         continue
 
                 # --- Report Reader (Curated Info)
-                if data.startswith("br:"):
-                    try:
-                        msg_map = repo.get_telegram_message(chat_id=existing_chat_id, message_id=mid)
-                    except Exception:
-                        msg_map = None
-                    report_key = (getattr(msg_map, "idempotency_key", "") or "").strip() if msg_map else ""
+                if data.startswith(("br:", "brk:")):
+                    msg_map = _get_telegram_message_with_fallback(
+                        repo=repo,
+                        make_session=make_session,
+                        chat_id=existing_chat_id,
+                        message_id=mid,
+                    )
+                    if msg_map is None:
+                        rep_recovered = _recover_digest_report_from_message(
+                            repo=repo,
+                            message=msg_obj if isinstance(msg_obj, dict) else None,
+                        )
+                        if rep_recovered is not None:
+                            try:
+                                repo.ensure_telegram_messages_recorded(
+                                    chat_id=existing_chat_id,
+                                    idempotency_key=str(getattr(rep_recovered, "idempotency_key", "") or "").strip(),
+                                    message_ids=[mid],
+                                    kind="digest",
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "telegram reader mapping recovery persist failed: chat_id=%s message_id=%s err=%s",
+                                    existing_chat_id,
+                                    mid,
+                                    _telegram_exc_text(exc),
+                                )
+                            msg_map = _get_telegram_message_with_fallback(
+                                repo=repo,
+                                make_session=make_session,
+                                chat_id=existing_chat_id,
+                                message_id=mid,
+                            )
+                    report_key = (reader_embedded_key or "").strip()
+                    if not report_key:
+                        report_key = (getattr(msg_map, "idempotency_key", "") or "").strip() if msg_map else ""
                     if not report_key:
                         if _out_lang() == "zh":
                             await _send_ack("⚠️ 这条 Reader 已过期（找不到关联报告）。请等下一轮推送。")
@@ -2356,7 +3201,7 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                             await _send_ack("⚠️ Report not found (may have been pruned).")
                         continue
 
-                    parts = [p for p in data.split(":") if p]
+                    parts = list(reader_parts or [p for p in data.split(":") if p])
                     action = parts[1] if len(parts) >= 2 else "toc"
                     out_lang = _out_lang()
                     show_feedback = bool(
@@ -2446,81 +3291,47 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                 await _send_ack("⚠️ New batch failed: push skipped or empty result; retry later.")
                         continue
 
+                    if make_session is not None and _reader_action_is_coalescible(action=action, parts=parts):
+                        await _queue_reader_navigation_request(
+                            _ReaderNavRequest(
+                                bot_token=token,
+                                timeout_seconds=_telegram_interaction_timeout_seconds(settings),
+                                chat_id=existing_chat_id,
+                                message_id=mid,
+                                report_key=report_key,
+                                markdown=md,
+                                action=action,
+                                parts=tuple(parts),
+                                out_lang=out_lang,
+                                show_feedback=show_feedback,
+                                mute_days=_default_mute_days(),
+                            ),
+                            make_session=make_session,
+                        )
+                        continue
+
                     try:
                         from tracker.push.telegram import TelegramPusher
 
-                        p = TelegramPusher(token, timeout_seconds=int(settings.http_timeout_seconds or 20))
+                        p = TelegramPusher(token, timeout_seconds=_telegram_interaction_timeout_seconds(settings))
 
                         text_html = ""
                         kb: dict | None = None
 
-                        if action in {"toc", "menu"}:
-                            try:
-                                toc_page = int(parts[2]) if len(parts) >= 3 else 0
-                            except Exception:
-                                toc_page = 0
-                            from tracker.telegram_report_reader import render_cover_html
-
-                            text_html, kb = render_cover_html(
-                                markdown=md,
-                                idempotency_key=report_key,
-                                lang=out_lang,
-                                toc_page=toc_page,
-                                show_feedback=show_feedback,
-                            )
-                        elif action == "sec":
-                            try:
-                                sec_idx = int(parts[2]) if len(parts) >= 3 else 0
-                            except Exception:
-                                sec_idx = 0
-                            try:
-                                page_i = int(parts[3]) if len(parts) >= 4 else 0
-                            except Exception:
-                                page_i = 0
-                            from tracker.telegram_report_reader import render_section_html
-
-                            text_html, kb = render_section_html(
-                                markdown=md,
-                                section_index=sec_idx,
-                                page=page_i,
-                                lang=out_lang,
-                                show_feedback=show_feedback,
-                            )
-                        elif action in {"refs", "ref"}:
-                            try:
-                                page_i = int(parts[2]) if len(parts) >= 3 else 0
-                            except Exception:
-                                page_i = 0
-                            from tracker.telegram_report_reader import render_references_html
-
-                            text_html, kb = render_references_html(
-                                markdown=md, page=page_i, lang=out_lang, show_feedback=show_feedback
-                            )
-                        elif action in {"full"}:
-                            try:
-                                page_i = int(parts[2]) if len(parts) >= 3 else 0
-                            except Exception:
-                                page_i = 0
-                            if report_key.startswith("digest:"):
-                                from tracker.telegram_report_reader import render_digest_full_html
-
-                                text_html, kb = render_digest_full_html(
-                                    markdown=md,
-                                    page=page_i,
-                                    lang=out_lang,
-                                    show_feedback=show_feedback,
-                                )
-                            else:
-                                from tracker.telegram_report_reader import render_full_html
-
-                                text_html, kb = render_full_html(
-                                    markdown=md,
-                                    page=page_i,
-                                    lang=out_lang,
-                                    show_feedback=show_feedback,
-                                )
+                        rendered = _render_reader_navigation_view(
+                            markdown=md,
+                            report_key=report_key,
+                            action=action,
+                            parts=parts,
+                            out_lang=out_lang,
+                            show_feedback=show_feedback,
+                        )
+                        if rendered is not None:
+                            text_html, kb = rendered
                         elif action == "fb":
                             if not show_feedback:
+                                from tracker.telegram_report_reader import reader_callback_data
+
                                 msg = "⚠️ 已关闭：digest 条目反馈" if out_lang == "zh" else "⚠️ Disabled: digest item feedback"
                                 text_html = f"🗳️ <b>{'反馈' if out_lang == 'zh' else 'Feedback'}</b>\n\n{msg}"
                                 kb = {
@@ -2528,7 +3339,7 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                         [
                                             {
                                                 "text": ("⬅️ 目录" if out_lang == "zh" else "⬅️ TOC"),
-                                                "callback_data": "br:toc:0",
+                                                "callback_data": reader_callback_data(report_key=report_key, action="toc", parts=[0]),
                                             }
                                         ]
                                     ]
@@ -2586,10 +3397,6 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                                 ensure_ascii=False,
                                             ),
                                         )
-                                        try:
-                                            _apply_source_score_feedback(item_id=(item_id if item_id > 0 else None), feedback_event_id=int(ev.id), kind=kind)
-                                        except Exception:
-                                            pass
                                         pending_feedback_for_profile.append(int(ev.id))
                                         if out_lang == "zh":
                                             status = (f"{'👍' if kind == 'like' else '👎'} 已记录：#{int(ref_n)}").strip()
@@ -2620,10 +3427,6 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                                 ensure_ascii=False,
                                             ),
                                         )
-                                        try:
-                                            _apply_source_score_feedback(item_id=(item_id if item_id > 0 else None), feedback_event_id=int(getattr(evm, "id", 0) or 0), kind="mute")
-                                        except Exception:
-                                            pass
                                         status = f"🔕 已静音：{domain2}（{int(days)} 天）" if out_lang == "zh" else f"🔕 muted: {domain2} ({int(days)}d)"
                                     else:
                                         status = f"⚠️ 找不到条目：#{int(ref_n)}" if out_lang == "zh" else f"⚠️ item not found: #{int(ref_n)}"
@@ -2636,6 +3439,7 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                     lang=out_lang,
                                     mute_days=_default_mute_days(),
                                     status=status,
+                                    report_key=report_key,
                                 )
                         else:
                             from tracker.telegram_report_reader import render_cover_html
@@ -2688,12 +3492,12 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                         report_key,
                                         existing_chat_id,
                                         int(mid2),
-                                        map_exc,
+                                        _telegram_exc_text(map_exc),
                                     )
                         continue
                     except Exception as exc:
                         # Best-effort fallback: send a new message when edit fails (e.g. not editable).
-                        msg = (str(exc) or "").strip()
+                        msg = _telegram_exc_text(exc)
                         if _out_lang() == "zh":
                             await _send_ack(f"⚠️ Reader 操作失败：{msg[:180] + ('…' if len(msg) > 180 else '')}")
                         else:
@@ -4064,7 +4868,6 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                     await _send_with_markup(text=text, reply_markup=kb)
                     continue
 
-                # --- Research menu/actions (website-free)
                 # --- Prompts (slot bindings + template overrides)
                 if data.startswith("pr:"):
                     parts = [p for p in data.split(":") if p]
@@ -4784,6 +5587,12 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                     url = str(getattr(ev0, "url", "") or "").strip()
                     domain = str(getattr(ev0, "domain", "") or "").strip()
 
+                    if action in {"config_fix", "smart_fix"}:
+                        ok = await _queue_feedback_config_agent_task(ev=ev0, request_message_id=mid)
+                        if ok and str(getattr(ev0, "kind", "") or "").strip() == "comment":
+                            repo.mark_feedback_events_applied(ids=[int(ev_id)])
+                        continue
+
                     if action in {"like", "dislike"}:
                         ev2 = repo.add_feedback_event(
                             channel="telegram",
@@ -4798,16 +5607,12 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                             note=f"from_comment:{ev_id}",
                             raw=json.dumps({"comment_id": ev_id}, ensure_ascii=False),
                         )
-                        try:
-                            _apply_source_score_feedback(item_id=(item_id if item_id > 0 else None), feedback_event_id=int(ev2.id), kind=action)
-                        except Exception:
-                            pass
                         pending_feedback_for_profile.append(int(ev2.id))
                         repo.mark_feedback_events_applied(ids=[int(ev_id)])
                         if _out_lang() == "zh":
-                            await _send_ack(f"✅ 已记录：{action}（用于更新 Profile/域名质量）")
+                            await _send_ack(f"✅ 已记录：{action}（用于更新 Profile / Prompt 软信号）")
                         else:
-                            await _send_ack(f"✅ recorded: {action} (for profile/domain quality)")
+                            await _send_ack(f"✅ recorded: {action} (for profile/prompt soft signals)")
                         continue
 
                     if action in {"note", "profile_note"}:
@@ -4852,7 +5657,7 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                         target_slot_id = (
                             (repo.get_app_config("telegram_prompt_delta_target_slot_id") or "").strip()
                             or (getattr(settings, "telegram_prompt_delta_target_slot_id", "") or "").strip()
-                            or "research.engine.synth.operator_delta"
+                            or "llm.curate_items.operator_delta"
                         )
 
                         ev2 = repo.add_feedback_event(
@@ -5177,7 +5982,7 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                         payload = json.loads((getattr(t_td, "intent", "") or "").strip() or "{}")
                     except Exception:
                         payload = {}
-                    target_slot_id = "research.engine.synth.operator_delta"
+                    target_slot_id = "llm.curate_items.operator_delta"
                     target_template_id = ""
                     out_lang = _out_lang()
                     delta_new = ""
@@ -5351,7 +6156,12 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                         continue
 
                     if mid > 0 and emoji:
-                        tm = repo.get_telegram_message(chat_id=existing_chat_id, message_id=mid)
+                        tm = _get_telegram_message_with_fallback(
+                            repo=repo,
+                            make_session=make_session,
+                            chat_id=existing_chat_id,
+                            message_id=mid,
+                        )
                         item_id = int(getattr(tm, "item_id", 0) or 0) if tm else 0
                         if item_id > 0:
                             url, domain = _item_from_id(item_id)
@@ -5378,10 +6188,6 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                     note=f"reaction:{emoji}",
                                     raw=json.dumps({"emoji": emoji}),
                                 )
-                                try:
-                                    _apply_source_score_feedback(item_id=item_id, feedback_event_id=int(ev.id), kind=kind)
-                                except Exception:
-                                    pass
                                 if kind in {"like", "dislike", "rate"}:
                                     pending_feedback_for_profile.append(int(ev.id))
                                 if kind == "mute" and domain:
@@ -5393,31 +6199,7 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                     else:
                                         await _send_ack(f"🔕 muted: {domain} ({value_int} days)")
                                 elif kind == "dislike" and domain:
-                                    # Offer a one-tap "mute domain" suggestion without spamming.
-                                    try:
-                                        muted = repo.is_muted(scope="domain", key=domain, when=dt.datetime.utcnow())
-                                    except Exception:
-                                        muted = False
-                                    if not muted:
-                                        days2 = _default_mute_days()
-                                        is_zh = _out_lang() == "zh"
-                                        text2 = (
-                                            f"已记录：👎\n要静音域名 `{domain}` {days2} 天吗？"
-                                            if is_zh
-                                            else f"Recorded: 👎\nMute `{domain}` for {days2} days?"
-                                        )
-                                        kb2 = {
-                                            "inline_keyboard": [
-                                                [
-                                                    {"text": (f"🔕 静音 {days2} 天" if is_zh else f"🔕 Mute {days2}d"), "callback_data": f"fb:mute:{int(ev.id)}"},
-                                                    {"text": ("🚫 屏蔽域名" if is_zh else "🚫 Exclude domain"), "callback_data": f"fb:exclude_domain:{int(ev.id)}"},
-                                                ],
-                                                [
-                                                    {"text": ("忽略" if is_zh else "Ignore"), "callback_data": f"fb:ignore:{int(ev.id)}"},
-                                                ],
-                                            ]
-                                        }
-                                        await _send_with_markup(text=text2, reply_markup=kb2)
+                                    await _send_dislike_followup_menu(ev=ev, request_message_id=mid)
                 continue
 
             # 2) Messages (commands / reply feedback).
@@ -5428,22 +6210,40 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
             if not isinstance(chat, dict) or "id" not in chat:
                 continue
             chat_id = str(chat.get("id")).strip()
-            if chat_id != existing_chat_id:
+            if not chat_id:
                 continue
 
             from_obj = msg.get("from")
             uid = str(from_obj.get("id") or "").strip() if isinstance(from_obj, dict) else ""
-            if not owner_user_id and uid:
-                owner_user_id = uid
-                repo.set_app_config("telegram_owner_user_id", uid)
-            if owner_user_id and uid and uid != owner_user_id:
-                continue
 
             text = msg.get("text")
             if not isinstance(text, str):
                 continue
+            external_bind_code = _extract_external_bind_code(text, settings)
+            if external_bind_code:
+                res = await _forward_external_bind_code(
+                    settings=settings,
+                    code=external_bind_code,
+                    telegram_chat_id=chat_id,
+                    telegram_user_id=uid,
+                    username=str(from_obj.get("username") or "").strip() if isinstance(from_obj, dict) else "",
+                    text=text,
+                    locale=_out_lang(),
+                )
+                await _send_ack_to_chat(chat_id=chat_id, text=str(res.get("reply_text") or "").strip())
+                continue
+
+            if chat_id != existing_chat_id:
+                continue
+
+            if not owner_user_id and uid:
+                owner_user_id = uid
+                repo.set_app_config("telegram_owner_user_id", uid)
+
             s = text.strip()
             if not s:
+                continue
+            if owner_user_id and uid and uid != owner_user_id:
                 continue
 
             # Status/help commands.
@@ -6134,7 +6934,7 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                         payload = json.loads((getattr(t_td, "intent", "") or "").strip() or "{}")
                     except Exception:
                         payload = {}
-                    target_slot_id = "research.engine.synth.operator_delta"
+                    target_slot_id = "llm.curate_items.operator_delta"
                     target_template_id = ""
                     out_lang = _out_lang()
                     fb_ids: list[int] = []
@@ -6877,7 +7677,12 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
 
             target_item_id = 0
             if reply_mid > 0:
-                tm = repo.get_telegram_message(chat_id=existing_chat_id, message_id=reply_mid)
+                tm = _get_telegram_message_with_fallback(
+                    repo=repo,
+                    make_session=make_session,
+                    chat_id=existing_chat_id,
+                    message_id=reply_mid,
+                )
                 target_item_id = int(getattr(tm, "item_id", 0) or 0) if tm else 0
 
             # Parse explicit item id in command text.
@@ -7111,7 +7916,6 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                         [
                             {"text": ("Sources" if is_zh else "Sources"), "callback_data": "s:page:0"},
                             {"text": ("Profile" if is_zh else "Profile"), "callback_data": "profile:menu"},
-                            {"text": ("Research" if is_zh else "Research"), "callback_data": "research:menu"},
                         ],
                         [
                             {"text": ("Push" if is_zh else "Push"), "callback_data": "push:menu"},
@@ -7624,10 +8428,12 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                 kind = "unmute"
             elif reply_mid > 0 and s.isdigit():
                 # Bare numeric rating is only meaningful when replying to a *single-item* push (alert).
-                try:
-                    tm_rating = repo.get_telegram_message(chat_id=existing_chat_id, message_id=reply_mid)
-                except Exception:
-                    tm_rating = None
+                tm_rating = _get_telegram_message_with_fallback(
+                    repo=repo,
+                    make_session=make_session,
+                    chat_id=existing_chat_id,
+                    message_id=reply_mid,
+                )
                 iid = int(getattr(tm_rating, "item_id", 0) or 0) if tm_rating else 0
                 if iid > 0:
                     try:
@@ -7671,7 +8477,12 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                 if not replies_enabled:
                     continue
                 if reply_mid > 0 and not s.startswith("/"):
-                    tm0 = repo.get_telegram_message(chat_id=existing_chat_id, message_id=reply_mid)
+                    tm0 = _get_telegram_message_with_fallback(
+                        repo=repo,
+                        make_session=make_session,
+                        chat_id=existing_chat_id,
+                        message_id=reply_mid,
+                    )
                     if tm0:
                         item_id_hint = int(getattr(tm0, "item_id", 0) or 0) if tm0 else 0
                         action_hint, ref_idx, remainder = _parse_reply_item_selector(s)
@@ -7731,10 +8542,6 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                 note="reply_index",
                                 raw=json.dumps(raw2, ensure_ascii=False),
                             )
-                            try:
-                                _apply_source_score_feedback(item_id=(item_id_hint if item_id_hint > 0 else None), feedback_event_id=int(ev.id), kind=str(action_hint))
-                            except Exception:
-                                pass
                             pending_feedback_for_profile.append(int(ev.id))
 
                             # Acknowledge quickly; for dislikes, offer a one-tap domain action menu.
@@ -7750,30 +8557,7 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                                 await _send_ack(f"✅ recorded: {tag}{anchor}{title3}".strip())
 
                             if action_hint == "dislike" and dom0:
-                                try:
-                                    muted = repo.is_muted(scope="domain", key=dom0, when=dt.datetime.utcnow())
-                                except Exception:
-                                    muted = False
-                                if not muted:
-                                    days2 = _default_mute_days()
-                                    is_zh = _out_lang() == "zh"
-                                    text2 = (
-                                        f"已记录：👎\n要静音域名 `{dom0}` {days2} 天吗？"
-                                        if is_zh
-                                        else f"Recorded: 👎\nMute `{dom0}` for {days2} days?"
-                                    )
-                                    kb2 = {
-                                        "inline_keyboard": [
-                                            [
-                                                {"text": (f"🔕 静音 {days2} 天" if is_zh else f"🔕 Mute {days2}d"), "callback_data": f"fb:mute:{int(ev.id)}"},
-                                                {"text": ("🚫 屏蔽域名" if is_zh else "🚫 Exclude domain"), "callback_data": f"fb:exclude_domain:{int(ev.id)}"},
-                                            ],
-                                            [
-                                                {"text": ("忽略" if is_zh else "Ignore"), "callback_data": f"fb:ignore:{int(ev.id)}"},
-                                            ],
-                                        ]
-                                    }
-                                    await _send_one_with_markup(text=text2, reply_markup=kb2)
+                                await _send_dislike_followup_menu(ev=ev, request_message_id=msg_id)
                             continue
 
                         ev0 = repo.add_feedback_event(
@@ -7906,10 +8690,6 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
             )
 
             if kind in {"like", "dislike", "rate"}:
-                try:
-                    _apply_source_score_feedback(item_id=(target_item_id if target_item_id > 0 else None), feedback_event_id=int(ev.id), kind=kind)
-                except Exception:
-                    pass
                 pending_feedback_for_profile.append(int(ev.id))
 
             if kind == "mute":
@@ -7957,30 +8737,7 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
                 # If this was a dislike anchored on a pushed item (reply), offer a one-tap domain action menu.
                 # This mirrors the reaction UX, and helps operators quickly mute/exclude low-signal domains.
                 if kind == "dislike" and reply_mid > 0 and domain:
-                    try:
-                        muted = repo.is_muted(scope="domain", key=domain, when=dt.datetime.utcnow())
-                    except Exception:
-                        muted = False
-                    if not muted:
-                        days2 = _default_mute_days()
-                        is_zh = _out_lang() == "zh"
-                        text2 = (
-                            f"已记录：👎\n要静音域名 `{domain}` {days2} 天吗？"
-                            if is_zh
-                            else f"Recorded: 👎\nMute `{domain}` for {days2} days?"
-                        )
-                        kb2 = {
-                            "inline_keyboard": [
-                                [
-                                    {"text": (f"🔕 静音 {days2} 天" if is_zh else f"🔕 Mute {days2}d"), "callback_data": f"fb:mute:{int(ev.id)}"},
-                                    {"text": ("🚫 屏蔽域名" if is_zh else "🚫 Exclude domain"), "callback_data": f"fb:exclude_domain:{int(ev.id)}"},
-                                ],
-                                [
-                                    {"text": ("忽略" if is_zh else "Ignore"), "callback_data": f"fb:ignore:{int(ev.id)}"},
-                                ],
-                            ]
-                        }
-                        await _send_one_with_markup(text=text2, reply_markup=kb2)
+                    await _send_dislike_followup_menu(ev=ev, request_message_id=msg_id)
 
         if max_update_id is not None:
             repo.set_app_config("telegram_update_offset", str(max_update_id + 1))
@@ -8081,7 +8838,7 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
         return {"status": "connected", "chat_id": existing_chat_id}
 
     active_code = (code or repo.get_app_config("telegram_setup_code") or "").strip()
-    if not active_code:
+    if not active_code and not _external_bind_base_url(settings):
         return {"status": "no_code"}
 
     raw_off = (repo.get_app_config("telegram_update_offset") or "").strip()
@@ -8092,7 +8849,10 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
 
     # Make sure polling works even if the bot was configured with a webhook elsewhere.
     try:
-        await telegram_delete_webhook(bot_token=token, client_timeout_seconds=settings.http_timeout_seconds)
+        await telegram_delete_webhook(
+            bot_token=token,
+            client_timeout_seconds=_telegram_poll_client_timeout_seconds(settings, poll_timeout_seconds=0),
+        )
     except Exception:
         pass
 
@@ -8100,7 +8860,7 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
         bot_token=token,
         offset=offset,
         timeout_seconds=0,
-        client_timeout_seconds=settings.http_timeout_seconds,
+        client_timeout_seconds=_telegram_poll_client_timeout_seconds(settings, poll_timeout_seconds=0),
     )
 
     max_update_id: int | None = offset - 1 if offset is not None else None
@@ -8121,6 +8881,38 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
         text = msg.get("text")
         if not isinstance(text, str):
             continue
+        chat = msg.get("chat")
+        if not isinstance(chat, dict) or "id" not in chat:
+            continue
+        chat_id = str(chat.get("id")).strip()
+        if not chat_id:
+            continue
+        external_bind_code = _extract_external_bind_code(text, settings)
+        if external_bind_code:
+            from_obj = msg.get("from")
+            res = await _forward_external_bind_code(
+                settings=settings,
+                code=external_bind_code,
+                telegram_chat_id=chat_id,
+                telegram_user_id=str(from_obj.get("id") or "").strip() if isinstance(from_obj, dict) else "",
+                username=str(from_obj.get("username") or "").strip() if isinstance(from_obj, dict) else "",
+                text=text,
+                locale="zh",
+            )
+            try:
+                from tracker.push.telegram import TelegramPusher
+
+                p = TelegramPusher(token, timeout_seconds=int(settings.http_timeout_seconds or 20))
+                await p.send_text(
+                    chat_id=chat_id,
+                    text=str(res.get("reply_text") or "").strip(),
+                    disable_preview=True,
+                )
+            except Exception:
+                pass
+            continue
+        if not active_code:
+            continue
         start_payload = telegram_extract_start_payload(text)
         if start_payload is None:
             continue
@@ -8130,12 +8922,6 @@ async def telegram_poll(*, repo: Repo, settings: Settings, code: str | None = No
             uid = str(from_obj.get("id") or "").strip()
             if uid and uid != owner_user_id:
                 continue
-        chat = msg.get("chat")
-        if not isinstance(chat, dict) or "id" not in chat:
-            continue
-        chat_id = str(chat.get("id")).strip()
-        if not chat_id:
-            continue
         # Record the first successful connector as the owner (private bot posture).
         if not owner_user_id and isinstance(from_obj, dict):
             uid = str(from_obj.get("id") or "").strip()

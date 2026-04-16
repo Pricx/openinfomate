@@ -19,12 +19,12 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Upload
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from jinja2 import pass_context
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from tracker.db import session_factory
-from tracker.job_lock import job_lock
+from tracker.job_lock import job_lock, job_lock_async
 from tracker.logging_config import configure_logging
 from tracker.models import Base
 from tracker.repo import Repo
@@ -59,10 +59,28 @@ from tracker.actions import (
     update_binding as update_binding_action,
     update_source_meta as update_source_meta_action,
 )
-from tracker.llm import llm_plan_tracking_ai_setup, llm_propose_profile_setup, llm_propose_topic_setup
+from tracker.bridge_contract import (
+    BridgeConfigPlanRequest,
+    BridgeConfigPlanResponse,
+    BridgeMetaResponse,
+    BridgeProfileProposeRequest,
+    BridgeProfileProposeResponse,
+    BridgeTopicProposeRequest,
+    BridgeTopicProposeResponse,
+    BridgeTrackingPlanRequest,
+    BridgeTrackingPlanResponse,
+)
+from tracker.bridge_service import (
+    bridge_config_plan,
+    bridge_profile_propose,
+    bridge_topic_propose,
+    bridge_tracking_plan,
+)
+from tracker.llm import llm_plan_tracking_ai_setup
 from tracker.llm_usage import estimate_llm_cost_usd, make_llm_usage_recorder
 from tracker.i18n import LANG_COOKIE_NAME, SUPPORTED_LANGS, get_request_lang, normalize_lang, t as translate_text
 from tracker.envfile import parse_env_assignments
+from tracker.topic_gate_config import normalize_topic_gate_config
 from tracker.web.onboarding import ADVANCED_TOUR_DISMISSED_KEY, build_onboarding_state
 from tracker.web.config_chat import build_config_chat_bootstrap, build_web_config_chat_history_text, build_web_config_chat_page_context
 from tracker.config_agent_core import apply_config_agent_plan, plan_config_agent_request, validate_config_agent_plan
@@ -271,6 +289,37 @@ class TopicPolicyUpdate(BaseModel):
     llm_curation_enabled: bool | None = None
     llm_curation_prompt: str | None = None
 
+
+class TopicGateUpdate(BaseModel):
+    candidate_min_score: int | None = Field(default=None, ge=0, le=100)
+    candidate_convergence: str | None = None
+    push_min_score: int | None = Field(default=None, ge=0, le=100)
+    max_digest_items: int | None = Field(default=None, ge=1)
+    max_alert_items: int | None = Field(default=None, ge=1)
+    push_dedupe_strength: str | None = None
+
+    @field_validator(
+        "candidate_min_score",
+        "push_min_score",
+        "max_digest_items",
+        "max_alert_items",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_optional_int(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("candidate_convergence", "push_dedupe_strength", mode="before")
+    @classmethod
+    def _normalize_optional_text(cls, value: object) -> object:
+        raw = str(value or "").strip()
+        return raw or None
+
+
 class TopicProposeRequest(BaseModel):
     name: str = ""
     brief: str = Field(min_length=1, max_length=4000)
@@ -476,6 +525,9 @@ def create_app(settings: Settings) -> FastAPI:
 
     def auth_dep(request: Request) -> None:
         return _require_auth(request, settings)
+
+    def localhost_dep(request: Request) -> None:
+        return _require_localhost(request)
 
     def _parse_linux_default_gateway_ip(route_text: str) -> str:
         """
@@ -887,33 +939,106 @@ def create_app(settings: Settings) -> FastAPI:
         )
         return {"ok": True}
 
-    @app.post("/topics/propose", response_model=TopicProposeResponse, dependencies=[Depends(auth_dep)])
-    async def propose_topic(payload: TopicProposeRequest, session: Session = Depends(get_db)):
+    @app.get("/config/topic-gates/defaults", dependencies=[Depends(auth_dep)])
+    @app.get("/topic-gates/defaults", dependencies=[Depends(auth_dep)])
+    def get_topic_gate_defaults(session: Session = Depends(get_db)):
+        repo = Repo(session)
+        defaults = repo.get_topic_gate_defaults()
+        return {
+            "defaults": defaults.to_dict(),
+            "effective": defaults.to_dict(),
+        }
+
+    @app.put("/config/topic-gates/defaults", dependencies=[Depends(auth_dep)])
+    @app.put("/topic-gates/defaults", dependencies=[Depends(auth_dep)])
+    def set_topic_gate_defaults(payload: TopicGateUpdate, session: Session = Depends(get_db)):
+        repo = Repo(session)
+        patch = {field: getattr(payload, field) for field in payload.model_fields_set}
+        try:
+            defaults = repo.set_topic_gate_defaults({}) if not patch else repo.patch_topic_gate_defaults(patch)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "ok": True,
+            "defaults": defaults.to_dict(),
+            "effective": defaults.to_dict(),
+        }
+
+    @app.get("/topics/{name}/gate-config", dependencies=[Depends(auth_dep)])
+    @app.get("/topics/{name}/gates", dependencies=[Depends(auth_dep)])
+    def get_topic_gates(name: str, session: Session = Depends(get_db)):
+        repo = Repo(session)
+        topic = repo.get_topic_by_name(name)
+        if not topic:
+            raise HTTPException(status_code=404, detail="topic not found")
+        return {
+            "topic": topic.name,
+            "topic_id": topic.id,
+            **repo.describe_topic_gate(topic_id=topic.id),
+        }
+
+    @app.put("/topics/{name}/gate-config", dependencies=[Depends(auth_dep)])
+    @app.put("/topics/{name}/gates", dependencies=[Depends(auth_dep)])
+    def set_topic_gates(name: str, payload: TopicGateUpdate, session: Session = Depends(get_db)):
+        repo = Repo(session)
+        topic = repo.get_topic_by_name(name)
+        if not topic:
+            raise HTTPException(status_code=404, detail="topic not found")
+        patch = {field: getattr(payload, field) for field in payload.model_fields_set}
+        try:
+            if not patch:
+                repo.delete_topic_gate_policy(topic_id=topic.id)
+            else:
+                repo.patch_topic_gate_policy(topic_id=topic.id, patch=patch)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "ok": True,
+            "topic": topic.name,
+            "topic_id": topic.id,
+            **repo.describe_topic_gate(topic_id=topic.id),
+        }
+
+    @app.post("/admin/topic/gates/defaults", dependencies=[Depends(auth_dep)])
+    def admin_topic_gate_defaults_update(
+        request: Request,
+        candidate_min_score: str = Form(""),
+        candidate_convergence: str = Form(""),
+        push_min_score: str = Form(""),
+        max_digest_items: str = Form(""),
+        max_alert_items: str = Form(""),
+        push_dedupe_strength: str = Form(""),
+        session: Session = Depends(get_db),
+    ):
         repo = Repo(session)
         try:
-            from tracker.dynamic_config import effective_settings
-
-            settings_eff = effective_settings(repo=repo, settings=settings)
-        except Exception:
-            settings_eff = settings
-        model_primary = str(
-            getattr(settings_eff, "llm_model_reasoning", "") or getattr(settings_eff, "llm_model", "") or ""
-        ).strip()
-        if not (settings_eff.llm_base_url and model_primary):
-            raise HTTPException(status_code=400, detail="LLM is not configured")
-        name_hint = (payload.name or "").strip()
-        brief = (payload.brief or "").strip()
-        if not brief:
-            raise HTTPException(status_code=400, detail="missing brief")
-
-        usage_cb = make_llm_usage_recorder(session=session)
-        try:
-            proposal = await llm_propose_topic_setup(
-                settings=settings_eff,
-                topic_name=(name_hint or "New Topic"),
-                brief=brief,
-                usage_cb=usage_cb,
+            config = normalize_topic_gate_config(
+                {
+                    "candidate_min_score": candidate_min_score,
+                    "candidate_convergence": candidate_convergence,
+                    "push_min_score": push_min_score,
+                    "max_digest_items": max_digest_items,
+                    "max_alert_items": max_alert_items,
+                    "push_dedupe_strength": push_dedupe_strength,
+                }
             )
+            repo.set_topic_gate_defaults(config)
+        except ValueError as exc:
+            return _redir(request, msg=f"topic gate defaults invalid: {exc}")
+        return _redir(request, msg="topic gate defaults updated")
+
+    @app.post("/topics/propose", response_model=TopicProposeResponse, dependencies=[Depends(auth_dep)])
+    async def propose_topic(payload: TopicProposeRequest, session: Session = Depends(get_db)):
+        try:
+            proposal = await bridge_topic_propose(
+                session=session,
+                settings=settings,
+                payload=BridgeTopicProposeRequest(name=payload.name or "", brief=payload.brief or ""),
+            )
+        except RuntimeError as exc:
+            detail = str(exc or "").strip() or "topic proposal failed"
+            status_code = 400 if ("not configured" in detail.lower() or "required" in detail.lower()) else 502
+            raise HTTPException(status_code=status_code, detail=detail) from exc
         except httpx.HTTPStatusError as exc:
             body = ""
             try:
@@ -925,54 +1050,37 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=502, detail=f"LLM HTTP {exc.response.status_code}: {body or exc}") from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"LLM error: {exc}") from exc
-        if proposal is None:
-            raise HTTPException(status_code=400, detail="LLM is not configured")
-
-        hints = None
-        if getattr(proposal, "source_hints", None):
-            h = proposal.source_hints
-            hints = TopicProposeSourceHints(
-                add_hn=bool(getattr(h, "add_hn", True)),
-                add_searxng=bool(getattr(h, "add_searxng", True)),
-                add_discourse=bool(getattr(h, "add_discourse", False)),
-                discourse_base_url=str(getattr(h, "discourse_base_url", "") or ""),
-                discourse_json_path=str(getattr(h, "discourse_json_path", "/latest.json") or "/latest.json"),
-                add_nodeseek=bool(getattr(h, "add_nodeseek", False)),
-            )
-
         return TopicProposeResponse(
             topic_name=proposal.topic_name,
-            query=proposal.query_keywords,
+            query=proposal.query,
             alert_keywords=proposal.alert_keywords,
             ai_prompt=proposal.ai_prompt,
-            source_hints=hints,
+            source_hints=(
+                TopicProposeSourceHints(
+                    add_hn=proposal.source_hints.add_hn,
+                    add_searxng=proposal.source_hints.add_searxng,
+                    add_discourse=proposal.source_hints.add_discourse,
+                    discourse_base_url=proposal.source_hints.discourse_base_url,
+                    discourse_json_path=proposal.source_hints.discourse_json_path,
+                    add_nodeseek=proposal.source_hints.add_nodeseek,
+                )
+                if proposal.source_hints
+                else None
+            ),
         )
 
     @app.post("/profile/propose", response_model=ProfileProposeResponse, dependencies=[Depends(auth_dep)])
     async def propose_profile(payload: ProfileProposeRequest, session: Session = Depends(get_db)):
-        repo = Repo(session)
         try:
-            from tracker.dynamic_config import effective_settings
-
-            settings_eff = effective_settings(repo=repo, settings=settings)
-        except Exception:
-            settings_eff = settings
-        model_primary = str(
-            getattr(settings_eff, "llm_model_reasoning", "") or getattr(settings_eff, "llm_model", "") or ""
-        ).strip()
-        if not (settings_eff.llm_base_url and model_primary):
-            raise HTTPException(status_code=400, detail="LLM is not configured")
-        raw = (payload.text or "").strip()
-        if not raw:
-            raise HTTPException(status_code=400, detail="missing text")
-
-        from tracker.profile_input import normalize_profile_text
-
-        text = normalize_profile_text(text=raw)
-
-        usage_cb = make_llm_usage_recorder(session=session)
-        try:
-            proposal = await llm_propose_profile_setup(settings=settings_eff, profile_text=text, usage_cb=usage_cb)
+            proposal = await bridge_profile_propose(
+                session=session,
+                settings=settings,
+                payload=BridgeProfileProposeRequest(text=payload.text),
+            )
+        except RuntimeError as exc:
+            detail = str(exc or "").strip() or "profile proposal failed"
+            status_code = 400 if ("not configured" in detail.lower() or "required" in detail.lower()) else 502
+            raise HTTPException(status_code=status_code, detail=detail) from exc
         except httpx.HTTPStatusError as exc:
             body = ""
             try:
@@ -984,16 +1092,68 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=502, detail=f"LLM HTTP {exc.response.status_code}: {body or exc}") from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"LLM error: {exc}") from exc
-        if proposal is None:
-            raise HTTPException(status_code=400, detail="LLM is not configured")
-
         return ProfileProposeResponse(
-            understanding=str(getattr(proposal, "understanding", "") or ""),
-            interest_axes=list(getattr(proposal, "interest_axes", []) or []),
-            interest_keywords=list(getattr(proposal, "interest_keywords", []) or []),
-            retrieval_queries=list(getattr(proposal, "retrieval_queries", []) or []),
-            ai_prompt=str(getattr(proposal, "ai_prompt", "") or ""),
+            understanding=proposal.understanding,
+            interest_axes=proposal.interest_axes,
+            interest_keywords=proposal.interest_keywords,
+            retrieval_queries=proposal.retrieval_queries,
+            ai_prompt=proposal.ai_prompt,
         )
+
+    @app.get(
+        "/internal/bridge/v1/meta",
+        response_model=BridgeMetaResponse,
+        dependencies=[Depends(localhost_dep)],
+    )
+    async def internal_bridge_meta():
+        return BridgeMetaResponse()
+
+    @app.post(
+        "/internal/bridge/v1/profile/propose",
+        response_model=BridgeProfileProposeResponse,
+        dependencies=[Depends(localhost_dep)],
+    )
+    async def internal_bridge_profile_propose(
+        payload: BridgeProfileProposeRequest,
+        session: Session = Depends(get_db),
+    ):
+        return await bridge_profile_propose(session=session, settings=settings, payload=payload)
+
+    @app.post(
+        "/internal/bridge/v1/topic/propose",
+        response_model=BridgeTopicProposeResponse,
+        dependencies=[Depends(localhost_dep)],
+    )
+    async def internal_bridge_topic_propose(
+        payload: BridgeTopicProposeRequest,
+        session: Session = Depends(get_db),
+    ):
+        return await bridge_topic_propose(session=session, settings=settings, payload=payload)
+
+    @app.post(
+        "/internal/bridge/v1/tracking/plan",
+        response_model=BridgeTrackingPlanResponse,
+        dependencies=[Depends(localhost_dep)],
+    )
+    async def internal_bridge_tracking_plan(
+        payload: BridgeTrackingPlanRequest,
+        session: Session = Depends(get_db),
+    ):
+        try:
+            return await bridge_tracking_plan(session=session, settings=settings, payload=payload)
+        except httpx.TimeoutException as exc:
+            raise HTTPException(status_code=504, detail="upstream core tracking planner timed out") from exc
+
+    @app.post(
+        "/internal/bridge/v1/config/plan",
+        response_model=BridgeConfigPlanResponse,
+        dependencies=[Depends(localhost_dep)],
+    )
+    async def internal_bridge_config_plan(
+        payload: BridgeConfigPlanRequest,
+        session: Session = Depends(get_db),
+    ):
+        return await bridge_config_plan(session=session, settings=settings, payload=payload)
 
     @app.post("/profile/delta/propose", response_model=ProfileDeltaProposeResponse, dependencies=[Depends(auth_dep)])
     async def propose_profile_delta(payload: ProfileDeltaProposeRequest, session: Session = Depends(get_db)):
@@ -1312,8 +1472,8 @@ def create_app(settings: Settings) -> FastAPI:
         return {"ok": True}
 
     @app.post("/run/tick", dependencies=[Depends(auth_dep)])
-    async def run_tick_endpoint(push: bool = False, session: Session = Depends(get_db)) -> dict:
-        result: TickResult = await run_tick(session=session, settings=settings, push=push)
+    async def run_tick_endpoint(push: bool = False, drain_backlog: bool = False, session: Session = Depends(get_db)) -> dict:
+        result: TickResult = await run_tick(session=session, settings=settings, push=push, drain_backlog=drain_backlog)
         return {
             "total_created": result.total_created,
             "total_pushed_alerts": result.total_pushed_alerts,
@@ -1609,7 +1769,15 @@ def create_app(settings: Settings) -> FastAPI:
         from tracker.telegram_connect import telegram_poll as telegram_poll_core
 
         try:
-            return await telegram_poll_core(repo=repo, settings=settings, code=payload.code)
+            async with job_lock_async(name="telegram_poll", timeout_seconds=0.2):
+                return await telegram_poll_core(repo=repo, settings=settings, code=payload.code)
+        except TimeoutError:
+            existing_chat_id = (repo.get_app_config("telegram_chat_id") or settings.telegram_chat_id or "").strip()
+            if existing_chat_id:
+                return {"status": "connected", "chat_id": existing_chat_id}
+            active_code = (payload.code or repo.get_app_config("telegram_setup_code") or "").strip()
+            external_bind_enabled = bool((getattr(settings, "telegram_external_bind_base_url", None) or "").strip())
+            return {"status": "pending" if (active_code or external_bind_enabled) else "no_code"}
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1726,6 +1894,7 @@ def create_app(settings: Settings) -> FastAPI:
         topics = repo.list_topics()
         topic_name_by_id = {t.id: t.name for t in topics}
         topic_policies = {p.topic_id: p for p in repo.list_topic_policies()}
+        topic_gate_defaults = repo.get_topic_gate_defaults().to_dict()
         meta_map = {s.id: m for s, _h, m in repo.list_sources_with_health_and_meta() if m}
         score_map = {int(s.source_id): s for s in repo.list_source_scores(limit=10_000)}
         candidates = repo.list_source_candidates(status="new", limit=50)
@@ -1948,10 +2117,10 @@ def create_app(settings: Settings) -> FastAPI:
         if ai_setup_auto_accept_enabled:
             ai_setup_notify_enabled = False
         try:
-            ai_setup_min_source_score = int(getattr(eff_settings, "source_quality_min_score", 50))
+            ai_setup_min_source_score = int(getattr(eff_settings, "source_quality_min_score", 0))
         except Exception:
-            ai_setup_min_source_score = 50
-        ai_setup_min_source_score = max(0, min(100, int(ai_setup_min_source_score or 50)))
+            ai_setup_min_source_score = 0
+        ai_setup_min_source_score = max(0, min(100, int(ai_setup_min_source_score or 0)))
         try:
             ai_setup_max_sources_total = int(getattr(eff_settings, "discover_sources_max_sources_total", 500) or 500)
         except Exception:
@@ -2025,6 +2194,7 @@ def create_app(settings: Settings) -> FastAPI:
                 "stats": stats,
                 "topics": topics,
                 "topic_policies": topic_policies,
+                "topic_gate_defaults": topic_gate_defaults,
                 "topic_name_by_id": topic_name_by_id,
                 "sources": repo.list_sources(),
                 "bindings": repo.list_topic_sources(),
@@ -3662,14 +3832,7 @@ def create_app(settings: Settings) -> FastAPI:
 
             profile_topic_name = (repo.get_app_config("profile_topic_name") or "Profile").strip() or "Profile"
 
-            # Fast-path: if the prompt is already in structured profile-brief form, skip the LLM
-            # planner and rely on deterministic expansion from INTEREST_AXES/RETRIEVAL_QUERIES.
-            #
-            # This avoids `httpx.ReadTimeout` on slow reasoning models / busy gateways.
-            if _looks_like_profile_brief(want_for_planner):
-                plan = _fallback_profile_seed_plan(profile_topic_name=profile_topic_name)
-                warnings = ["planner: skipped LLM (profile brief detected); expanded deterministically"]
-            elif needs_multi_pass:
+            if needs_multi_pass:
                 from tracker.config_agent import validate_ai_setup_plan
 
                 def _build_pass_prompt(
@@ -3860,111 +4023,8 @@ def create_app(settings: Settings) -> FastAPI:
                         usage_cb=usage_cb,
                     )
                 except Exception as exc:
-                    # Smart Config must work for arbitrary operator input. When planning times out,
-                    # fall back to a deterministic expansion from a transformed structured brief.
-                    #
-                    # This keeps the plan auditable (preview diff) and avoids hard 500s for non-profile input.
                     if isinstance(exc, httpx.TimeoutException):
-                        try:
-                            from tracker.llm import llm_transform_tracking_ai_setup_input
-
-                            info = transform_info if isinstance(transform_info, dict) else None
-                            if not info:
-                                info = await llm_transform_tracking_ai_setup_input(
-                                    repo=repo,
-                                    settings=eff,
-                                    user_prompt_chunk=want,
-                                    usage_cb=usage_cb,
-                                )
-                            if not isinstance(info, dict):
-                                info = {}
-
-                            understanding3 = str(info.get("understanding") or "").strip()
-                            axes3_raw = info.get("interest_axes") if isinstance(info.get("interest_axes"), list) else []
-                            kw3_raw = info.get("keywords") if isinstance(info.get("keywords"), list) else []
-                            q3_raw = info.get("seed_queries") if isinstance(info.get("seed_queries"), list) else []
-
-                            def _clean_list(items: object, *, max_items: int, max_len: int) -> list[str]:
-                                if not isinstance(items, list):
-                                    return []
-                                out2: list[str] = []
-                                seen2: set[str] = set()
-                                for x in items:
-                                    s = " ".join(str(x or "").split()).strip()
-                                    if not s:
-                                        continue
-                                    if len(s) > max_len:
-                                        s = s[:max_len].rstrip()
-                                    key = s.lower()
-                                    if key in seen2:
-                                        continue
-                                    seen2.add(key)
-                                    out2.append(s)
-                                    if len(out2) >= max_items:
-                                        break
-                                return out2
-
-                            axes3 = _clean_list(axes3_raw, max_items=120, max_len=220)
-                            kw3 = _clean_list(kw3_raw, max_items=400, max_len=100)
-                            q3 = _clean_list(q3_raw, max_items=200, max_len=260)
-
-                            # Ensure the structured brief is non-empty so `autofix` can expand.
-                            if not axes3:
-                                w0 = (want or "").strip()
-                                if w0:
-                                    axes3 = [(w0[:160].rstrip() + "…") if len(w0) > 160 else w0]
-                                else:
-                                    axes3 = []
-                            if not q3:
-                                w0 = (want or "").strip()
-                                if w0:
-                                    q3 = [(w0[:180].rstrip() + "…") if len(w0) > 180 else w0]
-                                else:
-                                    q3 = []
-
-                            lines2: list[str] = []
-                            lines2.append("SMART_CONFIG_INPUT (transformed after planner timeout):")
-                            if understanding3:
-                                lines2.append("")
-                                lines2.append("UNDERSTANDING:")
-                                lines2.append(understanding3)
-                            if axes3:
-                                lines2.append("")
-                                lines2.append("INTEREST_AXES:")
-                                for a in axes3[:200]:
-                                    lines2.append(f"- {a}")
-                            if kw3:
-                                lines2.append("")
-                                lines2.append("KEYWORDS:")
-                                for k in kw3[:400]:
-                                    lines2.append(f"- {k}")
-                            if q3:
-                                lines2.append("")
-                                lines2.append("SEED_QUERIES:")
-                                for q in q3[:400]:
-                                    lines2.append(f"- {q}")
-                            lines2.append("")
-                            lines2.append("REQUIREMENTS:")
-                            lines2.append("- Expand sources as much as possible; do not be conservative.")
-                            lines2.append("- Split into semantically-orthogonal topics; no preset topic count.")
-                            lines2.append("- Generate many short, semantically-orthogonal search seeds; do NOT stuff all keywords into one query.")
-                            lines2.append("- Do NOT omit sources because you judge them sensitive/gray/harmful; final judgement is human.")
-
-                            want_for_planner = "\n".join(lines2).strip()
-                            transform_info = {
-                                "understanding": understanding3,
-                                "interest_axes": list(axes3),
-                                "keywords": list(kw3),
-                                "seed_queries": list(q3),
-                            }
-
-                            plan = _fallback_profile_seed_plan(profile_topic_name=profile_topic_name)
-                            warnings = [f"planner: {type(exc).__name__}; expanded deterministically (transformed brief)"]
-                            planned = None
-                        except Exception as exc2:
-                            plan = _fallback_profile_seed_plan(profile_topic_name=profile_topic_name)
-                            warnings = [f"planner: {type(exc).__name__}; deterministic fallback failed: {str(exc2)[:200]}"]
-                            planned = None
+                        raise
                     else:
                         bumped = None
                         try:
@@ -4026,6 +4086,8 @@ def create_app(settings: Settings) -> FastAPI:
             preview_md = diff_tracking_snapshots(before=snap_before, after=snap_preview)
         except Exception as exc:
             msg = str(exc) or f"{type(exc).__name__}"
+            status_code = 504 if isinstance(exc, httpx.TimeoutException) else 500
+            error_code = "plan_timed_out" if isinstance(exc, httpx.TimeoutException) else "plan_failed"
             try:
                 logger.exception("ai-setup plan failed: %s", msg)
             except Exception:
@@ -4042,8 +4104,8 @@ def create_app(settings: Settings) -> FastAPI:
             except Exception:
                 pass
             return JSONResponse(
-                status_code=500,
-                content={"ok": False, "error": "plan_failed", "message": msg},
+                status_code=status_code,
+                content={"ok": False, "error": error_code, "message": msg},
             )
 
         try:
@@ -4602,9 +4664,9 @@ def create_app(settings: Settings) -> FastAPI:
         except Exception:
             aa = True
         try:
-            ms = int(getattr(eff, "source_quality_min_score", 50))
+            ms = int(getattr(eff, "source_quality_min_score", 0))
         except Exception:
-            ms = 50
+            ms = 0
         ms = max(0, min(100, int(ms)))
         try:
             mx = int(getattr(eff, "discover_sources_max_sources_total", 500) or 500)
@@ -5886,6 +5948,12 @@ def create_app(settings: Settings) -> FastAPI:
         sync_search_sources: bool = Form(False),
         ai_enabled: bool = Form(False),
         ai_prompt: str = Form(""),
+        candidate_min_score: str = Form(""),
+        candidate_convergence: str = Form(""),
+        push_min_score: str = Form(""),
+        max_digest_items: str = Form(""),
+        max_alert_items: str = Form(""),
+        push_dedupe_strength: str = Form(""),
         session: Session = Depends(get_db),
     ):
         repo = Repo(session)
@@ -5906,6 +5974,24 @@ def create_app(settings: Settings) -> FastAPI:
             llm_curation_enabled=ai_enabled,
             llm_curation_prompt=ai_prompt,
         )
+
+        try:
+            gate_config = normalize_topic_gate_config(
+                {
+                    "candidate_min_score": candidate_min_score,
+                    "candidate_convergence": candidate_convergence,
+                    "push_min_score": push_min_score,
+                    "max_digest_items": max_digest_items,
+                    "max_alert_items": max_alert_items,
+                    "push_dedupe_strength": push_dedupe_strength,
+                }
+            )
+            if gate_config.is_empty():
+                repo.delete_topic_gate_policy(topic_id=topic.id)
+            else:
+                repo.upsert_topic_gate_policy(topic_id=topic.id, config=gate_config)
+        except ValueError as exc:
+            return _redir(request, msg=f"topic gates invalid: {exc}")
 
         extra = ""
         if sync_search_sources:
@@ -5930,13 +6016,14 @@ def create_app(settings: Settings) -> FastAPI:
 
         try:
             from sqlalchemy import delete
-            from tracker.models import AlertBudget, ItemTopic, Report, SourceCandidate, Topic, TopicPolicy, TopicSource
+            from tracker.models import AlertBudget, ItemTopic, Report, SourceCandidate, Topic, TopicGatePolicy, TopicPolicy, TopicSource
 
             topic_id = int(topic.id)
             # Delete dependents first (avoid FK issues when enabled).
             session.execute(delete(ItemTopic).where(ItemTopic.topic_id == topic_id))
             session.execute(delete(TopicSource).where(TopicSource.topic_id == topic_id))
             session.execute(delete(TopicPolicy).where(TopicPolicy.topic_id == topic_id))
+            session.execute(delete(TopicGatePolicy).where(TopicGatePolicy.topic_id == topic_id))
             session.execute(delete(SourceCandidate).where(SourceCandidate.topic_id == topic_id))
             session.execute(delete(AlertBudget).where(AlertBudget.topic_id == topic_id))
             session.execute(delete(Report).where(Report.topic_id == topic_id))
@@ -6199,11 +6286,12 @@ def create_app(settings: Settings) -> FastAPI:
     def admin_run_tick(
         request: Request,
         push: bool = Form(False),
+        drain_backlog: bool = Form(False),
         session: Session = Depends(get_db),
     ):
         try:
             with job_lock(name="jobs", timeout_seconds=0.0):
-                asyncio.run(run_tick(session=session, settings=settings, push=push))
+                asyncio.run(run_tick(session=session, settings=settings, push=push, drain_backlog=drain_backlog))
         except TimeoutError:
             return _redir(request, msg="busy: another job is running")
         return _redir(request)

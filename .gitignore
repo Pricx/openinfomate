@@ -14,6 +14,10 @@ scripts/deploy_ssh.sh
 .DS_Store
 
 tracker.db
+tracker.db-shm
+tracker.db-wal
+tracker.db*.bak-*
+tracker.db-*
 *.sqlite
 
 .env
@@ -24,3 +28,9 @@ tracker.db
 docs/tracker/plan/
 .codex/
 docs/ui/
+docs/infra/
+docs/open-pro-bridge/
+docs/ops/
+docs/runtime/
+var/
+=

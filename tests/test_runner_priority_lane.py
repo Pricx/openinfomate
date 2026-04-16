@@ -10,6 +10,64 @@ from tracker.runner import run_tick
 from tracker.settings import Settings
 
 
+def test_priority_lane_ignores_preexisting_candidates_by_default(db_session, monkeypatch):
+    repo = Repo(db_session)
+    topic = repo.add_topic(name="Profile", query="")
+    source = repo.add_source(type="rss", url="file:///tmp/feed.xml")
+
+    now = dt.datetime.utcnow()
+    item = Item(
+        source_id=source.id,
+        url="https://example.com/old-candidate",
+        canonical_url="https://example.com/old-candidate",
+        title="Introducing GPT-5.3-Codex-Spark",
+        content_text="OpenAI released a new Codex Spark model (major update).",
+        content_hash="x",
+        simhash64=0,
+        created_at=now - dt.timedelta(hours=1),
+    )
+    db_session.add(item)
+    db_session.flush()
+    db_session.add(ItemTopic(item_id=item.id, topic_id=topic.id, decision="candidate", reason="", created_at=now - dt.timedelta(hours=1)))
+    db_session.commit()
+
+    called = {"triage": 0, "curate": 0}
+
+    async def fake_triage(  # type: ignore[no-untyped-def]
+        *, settings, topic, policy_prompt, candidates, recent_sent=None, max_keep=0, usage_cb=None
+    ):
+        called["triage"] += 1
+        return [int(candidates[0]["item_id"])]
+
+    async def fake_curate(  # type: ignore[no-untyped-def]
+        *, settings, topic, policy_prompt, candidates, recent_sent=None, max_digest=0, max_alert=0, usage_cb=None
+    ):
+        called["curate"] += 1
+        cid = int(candidates[0]["item_id"])
+        return [LlmCurationDecision(item_id=cid, decision="alert", why="major model release", summary="New model release")]
+
+    monkeypatch.setattr("tracker.runner.llm_triage_topic_items", fake_triage)
+    monkeypatch.setattr("tracker.runner.llm_curate_topic_items", fake_curate)
+
+    settings = Settings(
+        llm_base_url="http://llm.local",
+        llm_model="dummy",
+        priority_lane_enabled=True,
+        priority_lane_hours=72,
+        priority_lane_pool_max_candidates=50,
+        priority_lane_triage_keep_candidates=5,
+        priority_lane_max_alert=2,
+    )
+
+    asyncio.run(run_tick(session=db_session, settings=settings, push=False))
+
+    it_row = repo.get_item_topic(item_id=int(item.id), topic_id=int(topic.id))
+    assert it_row is not None
+    assert it_row.decision == "candidate"
+    assert called["triage"] == 0
+    assert called["curate"] == 0
+
+
 def test_priority_lane_promotes_candidate_to_alert(db_session, monkeypatch):
     repo = Repo(db_session)
     topic = repo.add_topic(name="Profile", query="")
@@ -57,7 +115,7 @@ def test_priority_lane_promotes_candidate_to_alert(db_session, monkeypatch):
         priority_lane_max_alert=2,
     )
 
-    asyncio.run(run_tick(session=db_session, settings=settings, push=False))
+    asyncio.run(run_tick(session=db_session, settings=settings, push=False, drain_backlog=True))
 
     it_row = repo.get_item_topic(item_id=int(item.id), topic_id=int(topic.id))
     assert it_row is not None
@@ -119,7 +177,7 @@ def test_priority_lane_budget_denied_falls_back_to_digest(db_session, monkeypatc
         priority_lane_max_alert=2,
     )
 
-    asyncio.run(run_tick(session=db_session, settings=settings, push=True))
+    asyncio.run(run_tick(session=db_session, settings=settings, push=True, drain_backlog=True))
     assert pushed == []
 
     it_row = repo.get_item_topic(item_id=int(item.id), topic_id=int(topic.id))

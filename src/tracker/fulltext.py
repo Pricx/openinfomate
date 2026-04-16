@@ -15,6 +15,58 @@ from tracker.http_auth import AuthRequiredError, looks_like_login_redirect
 logger = logging.getLogger(__name__)
 
 _DISCOURSE_TOPIC_PATH_RE = re.compile(r"^/t/[^/]+/\d+$")
+_ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org", "export.arxiv.org"}
+
+
+def _is_arxiv_abs_url(url: str) -> bool:
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    try:
+        parts = urlsplit(raw)
+    except Exception:
+        return False
+    host = (parts.netloc or "").strip().lower()
+    path = (parts.path or "").strip()
+    return host in _ARXIV_HOSTS and path.startswith("/abs/")
+
+
+def _extract_text_from_arxiv_abs_html(*, html: str) -> str:
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    title = ""
+    try:
+        meta = soup.find("meta", attrs={"name": "citation_title"})
+        if meta is not None:
+            title = str(meta.get("content") or "").strip()
+    except Exception:
+        title = ""
+    if not title:
+        node = soup.select_one("h1.title")
+        title = normalize_text(node.get_text(" ", strip=True) if node else "")
+        if title.lower().startswith("title:"):
+            title = title.split(":", 1)[1].strip()
+
+    abstract = ""
+    node = soup.select_one("blockquote.abstract")
+    if node is not None:
+        abstract = normalize_text(node.get_text(" ", strip=True))
+        if abstract.lower().startswith("abstract:"):
+            abstract = abstract.split(":", 1)[1].strip()
+    if not abstract:
+        try:
+            meta = soup.find("meta", attrs={"name": "description"})
+            if meta is not None:
+                abstract = normalize_text(str(meta.get("content") or ""))
+        except Exception:
+            abstract = ""
+
+    parts: list[str] = []
+    if title:
+        parts.append(f"Title: {title}")
+    if abstract:
+        parts.append(f"Abstract: {abstract}")
+    return normalize_text(" ".join(parts))
 
 
 def _extract_text_from_html(*, html: str, url: str) -> str:
@@ -239,6 +291,14 @@ async def fetch_fulltext_for_url(
             raise ValueError(f"unsupported content-type: {content_type}")
         html = resp.text
         final_url = str(getattr(resp, "url", url) or url)
+
+    if _is_arxiv_abs_url(final_url or url):
+        text = _extract_text_from_arxiv_abs_html(html=html)
+        if text:
+            max_i = max(1, int(max_chars or 1))
+            if len(text) > max_i:
+                return text[:max_i] + "…"
+            return text
 
     text = _extract_text_from_html(html=html, url=final_url or url)
     if not text:

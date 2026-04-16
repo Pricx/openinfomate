@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 from tracker.repo import Repo
+from tracker.runner import _SEARXNG_BACKEND_BLOCK_REASON_KEY, _SEARXNG_BACKEND_BLOCK_UNTIL_KEY
 from tracker.runner import run_tick
 from tracker.settings import Settings
 
@@ -37,8 +38,14 @@ def test_run_tick_ingests_searxng_search(db_session, monkeypatch):
     topic = repo.add_topic(name="T", query="ai chips")
     source = repo.add_source(type="searxng_search", url="http://localhost:8888/search?q=ai+chips&format=json")
     repo.bind_topic_source(topic=topic, source=source)
+    repo.set_app_config_many(
+        {
+            _SEARXNG_BACKEND_BLOCK_UNTIL_KEY: "",
+            _SEARXNG_BACKEND_BLOCK_REASON_KEY: "",
+            "searxng_search_repair_last_at_utc": "",
+        }
+    )
 
     settings = Settings()
     result = asyncio.run(run_tick(session=db_session, settings=settings, push=False))
     assert result.total_created == 2
-

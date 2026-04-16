@@ -12,9 +12,16 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 from sqlalchemy.orm import Session as OrmSession
+from tenacity import AsyncRetrying
+from tenacity import before_sleep_log
+from tenacity import retry_if_exception
+from tenacity import stop_after_attempt
+from tenacity import wait_fixed
+from tenacity import wait_random_exponential
 
 from tracker.integrations.source_binding_mcp import source_binding_mcp_tool_catalog_text
 from tracker.integrations.config_settings_mcp import settings_mcp_tool_catalog_text
+from tracker.integrations.topic_gate_mcp import topic_gate_mcp_tool_catalog_text
 from tracker.models import Topic
 from tracker.repo import Repo
 from tracker.prompt_templates import resolve_prompt_best_effort
@@ -24,6 +31,7 @@ from tracker.push_dispatch import push_dingtalk_markdown, push_email_text, push_
 from tracker.openai_compat import (
     extract_text_from_openai_compat_response,
     extract_usage_tokens,
+    normalize_openai_compat_mode_preference,
     normalize_openai_compat_base_url,
     post_openai_compat_json,
 )
@@ -33,6 +41,50 @@ logger = logging.getLogger(__name__)
 UsageCallback = Callable[[dict], None]
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_TRANSIENT_LLM_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
+
+
+class RetryableLlmResponseError(RuntimeError):
+    """Semantic LLM failure that should be retried."""
+
+
+def _llm_retry_attempt_count(settings: Settings) -> int:
+    try:
+        attempts = int(getattr(settings, "llm_retry_attempts", 4) or 4)
+    except Exception:
+        attempts = 4
+    return max(1, min(10, attempts))
+
+
+def _llm_retry_wait_strategy(settings: Settings):
+    try:
+        min_wait = float(getattr(settings, "llm_retry_min_wait_seconds", 0.5) or 0.5)
+    except Exception:
+        min_wait = 0.5
+    try:
+        max_wait = float(getattr(settings, "llm_retry_max_wait_seconds", 8.0) or 8.0)
+    except Exception:
+        max_wait = 8.0
+    min_wait = max(0.0, min_wait)
+    max_wait = max(0.0, max_wait)
+    if max_wait <= 0:
+        return wait_fixed(0)
+    multiplier = min_wait if min_wait > 0 else 0.25
+    return wait_random_exponential(multiplier=multiplier, max=max_wait)
+
+
+def _is_retryable_llm_exception(exc: BaseException) -> bool:
+    if isinstance(exc, RetryableLlmResponseError):
+        return True
+    if isinstance(exc, httpx.RequestError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            status = int(exc.response.status_code or 0) if exc.response is not None else 0
+        except Exception:
+            status = 0
+        return status in _TRANSIENT_LLM_HTTP_STATUSES
+    return False
 
 
 @dataclass(frozen=True)
@@ -55,6 +107,7 @@ class LlmCurationDecision:
     decision: str  # ignore|digest|alert
     why: str
     summary: str
+    rank_score: int | None = None
 
 
 @dataclass(frozen=True)
@@ -217,6 +270,17 @@ def _select_llm_proxy_for_kind(settings: Settings, *, kind: str) -> str | None:
             return raw
     raw = (getattr(settings, "llm_proxy", "") or "").strip()
     return raw or None
+
+
+def _select_llm_compat_mode_for_kind(settings: Settings, *, kind: str) -> str | None:
+    primary = normalize_openai_compat_mode_preference(getattr(settings, "llm_compat_mode", "auto"))
+    if _kind_uses_mini_provider(kind):
+        mini = normalize_openai_compat_mode_preference(getattr(settings, "llm_mini_compat_mode", "auto"))
+        if mini != "auto":
+            return mini
+    if primary == "auto":
+        return None
+    return primary
 
 
 def _load_llm_extra_body(settings: Settings, *, kind: str = "") -> dict:
@@ -536,14 +600,27 @@ async def _post_llm_json(
     headers: dict[str, str],
     payload_chat: dict[str, Any],
 ) -> tuple[dict[str, Any], str]:
+    result: tuple[dict[str, Any], str] | None = None
     try:
-        data, mode = await post_openai_compat_json(
-            repo=repo,
-            client=client,
-            base_url=base_url,
-            headers=headers,
-            payload_chat=payload_chat,
-        )
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(_llm_retry_attempt_count(settings)),
+            wait=_llm_retry_wait_strategy(settings),
+            retry=retry_if_exception(_is_retryable_llm_exception),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True,
+        ):
+            with attempt:
+                data, mode = await post_openai_compat_json(
+                    repo=repo,
+                    client=client,
+                    base_url=base_url,
+                    headers=headers,
+                    payload_chat=payload_chat,
+                    preferred_mode=_select_llm_compat_mode_for_kind(settings, kind=kind),
+                )
+                if not extract_text_from_openai_compat_response(data):
+                    raise RetryableLlmResponseError("LLM response missing text content")
+                result = (data, mode)
     except Exception as exc:
         await _record_llm_provider_result(
             repo=repo,
@@ -555,6 +632,18 @@ async def _post_llm_json(
             error_message=str(exc),
         )
         raise
+    if result is None:
+        err = RuntimeError("LLM request finished without a response payload")
+        await _record_llm_provider_result(
+            repo=repo,
+            settings=settings,
+            kind=kind,
+            base_url=base_url,
+            model=model,
+            ok=False,
+            error_message=str(err),
+        )
+        raise err
     await _record_llm_provider_result(
         repo=repo,
         settings=settings,
@@ -563,7 +652,7 @@ async def _post_llm_json(
         model=model,
         ok=True,
     )
-    return data, mode
+    return result
 
 
 async def llm_plan_tracking_ai_setup(
@@ -692,6 +781,7 @@ async def llm_plan_config_agent(
     user_prompt: str,
     tracking_snapshot_text: str,
     profile_state_text: str,
+    profile_prompt_text: str = "",
     settings_state_text: str,
     conversation_history_text: str = "",
     page_context_text: str = "",
@@ -717,7 +807,16 @@ async def llm_plan_config_agent(
         headers["Authorization"] = f"Bearer {api_key}"
 
     lang = "zh" if _contains_cjk(user_prompt) else "en"
-    config_tools = settings_mcp_tools_text or (settings_mcp_tool_catalog_text(repo=repo, settings=settings, lang=lang) if repo is not None else "")
+    config_tools = settings_mcp_tools_text or (
+        "\n\n".join(
+            [
+                settings_mcp_tool_catalog_text(repo=repo, settings=settings, lang=lang),
+                topic_gate_mcp_tool_catalog_text(lang=lang),
+            ]
+        ).strip()
+        if repo is not None
+        else ""
+    )
     system = _tpl(
         repo,
         settings,
@@ -733,6 +832,7 @@ async def llm_plan_config_agent(
         "config_agent.core.plan.user",
         {
             "user_prompt": _truncate((user_prompt or "").strip(), 80_000),
+            "profile": _truncate((profile_prompt_text or "").strip(), 8_000),
             "conversation_history_text": _truncate((conversation_history_text or "").strip(), 6_000),
             "page_context_text": _truncate((page_context_text or "").strip(), 2_000),
             "tracking_snapshot_text": _truncate((tracking_snapshot_text or "").strip(), 16_000),
@@ -769,6 +869,158 @@ async def llm_plan_config_agent(
         )
     resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
     _emit_usage(usage_cb, kind=kind, model=resp_model, topic="config_agent", data=data)
+
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text content")
+    obj = _extract_first_json_object(content)
+    if not obj or not isinstance(obj, dict):
+        raise RuntimeError("LLM did not return valid JSON object")
+    return obj
+
+
+async def llm_route_config_agent_dialog(
+    *,
+    repo: Repo | None = None,
+    settings: Settings,
+    user_prompt: str,
+    conversation_history_text: str = "",
+    page_context_text: str = "",
+    dialog_tools_text: str = "",
+    usage_cb: UsageCallback | None = None,
+) -> dict[str, Any] | None:
+    if not settings.llm_base_url:
+        return None
+    kind = "config_agent_dialog_route"
+    model = _select_model_for_kind(settings, kind=kind)
+    if not model:
+        return None
+    _ensure_non_codex_model(model)
+    extra_body = _load_llm_extra_body(settings, kind=kind)
+
+    base_url = _select_llm_base_url_for_kind(settings, kind=kind)
+    api_key = _select_llm_api_key_for_kind(settings, kind=kind)
+    proxy = _select_llm_proxy_for_kind(settings, kind=kind)
+
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    lang = "zh" if _contains_cjk(user_prompt) else "en"
+    system = _tpl(repo, settings, "config_agent.core.dialog.route.system", {"dialog_tools_text": dialog_tools_text})
+    user = _tpl(
+        repo,
+        settings,
+        "config_agent.core.dialog.route.user",
+        {
+            "user_prompt": _truncate((user_prompt or "").strip(), 24_000),
+            "conversation_history_text": _truncate((conversation_history_text or "").strip(), 6_000),
+            "page_context_text": _truncate((page_context_text or "").strip(), 2_000),
+            "dialog_tools_text": _truncate((dialog_tools_text or "").strip(), 6_000),
+            "output_language": lang,
+        },
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0,
+        "max_tokens": 900,
+    }
+    payload.update(extra_body)
+
+    async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
+        data, _mode_used = await _post_llm_json(
+            settings=settings,
+            kind=kind,
+            model=model,
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
+    resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
+    _emit_usage(usage_cb, kind=kind, model=resp_model, topic="config_agent_dialog", data=data)
+
+    content = extract_text_from_openai_compat_response(data)
+    if not content:
+        raise RuntimeError("LLM response missing text content")
+    obj = _extract_first_json_object(content)
+    if not obj or not isinstance(obj, dict):
+        raise RuntimeError("LLM did not return valid JSON object")
+    return obj
+
+
+async def llm_answer_config_agent_dialog(
+    *,
+    repo: Repo | None = None,
+    settings: Settings,
+    user_prompt: str,
+    conversation_history_text: str = "",
+    page_context_text: str = "",
+    tool_results_json: str,
+    usage_cb: UsageCallback | None = None,
+) -> dict[str, Any] | None:
+    if not settings.llm_base_url:
+        return None
+    kind = "config_agent_dialog_answer"
+    model = _select_model_for_kind(settings, kind=kind)
+    if not model:
+        return None
+    _ensure_non_codex_model(model)
+    extra_body = _load_llm_extra_body(settings, kind=kind)
+
+    base_url = _select_llm_base_url_for_kind(settings, kind=kind)
+    api_key = _select_llm_api_key_for_kind(settings, kind=kind)
+    proxy = _select_llm_proxy_for_kind(settings, kind=kind)
+
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    lang = "zh" if _contains_cjk(user_prompt) else "en"
+    system = _tpl(repo, settings, "config_agent.core.dialog.answer.system")
+    user = _tpl(
+        repo,
+        settings,
+        "config_agent.core.dialog.answer.user",
+        {
+            "user_prompt": _truncate((user_prompt or "").strip(), 24_000),
+            "conversation_history_text": _truncate((conversation_history_text or "").strip(), 6_000),
+            "page_context_text": _truncate((page_context_text or "").strip(), 2_000),
+            "tool_results_json": _truncate((tool_results_json or "").strip(), 28_000),
+            "output_language": lang,
+        },
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0,
+        "max_tokens": 1600,
+    }
+    payload.update(extra_body)
+
+    async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds, proxy=proxy) as client:
+        data, _mode_used = await _post_llm_json(
+            settings=settings,
+            kind=kind,
+            model=model,
+            repo=repo,
+            client=client,
+            base_url=base_url,
+            headers=headers,
+            payload_chat=payload,
+        )
+    resp_model = str((data.get("model") if isinstance(data, dict) else None) or model or "")
+    _emit_usage(usage_cb, kind=kind, model=resp_model, topic="config_agent_dialog", data=data)
 
     content = extract_text_from_openai_compat_response(data)
     if not content:
@@ -2232,7 +2484,8 @@ async def llm_curate_topic_items(
     usage_cb: UsageCallback | None = None,
 ) -> list[LlmCurationDecision] | None:
     """
-    Prompt-driven curation: given candidate items (title/url/snippet), decide ignore|digest|alert.
+    Prompt-driven curation: given candidate items (title/url/snippet), decide ignore|digest|alert
+    and assign a relative rank score for ordering.
 
     - Returns None if LLM isn't configured.
     - Returns one decision per candidate item_id.
@@ -2253,6 +2506,9 @@ async def llm_curate_topic_items(
     extra_body = _load_llm_extra_body(settings, kind=kind)
 
     system = _tpl(repo, settings, "llm.curate_items.system")
+    operator_delta = _tpl(repo, settings, "llm.curate_items.operator_delta")
+    if (operator_delta or "").strip():
+        system = (system.rstrip() + "\n\n" + operator_delta.strip() + "\n").strip() + "\n"
 
     topic_policy_prompt_block = ""
     if policy_prompt and policy_prompt.strip():
@@ -2388,9 +2644,22 @@ async def llm_curate_topic_items(
             decision = "ignore"
         why = _truncate(str(row.get("why", "")).strip(), 600)
         summary = _truncate(str(row.get("summary", "")).strip(), 600)
+        rank_score: int | None = None
+        raw_rank = row.get("rank_score", row.get("score"))
+        if raw_rank not in (None, ""):
+            try:
+                rank_score = max(0, min(100, int(raw_rank)))
+            except Exception:
+                rank_score = None
         if _is_redundant_pair(summary, why):
             why = ""
-        out_by_id[item_id] = LlmCurationDecision(item_id=item_id, decision=decision, why=why, summary=summary)
+        out_by_id[item_id] = LlmCurationDecision(
+            item_id=item_id,
+            decision=decision,
+            why=why,
+            summary=summary,
+            rank_score=rank_score,
+        )
 
     # Ensure every candidate has a decision (safety): default to ignore.
     ordered_ids: list[int] = []
@@ -2401,22 +2670,43 @@ async def llm_curate_topic_items(
             continue
         ordered_ids.append(item_id)
         if item_id not in out_by_id:
-            out_by_id[item_id] = LlmCurationDecision(item_id=item_id, decision="ignore", why="", summary="")
+            out_by_id[item_id] = LlmCurationDecision(
+                item_id=item_id,
+                decision="ignore",
+                why="",
+                summary="",
+                rank_score=0,
+            )
 
-    # Enforce caps regardless of model behavior.
-    max_alert_i = max(0, int(max_alert))
-    max_digest_i = max(0, int(max_digest))
+    # Enforce optional hard caps regardless of model behavior.
+    # <=0 means "disabled / unlimited".
+    max_alert_i = int(max_alert or 0)
+    max_digest_i = int(max_digest or 0)
 
     # Keep input order for tie-breaking (newer first).
-    alert_ids = [item_id for item_id in ordered_ids if out_by_id[item_id].decision == "alert"]
-    for item_id in alert_ids[max_alert_i:]:
-        cur = out_by_id[item_id]
-        out_by_id[item_id] = LlmCurationDecision(item_id=item_id, decision="digest", why=cur.why, summary=cur.summary)
+    if max_alert_i > 0:
+        alert_ids = [item_id for item_id in ordered_ids if out_by_id[item_id].decision == "alert"]
+        for item_id in alert_ids[max_alert_i:]:
+            cur = out_by_id[item_id]
+            out_by_id[item_id] = LlmCurationDecision(
+                item_id=item_id,
+                decision="digest",
+                why=cur.why,
+                summary=cur.summary,
+                rank_score=cur.rank_score,
+            )
 
-    digest_ids = [item_id for item_id in ordered_ids if out_by_id[item_id].decision == "digest"]
-    for item_id in digest_ids[max_digest_i:]:
-        cur = out_by_id[item_id]
-        out_by_id[item_id] = LlmCurationDecision(item_id=item_id, decision="ignore", why=cur.why, summary=cur.summary)
+    if max_digest_i > 0:
+        digest_ids = [item_id for item_id in ordered_ids if out_by_id[item_id].decision == "digest"]
+        for item_id in digest_ids[max_digest_i:]:
+            cur = out_by_id[item_id]
+            out_by_id[item_id] = LlmCurationDecision(
+                item_id=item_id,
+                decision="ignore",
+                why=cur.why,
+                summary=cur.summary,
+                rank_score=cur.rank_score,
+            )
 
     # Rebuild in input order.
     return [out_by_id[item_id] for item_id in ordered_ids]

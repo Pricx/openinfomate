@@ -19,8 +19,6 @@ services:
       # Localhost-only binding means Web Admin writes are allowed without enabling remote env updates.
       # (Operators can still enable this explicitly if they expose the admin UI.)
       TRACKER_ADMIN_ALLOW_REMOTE_ENV_UPDATE: "false"
-      # First-run UX: start without preconfigured password/token (localhost-only port binding above).
-      TRACKER_BOOTSTRAP_ALLOW_NO_AUTH: "true"
       TRACKER_API_HOST: "0.0.0.0"
       TRACKER_API_PORT: "8080"
       TRACKER_DB_URL: "sqlite:////data/tracker.db"
@@ -42,7 +40,6 @@ services:
       OPENINFOMATE_API_PORT: "${OPENINFOMATE_API_PORT:-8899}"
       OPENINFOMATE_API_BIND_HOST: "127.0.0.1"
       TRACKER_ADMIN_ALLOW_REMOTE_ENV_UPDATE: "false"
-      TRACKER_BOOTSTRAP_ALLOW_NO_AUTH: "true"
       TRACKER_DB_URL: "sqlite:////data/tracker.db"
       TRACKER_ENV_PATH: "/data/.env"
       TRACKER_SEARXNG_BASE_URL: "${OPENINFOMATE_SEARXNG_BASE_URL:-http://searxng:8080}"

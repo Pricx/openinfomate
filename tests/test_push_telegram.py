@@ -5,6 +5,7 @@ import asyncio
 import httpx
 import pytest
 
+import tracker.push.telegram as telegram_mod
 from tracker.push.telegram import TelegramPusher, split_telegram_message
 
 
@@ -93,6 +94,30 @@ def test_telegram_pusher_send_raw_text_requires_message_id(monkeypatch):
     p = TelegramPusher("TEST", timeout_seconds=5)
     with pytest.raises(RuntimeError, match="missing message_id"):
         asyncio.run(p.send_raw_text(chat_id="123", text="hello", disable_preview=True))
+
+
+def test_telegram_pusher_retries_transport_error_with_fresh_client(monkeypatch):
+    asyncio.run(telegram_mod._reset_tg_push_http_client())
+    seen_clients: list[int] = []
+    attempts = 0
+
+    async def fake_post(self: httpx.AsyncClient, url: str, json: dict, **_kwargs):  # noqa: ANN001
+        nonlocal attempts
+        attempts += 1
+        seen_clients.append(id(self))
+        req = httpx.Request("POST", url)
+        if attempts == 1:
+            raise httpx.ReadError("", request=req)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 321}}, request=req)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    p = TelegramPusher("TEST", timeout_seconds=5)
+    mid = asyncio.run(p.send_raw_text(chat_id="123", text="hello", disable_preview=True))
+    assert mid == 321
+    assert attempts == 2
+    assert len(set(seen_clients)) == 2
+    asyncio.run(telegram_mod._reset_tg_push_http_client())
 
 
 

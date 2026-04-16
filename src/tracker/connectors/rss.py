@@ -15,6 +15,8 @@ from tracker.http_auth import AuthRequiredError, looks_like_login_redirect
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 _URL_RE = re.compile(r"https?://[^\s<>\")\]]+", re.IGNORECASE)
+_ARXIV_EXPORT_HOST = "export.arxiv.org"
+_ARXIV_PRIMARY_HOST = "arxiv.org"
 
 
 def _is_local_url(url: str) -> bool:
@@ -46,6 +48,22 @@ def _rewrite_url_host(*, url: str, host: str, scheme: str | None = None) -> str:
     if sc not in {"http", "https"}:
         sc = "https"
     return urlunsplit((sc, h, parts.path or "/", parts.query or "", parts.fragment or ""))
+
+
+def _rss_fallback_urls(url: str) -> list[str]:
+    raw = (url or "").strip()
+    if not raw:
+        return []
+    urls = [raw]
+    try:
+        host = (urlsplit(raw).hostname or "").strip().lower()
+    except Exception:
+        host = ""
+    if host == _ARXIV_EXPORT_HOST:
+        alt = _rewrite_url_host(url=raw, host=_ARXIV_PRIMARY_HOST)
+        if alt and alt not in urls:
+            urls.append(alt)
+    return urls
 
 
 def _extract_http_urls_from_html(html: str) -> list[str]:
@@ -178,6 +196,27 @@ class RssConnector(Connector):
     def __init__(self, *, timeout_seconds: int = 20):
         self.timeout_seconds = timeout_seconds
 
+    async def _get_first_successful_response(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: dict[str, str],
+    ) -> tuple[httpx.Response, str]:
+        last_exc: Exception | None = None
+        candidates = _rss_fallback_urls(url)
+        for candidate in candidates:
+            try:
+                resp = await client.get(candidate, headers=headers)
+                return resp, candidate
+            except Exception as exc:
+                last_exc = exc
+                if candidate == candidates[-1]:
+                    raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("rss fetch failed without attempts")
+
     async def fetch_with_state(
         self,
         *,
@@ -200,11 +239,11 @@ class RssConnector(Connector):
             headers["If-Modified-Since"] = last_modified
 
         async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
-            resp = await client.get(url, headers=headers)
+            resp, requested_url = await self._get_first_successful_response(client=client, url=url, headers=headers)
             status_code = int(getattr(resp, "status_code", 200) or 200)
             if status_code == 304:
                 return [], None
-            final_url = str(getattr(resp, "url", url) or url)
+            final_url = str(getattr(resp, "url", requested_url) or requested_url)
             if status_code in {401, 403} or looks_like_login_redirect(original_url=url, final_url=final_url):
                 raise AuthRequiredError(url=url, status_code=status_code, final_url=final_url)
             resp.raise_for_status()
@@ -245,8 +284,8 @@ class RssConnector(Connector):
             if cookie:
                 headers["Cookie"] = cookie
             async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
-                resp = await client.get(url, headers=headers)
-                feed_url = str(getattr(resp, "url", url) or url)
+                resp, requested_url = await self._get_first_successful_response(client=client, url=url, headers=headers)
+                feed_url = str(getattr(resp, "url", requested_url) or requested_url)
                 status_code = int(getattr(resp, "status_code", 200) or 200)
                 if status_code in {401, 403} or looks_like_login_redirect(original_url=url, final_url=feed_url):
                     raise AuthRequiredError(url=url, status_code=status_code, final_url=feed_url)

@@ -290,6 +290,57 @@ TRACKER_EMAIL_TO=...{% endif %}
             <div class="actions" style="margin-bottom:10px">
               <button type="button" class="btn-primary" onclick="trackerOpenDialog('dlgAddTopic')">{{ t("Add Topic") }}</button>
             </div>
+            {% set gate_defaults = topic_gate_defaults or {} %}
+            {% set gate_defaults_convergence = gate_defaults.get('candidate_convergence') or '' %}
+            <details style="margin-bottom:12px" open>
+              <summary><b>{{ t("Topic Gate defaults") }}</b></summary>
+              <div class="muted" style="margin-top:8px">{{ t("Use these as the global default for initial screening, candidate convergence, push-stage caps, and push dedupe. Leave blank to keep the open default: no extra hard gate.") }}</div>
+              <form method="post" action="/admin/topic/gates/defaults{{ page_qs }}" style="margin-top:10px">
+                <div class="row">
+                  <div style="flex:1 1 180px">
+                    <label class="muted">{{ t("Initial screening min score") }}</label>
+                    <input name="candidate_min_score" type="number" min="0" max="100" value="{{ gate_defaults.get('candidate_min_score') or '' }}" placeholder="{{ t('Leave blank') }}" />
+                  </div>
+                  <div style="flex:1 1 180px">
+                    <label class="muted">{{ t("Candidate convergence") }}</label>
+                    <select name="candidate_convergence">
+                      <option value="">{{ t("Leave blank") }}</option>
+                      <option value="loose" {% if gate_defaults_convergence == 'loose' %}selected{% endif %}>{{ t("Loose") }}</option>
+                      <option value="balanced" {% if gate_defaults_convergence == 'balanced' %}selected{% endif %}>{{ t("Balanced") }}</option>
+                      <option value="strict" {% if gate_defaults_convergence == 'strict' %}selected{% endif %}>{{ t("Strict") }}</option>
+                    </select>
+                  </div>
+                  <div style="flex:1 1 180px">
+                    <label class="muted">{{ t("Push min score") }}</label>
+                    <input name="push_min_score" type="number" min="0" max="100" value="{{ gate_defaults.get('push_min_score') or '' }}" placeholder="{{ t('Leave blank') }}" />
+                  </div>
+                </div>
+                <div class="row" style="margin-top:10px">
+                  <div style="flex:1 1 180px">
+                    <label class="muted">{{ t("Max digest items per batch") }}</label>
+                    <input name="max_digest_items" type="number" min="1" value="{{ gate_defaults.get('max_digest_items') or '' }}" placeholder="{{ t('Unlimited') }}" />
+                  </div>
+                  <div style="flex:1 1 180px">
+                    <label class="muted">{{ t("Max alert items per batch") }}</label>
+                    <input name="max_alert_items" type="number" min="1" value="{{ gate_defaults.get('max_alert_items') or '' }}" placeholder="{{ t('Unlimited') }}" />
+                  </div>
+                  <div style="flex:1 1 180px">
+                    <label class="muted">{{ t("Push dedupe strength") }}</label>
+                    <select name="push_dedupe_strength">
+                      <option value="">{{ t("Leave blank") }}</option>
+                      <option value="off" {% if gate_defaults.get('push_dedupe_strength') == 'off' %}selected{% endif %}>{{ t("Off") }}</option>
+                      <option value="loose" {% if gate_defaults.get('push_dedupe_strength') == 'loose' %}selected{% endif %}>{{ t("Loose") }}</option>
+                      <option value="balanced" {% if gate_defaults.get('push_dedupe_strength') == 'balanced' %}selected{% endif %}>{{ t("Balanced") }}</option>
+                      <option value="strict" {% if gate_defaults.get('push_dedupe_strength') == 'strict' %}selected{% endif %}>{{ t("Strict") }}</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="muted" style="margin-top:8px">{{ t("Topic-specific overrides are edited from each topic's Edit dialog. Blank means inherit defaults / no limit.") }}</div>
+                <div class="actions" style="margin-top:10px">
+                  <button type="submit" class="btn-primary">{{ t("Save") }}</button>
+                </div>
+              </form>
+            </details>
             <table>
               <thead>
                 <tr><th>{{ t("Name") }}</th><th class="nowrap">{{ t("Enabled") }}</th><th class="nowrap">AI</th><th>{{ t("Curated Info") }} (cron)</th><th>{{ t("Alerts") }}</th><th></th></tr>
@@ -401,6 +452,50 @@ TRACKER_EMAIL_TO=...{% endif %}
                       <input id="editTopicDailyCap" type="number" min="0" name="alert_daily_cap" placeholder="{{ t('Alert daily cap') }}" required />
                     </div>
                   </div>
+                  <details style="margin-top:10px" open>
+                    <summary class="muted">{{ t("Topic Gate") }}</summary>
+                    <div class="muted" style="margin-top:8px">{{ t("Use blank values to inherit the global default (or stay unlimited if the default is also blank).") }}</div>
+                    <div id="editTopicGateHint" class="muted" style="margin-top:8px"></div>
+                    <div class="row" style="margin-top:10px">
+                      <div style="flex:1 1 180px">
+                        <label class="muted">{{ t("Initial screening min score") }}</label>
+                        <input id="editTopicGateCandidateMinScore" name="candidate_min_score" type="number" min="0" max="100" placeholder="{{ t('Leave blank') }}" />
+                      </div>
+                      <div style="flex:1 1 180px">
+                        <label class="muted">{{ t("Candidate convergence") }}</label>
+                        <select id="editTopicGateCandidateConvergence" name="candidate_convergence">
+                          <option value="">{{ t("Leave blank") }}</option>
+                          <option value="loose">{{ t("Loose") }}</option>
+                          <option value="balanced">{{ t("Balanced") }}</option>
+                          <option value="strict">{{ t("Strict") }}</option>
+                        </select>
+                      </div>
+                      <div style="flex:1 1 180px">
+                        <label class="muted">{{ t("Push min score") }}</label>
+                        <input id="editTopicGatePushMinScore" name="push_min_score" type="number" min="0" max="100" placeholder="{{ t('Leave blank') }}" />
+                      </div>
+                    </div>
+                    <div class="row" style="margin-top:10px">
+                      <div style="flex:1 1 180px">
+                        <label class="muted">{{ t("Max digest items per batch") }}</label>
+                        <input id="editTopicGateMaxDigestItems" name="max_digest_items" type="number" min="1" placeholder="{{ t('Unlimited') }}" />
+                      </div>
+                      <div style="flex:1 1 180px">
+                        <label class="muted">{{ t("Max alert items per batch") }}</label>
+                        <input id="editTopicGateMaxAlertItems" name="max_alert_items" type="number" min="1" placeholder="{{ t('Unlimited') }}" />
+                      </div>
+                      <div style="flex:1 1 180px">
+                        <label class="muted">{{ t("Push dedupe strength") }}</label>
+                        <select id="editTopicGatePushDedupeStrength" name="push_dedupe_strength">
+                          <option value="">{{ t("Leave blank") }}</option>
+                          <option value="off">{{ t("Off") }}</option>
+                          <option value="loose">{{ t("Loose") }}</option>
+                          <option value="balanced">{{ t("Balanced") }}</option>
+                          <option value="strict">{{ t("Strict") }}</option>
+                        </select>
+                      </div>
+                    </div>
+                  </details>
                   <details style="margin-top:10px">
                     <summary class="muted">{{ t("AI Policy (LLM curation)") }}</summary>
                     <div class="row" style="margin-top:10px; align-items:center">
@@ -3259,6 +3354,44 @@ TRACKER_EMAIL_TO=...{% endif %}
       } catch (e) {}
     }
 
+    const TRACKER_TOPIC_GATE_LABELS = {
+      candidate_min_score: '{{ t("Initial screening min score") }}',
+      candidate_convergence: '{{ t("Candidate convergence") }}',
+      push_min_score: '{{ t("Push min score") }}',
+      max_digest_items: '{{ t("Max digest items per batch") }}',
+      max_alert_items: '{{ t("Max alert items per batch") }}',
+      push_dedupe_strength: '{{ t("Push dedupe strength") }}'
+    };
+
+    function trackerTopicGateSetFieldValue(id, value) {
+      try {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.value = (value === null || value === undefined) ? '' : String(value);
+      } catch (e) {}
+    }
+
+    function trackerTopicGateRenderHint(data) {
+      try {
+        const el = document.getElementById('editTopicGateHint');
+        if (!el) return;
+        const inherits = (data && typeof data === 'object' && data.inherits && typeof data.inherits === 'object') ? data.inherits : {};
+        const effective = (data && typeof data === 'object' && data.effective && typeof data.effective === 'object') ? data.effective : {};
+        const fields = ['candidate_min_score', 'candidate_convergence', 'push_min_score', 'max_digest_items', 'max_alert_items', 'push_dedupe_strength'];
+        const allInherited = fields.every((field) => !!inherits[field]);
+        const parts = [];
+        fields.forEach((field) => {
+          const value = effective[field];
+          if (value === null || value === undefined || String(value).trim() === '') return;
+          parts.push(String(TRACKER_TOPIC_GATE_LABELS[field] || field) + '=' + String(value));
+        });
+        const head = allInherited
+          ? '{{ t("This topic currently inherits the global Topic Gate defaults.") }}'
+          : '{{ t("This topic currently has custom Topic Gate overrides.") }}';
+        el.textContent = parts.length > 0 ? (head + ' {{ t("Effective:") }} ' + parts.join(' · ')) : head;
+      } catch (e) {}
+    }
+
     function trackerEditTopic(button) {
       try {
         const name = button.getAttribute('data-name') || '';
@@ -3278,6 +3411,7 @@ TRACKER_EMAIL_TO=...{% endif %}
         const aiEnabledEl = document.getElementById('editTopicAiEnabled');
         const aiPresetEl = document.getElementById('editTopicAiPreset');
         const aiPromptEl = document.getElementById('editTopicAiPrompt');
+        const gateHintEl = document.getElementById('editTopicGateHint');
         const saveBtn = document.getElementById('editTopicSaveBtn');
 
         if (nameEl) nameEl.value = name;
@@ -3290,6 +3424,13 @@ TRACKER_EMAIL_TO=...{% endif %}
         if (aiEnabledEl) aiEnabledEl.checked = aiEnabled === 'true';
         if (aiPresetEl) aiPresetEl.value = '';
         if (aiPromptEl) aiPromptEl.value = '';
+        trackerTopicGateSetFieldValue('editTopicGateCandidateMinScore', '');
+        trackerTopicGateSetFieldValue('editTopicGateCandidateConvergence', '');
+        trackerTopicGateSetFieldValue('editTopicGatePushMinScore', '');
+        trackerTopicGateSetFieldValue('editTopicGateMaxDigestItems', '');
+        trackerTopicGateSetFieldValue('editTopicGateMaxAlertItems', '');
+        trackerTopicGateSetFieldValue('editTopicGatePushDedupeStrength', '');
+        if (gateHintEl) gateHintEl.textContent = '{{ t("Loading…") }}';
 
         if (saveBtn) {
           saveBtn.disabled = true;
@@ -3298,14 +3439,34 @@ TRACKER_EMAIL_TO=...{% endif %}
 
         trackerOpenDialog('dlgEditTopic');
 
-        _trackerFetchJson('/topics/' + encodeURIComponent(name) + '/policy')
-          .then((data) => {
-            if (aiEnabledEl) aiEnabledEl.checked = !!data.llm_curation_enabled;
-            if (aiPromptEl) aiPromptEl.value = data.llm_curation_prompt || '';
-            trackerTopicPresetChanged();
-          })
-          .catch((e) => {
-            trackerShowToast('{{ t("Failed to load policy:") }} ' + String(e || ''), 'error');
+        Promise.allSettled([
+          _trackerFetchJson('/topics/' + encodeURIComponent(name) + '/policy'),
+          _trackerFetchJson('/topics/' + encodeURIComponent(name) + '/gates')
+        ])
+          .then((results) => {
+            const policyRes = results[0];
+            const gateRes = results[1];
+            if (policyRes && policyRes.status === 'fulfilled') {
+              const data = policyRes.value || {};
+              if (aiEnabledEl) aiEnabledEl.checked = !!data.llm_curation_enabled;
+              if (aiPromptEl) aiPromptEl.value = data.llm_curation_prompt || '';
+              trackerTopicPresetChanged();
+            } else {
+              trackerShowToast('{{ t("Failed to load policy:") }} ' + String((policyRes && policyRes.reason) || ''), 'error');
+            }
+            if (gateRes && gateRes.status === 'fulfilled') {
+              const gateData = gateRes.value || {};
+              const override = (gateData && typeof gateData === 'object' && gateData.override && typeof gateData.override === 'object') ? gateData.override : {};
+              trackerTopicGateSetFieldValue('editTopicGateCandidateMinScore', override.candidate_min_score);
+              trackerTopicGateSetFieldValue('editTopicGateCandidateConvergence', override.candidate_convergence);
+              trackerTopicGateSetFieldValue('editTopicGatePushMinScore', override.push_min_score);
+              trackerTopicGateSetFieldValue('editTopicGateMaxDigestItems', override.max_digest_items);
+              trackerTopicGateSetFieldValue('editTopicGateMaxAlertItems', override.max_alert_items);
+              trackerTopicGateSetFieldValue('editTopicGatePushDedupeStrength', override.push_dedupe_strength);
+              trackerTopicGateRenderHint(gateData);
+            } else if (gateHintEl) {
+              gateHintEl.textContent = '{{ t("Failed to load Topic Gate settings.") }}';
+            }
           })
           .finally(() => {
             if (saveBtn) {

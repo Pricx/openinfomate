@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import re
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import feedparser
 import httpx
+import requests
+from bs4 import BeautifulSoup
 
 from tracker.connectors.base import Connector, FetchedEntry
+from tracker.connectors.errors import TemporaryFetchBlockError
 from tracker.http_auth import AuthRequiredError, looks_like_login_redirect
+from tracker.normalize import html_to_text, normalize_text
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +23,49 @@ logger = logging.getLogger(__name__)
 # every fetch in long-running services.
 _CF_CHALLENGED_NETLOCS: set[str] = set()
 _RSS_OPTIONAL_UNAVAILABLE_URLS: set[str] = set()
+_JSON_BLOCKLIKE_STATUS_CODES = {403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+_DISCOURSE_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain;q=0.9, application/xml;q=0.8, text/xml;q=0.8, */*;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
+_DISCOURSE_RSS_BOILERPLATE_RE = (
+    re.compile(r"(阅读完整话题|read full topic|continue reading|click to expand)", re.IGNORECASE),
+)
+_HTTPX_REQUESTS_FALLBACK_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout)
+
+
+def _retry_after_seconds(headers: dict[str, str] | httpx.Headers | None) -> int | None:
+    if not headers:
+        return None
+    try:
+        raw = str(headers.get("Retry-After") or headers.get("retry-after") or "").strip()
+    except Exception:
+        raw = ""
+    if not raw:
+        return None
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return None
+
+
+def _looks_like_transient_discourse_block(*, status_code: int, headers: dict[str, str] | httpx.Headers | None, final_url: str) -> bool:
+    code = int(status_code or 0)
+    if code == 403:
+        try:
+            if str((headers or {}).get("cf-mitigated") or "").strip().lower() == "challenge":
+                return True
+        except Exception:
+            pass
+        return not looks_like_login_redirect(original_url=final_url, final_url=final_url)
+    return code in _JSON_BLOCKLIKE_STATUS_CODES
 
 
 def build_discourse_json_url(*, base_url: str, json_path: str = "/latest.json") -> str:
@@ -35,6 +84,15 @@ def _base_from_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
 
 
+def _normalize_discourse_html_summary(raw: str) -> str | None:
+    text = normalize_text(raw or "")
+    if not text:
+        return None
+    if len(text) > 1200:
+        text = text[:1200].rstrip() + "…"
+    return text or None
+
+
 class DiscourseConnector(Connector):
     type = "discourse"
 
@@ -48,6 +106,30 @@ class DiscourseConnector(Connector):
         self.timeout_seconds = timeout_seconds
         self.rss_catchup_pages = max(1, int(rss_catchup_pages or 1))
         self.cookie = (cookie or "").strip() or None
+
+    async def _requests_get(self, *, url: str, headers: dict[str, str]):
+        def _run():
+            return requests.get(
+                url,
+                headers=headers,
+                timeout=self.timeout_seconds,
+                allow_redirects=True,
+            )
+
+        return await asyncio.to_thread(_run)
+
+    async def _get_with_transport_fallback(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: dict[str, str],
+    ):
+        try:
+            return await client.get(url, headers=headers)
+        except _HTTPX_REQUESTS_FALLBACK_EXCEPTIONS as exc:
+            logger.info("discourse httpx get failed; retrying with requests: url=%s err=%r", url, exc)
+            return await self._requests_get(url=url, headers=headers)
 
     def _with_page(self, url: str, page: int) -> str:
         try:
@@ -98,6 +180,19 @@ class DiscourseConnector(Connector):
             rss_path = f"/{rss_path}"
         return urlunsplit((parts.scheme, parts.netloc, rss_path, "", ""))
 
+    def _html_fallback_url(self, url: str) -> str:
+        parts = urlsplit(url)
+        path = parts.path or ""
+        if path.endswith(".json"):
+            html_path = path[: -len(".json")]
+        elif path.endswith(".rss"):
+            html_path = path[: -len(".rss")]
+        else:
+            html_path = path or "/latest"
+        if not html_path.startswith("/"):
+            html_path = f"/{html_path}"
+        return urlunsplit((parts.scheme, parts.netloc, html_path, parts.query, parts.fragment))
+
     def _effective_rss_catchup_pages(self, *, url: str, include_top_daily: bool) -> int:
         pages = max(1, int(self.rss_catchup_pages or 1))
         try:
@@ -111,6 +206,22 @@ class DiscourseConnector(Connector):
                 pages = max(pages, 12)
         return pages
 
+    def _clean_rss_summary(self, *, raw: str, title: str) -> str | None:
+        text = html_to_text(raw or "")
+        if not text:
+            return None
+        for pat in _DISCOURSE_RSS_BOILERPLATE_RE:
+            text = pat.sub(" ", text)
+        text = normalize_text(text)
+        title_norm = normalize_text(title or "")
+        if title_norm and text.startswith(title_norm):
+            text = normalize_text(text[len(title_norm) :].lstrip(" -:：|·"))
+        if not text or text == title_norm:
+            return None
+        if len(text) > 1200:
+            text = text[:1200].rstrip() + "…"
+        return text or None
+
     def _parse_rss(self, *, text: str) -> list[FetchedEntry]:
         feed = feedparser.parse(text)
         entries: list[FetchedEntry] = []
@@ -118,14 +229,54 @@ class DiscourseConnector(Connector):
             link = getattr(e, "link", None) or ""
             title = getattr(e, "title", "") or ""
             published = getattr(e, "published", None) or getattr(e, "updated", None)
-            # Discourse RSS descriptions are often long and share boilerplate across topics
-            # ("阅读完整话题", participant counts, etc.). Using them as the primary ingest text
-            # can cause false-positive simhash near-dup drops. Prefer title-only at ingest;
-            # full text can be fetched later via per-topic RSS in `fulltext`.
-            summary = None
+            summary = self._clean_rss_summary(
+                raw=str(getattr(e, "summary", None) or getattr(e, "description", None) or ""),
+                title=title,
+            )
             if link:
                 entries.append(FetchedEntry(url=link, title=title, published_at_iso=published, summary=summary))
         return entries
+
+    def _parse_html_latest(self, *, html: str, page_url: str) -> list[FetchedEntry]:
+        soup = BeautifulSoup(html or "", "html.parser")
+        entries: list[FetchedEntry] = []
+        seen: set[str] = set()
+        for row in soup.select("tr.topic-list-item"):
+            anchor = row.select_one("a.title[href]")
+            if anchor is None:
+                continue
+            href = str(anchor.get("href") or "").strip()
+            if not href:
+                continue
+            link = urljoin(page_url, href)
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            title = normalize_text(anchor.get_text(" ", strip=True) or "")
+            if not title:
+                continue
+            excerpt = row.select_one("p.excerpt")
+            summary = _normalize_discourse_html_summary(excerpt.get_text(" ", strip=True) if excerpt else "")
+            entries.append(FetchedEntry(url=link, title=title, summary=summary))
+        return entries
+
+    async def _fetch_html_latest(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        url: str,
+    ) -> list[FetchedEntry]:
+        page_url = self._html_fallback_url(url)
+        headers = dict(_DISCOURSE_BROWSER_HEADERS)
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        if self.cookie:
+            headers["Cookie"] = self.cookie
+        resp = await self._get_with_transport_fallback(client=client, url=page_url, headers=headers)
+        final_url = str(getattr(resp, "url", page_url) or page_url)
+        if resp.status_code in {401, 403} or looks_like_login_redirect(original_url=page_url, final_url=final_url):
+            raise AuthRequiredError(url=page_url, status_code=resp.status_code, final_url=final_url)
+        resp.raise_for_status()
+        return self._parse_html_latest(html=resp.text, page_url=page_url)
 
     async def _fetch_rss_pages(
         self,
@@ -143,7 +294,8 @@ class DiscourseConnector(Connector):
         merged: list[FetchedEntry] = []
         seen: set[str] = set()
         max_pages = max(1, int(pages or 1))
-        headers = {"User-Agent": "tracker/0.1"}
+        headers = dict(_DISCOURSE_BROWSER_HEADERS)
+        headers["Accept"] = "application/rss+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8"
         if self.cookie:
             headers["Cookie"] = self.cookie
         transient_status_codes = {408, 425, 429, 500, 502, 503, 504}
@@ -153,7 +305,7 @@ class DiscourseConnector(Connector):
         for i in range(max_pages):
             url = primary_url if i == 0 else self._with_page(primary_url, i)
             try:
-                resp = await client.get(url, headers=headers)
+                resp = await self._get_with_transport_fallback(client=client, url=url, headers=headers)
             except Exception as exc:
                 if i == 0:
                     raise
@@ -212,14 +364,15 @@ class DiscourseConnector(Connector):
         seen: set[str],
         entries: list[FetchedEntry],
     ) -> None:
-        headers = {"User-Agent": "tracker/0.1"}
+        headers = dict(_DISCOURSE_BROWSER_HEADERS)
+        headers["Accept"] = "application/rss+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8"
         if self.cookie:
             headers["Cookie"] = self.cookie
         for extra in urls:
             if extra in _RSS_OPTIONAL_UNAVAILABLE_URLS:
                 continue
             try:
-                extra_resp = await client.get(extra, headers=headers)
+                extra_resp = await self._get_with_transport_fallback(client=client, url=extra, headers=headers)
                 if extra_resp.status_code == 404:
                     _RSS_OPTIONAL_UNAVAILABLE_URLS.add(extra)
                     continue
@@ -240,7 +393,7 @@ class DiscourseConnector(Connector):
         parts = urlsplit(url)
         netloc = parts.netloc
         async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
-            headers = {"User-Agent": "tracker/0.1"}
+            headers = dict(_DISCOURSE_BROWSER_HEADERS)
             if self.cookie:
                 headers["Cookie"] = self.cookie
             if netloc and netloc in _CF_CHALLENGED_NETLOCS:
@@ -252,12 +405,22 @@ class DiscourseConnector(Connector):
                 except Exception as exc:
                     logger.info("discourse rss fetch failed: url=%s err=%s", primary, exc)
                     entries = await self._fetch_rss_pages(client=client, primary_url=primary, pages=1)
+                if not entries:
+                    try:
+                        entries = await self._fetch_html_latest(client=client, url=url)
+                    except Exception as exc:
+                        logger.info("discourse html fetch failed after empty rss fallback: url=%s err=%s", url, exc)
                 seen = {e.url for e in entries if e.url}
                 await self._merge_rss_urls(client=client, urls=rss_urls[1:], seen=seen, entries=entries)
                 return entries
 
-            resp = await client.get(url, headers=headers)
-            if resp.status_code == 403 and resp.headers.get("cf-mitigated") == "challenge":
+            resp = await self._get_with_transport_fallback(client=client, url=url, headers=headers)
+            final_url = str(getattr(resp, "url", url) or url)
+            if _looks_like_transient_discourse_block(
+                status_code=int(getattr(resp, "status_code", 0) or 0),
+                headers=getattr(resp, "headers", None),
+                final_url=final_url,
+            ):
                 if netloc:
                     _CF_CHALLENGED_NETLOCS.add(netloc)
                 rss_urls = self._rss_recall_urls(url, include_top_daily=include_top_daily)
@@ -267,12 +430,31 @@ class DiscourseConnector(Connector):
                     entries = await self._fetch_rss_pages(client=client, primary_url=primary, pages=pages)
                 except Exception as exc:
                     logger.info("discourse rss fetch failed: url=%s err=%s", primary, exc)
-                    entries = await self._fetch_rss_pages(client=client, primary_url=primary, pages=1)
+                    try:
+                        entries = await self._fetch_rss_pages(client=client, primary_url=primary, pages=1)
+                    except Exception as fallback_exc:
+                        raise TemporaryFetchBlockError(
+                            url=url,
+                            status_code=int(getattr(resp, "status_code", 0) or 0),
+                            final_url=final_url,
+                            retry_after_seconds=_retry_after_seconds(getattr(resp, "headers", None)),
+                            reason=f"json_blocked_and_rss_failed:{fallback_exc}",
+                        ) from exc
+                if not entries:
+                    try:
+                        entries = await self._fetch_html_latest(client=client, url=url)
+                    except Exception as exc:
+                        raise TemporaryFetchBlockError(
+                            url=url,
+                            status_code=int(getattr(resp, "status_code", 0) or 0),
+                            final_url=final_url,
+                            retry_after_seconds=_retry_after_seconds(getattr(resp, "headers", None)),
+                            reason=f"json_blocked_rss_empty_and_html_failed:{exc}",
+                        ) from exc
                 seen = {e.url for e in entries if e.url}
                 await self._merge_rss_urls(client=client, urls=rss_urls[1:], seen=seen, entries=entries)
                 return entries
 
-            final_url = str(getattr(resp, "url", url) or url)
             if resp.status_code in {401, 403} or looks_like_login_redirect(original_url=url, final_url=final_url):
                 raise AuthRequiredError(url=url, status_code=resp.status_code, final_url=final_url)
             resp.raise_for_status()

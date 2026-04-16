@@ -15,5 +15,5 @@
 AI Agents|crewai,autogen,langgraph,agentic,workflow
 LLM Security|prompt injection,agent security,ssrf,rce,supply chain
 AI Chips|ai chips,gpu,asic,accelerator,hbm
-Open Source Infra|searxng,sqlite,systemd,fastapi,playwright
+Open Source Infra|searxng,sqlite,systemd,fastapi
 China Dev社区|AI,LLM,开源,安全,系统,infra,工程化

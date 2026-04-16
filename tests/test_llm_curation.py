@@ -6,8 +6,8 @@ import datetime as dt
 from sqlalchemy import select
 
 from tracker.connectors.base import FetchedEntry
-from tracker.llm import LlmCurationDecision
-from tracker.models import Item, ItemTopic
+from tracker.llm import LlmCurationDecision, llm_curate_topic_items
+from tracker.models import Item, ItemTopic, Topic
 from tracker.repo import Repo
 from tracker.runner import run_digest, run_tick
 from tracker.settings import Settings
@@ -80,6 +80,8 @@ def test_llm_curation_digest_curates_candidates(db_session, monkeypatch):
         llm_base_url="http://llm.local",
         llm_model="dummy",
         llm_curation_enabled=True,
+        llm_curation_max_candidates=10,
+        llm_curation_input_dedupe_enabled=True,
     )
 
     result = asyncio.run(run_digest(session=db_session, settings=settings, hours=24, push=False))
@@ -90,6 +92,190 @@ def test_llm_curation_digest_curates_candidates(db_session, monkeypatch):
 
     rows = list(db_session.scalars(select(ItemTopic).order_by(ItemTopic.item_id)))
     assert [r.decision for r in rows] == ["digest", "alert", "ignore"]
+
+
+def test_run_digest_historical_window_bounds_llm_curation(db_session, monkeypatch):
+    repo = Repo(db_session)
+    topic = repo.add_topic(name="T", query="gpu")
+    repo.upsert_topic_policy(topic_id=topic.id, llm_curation_enabled=True, llm_curation_prompt="pick signals only")
+    source = repo.add_source(type="rss", url="file:///tmp/feed.xml")
+    repo.upsert_source_score(source_id=source.id, score=80, origin="manual")
+
+    window_end = dt.datetime(2026, 4, 7, 2, 0, 0)
+    in_window_at = window_end - dt.timedelta(minutes=30)
+    future_at = window_end + dt.timedelta(minutes=30)
+    items = [
+        Item(
+            source_id=source.id,
+            url="https://example.com/in-window",
+            canonical_url="https://example.com/in-window",
+            title="In Window",
+            content_text="",
+            content_hash="",
+            simhash64=0,
+            created_at=in_window_at,
+        ),
+        Item(
+            source_id=source.id,
+            url="https://example.com/future",
+            canonical_url="https://example.com/future",
+            title="Future Window",
+            content_text="",
+            content_hash="",
+            simhash64=0,
+            created_at=future_at,
+        ),
+    ]
+    for it in items:
+        db_session.add(it)
+        db_session.flush()
+        db_session.add(ItemTopic(item_id=it.id, topic_id=topic.id, decision="candidate", reason="", created_at=it.created_at))
+    db_session.commit()
+
+    seen_titles: list[str] = []
+
+    async def fake_curate(  # type: ignore[no-untyped-def]
+        *, repo=None, settings, topic, policy_prompt, candidates, recent_sent=None, max_digest, max_alert, usage_cb=None
+    ):
+        seen_titles.extend(str(c.get("title") or "") for c in candidates)
+        return [
+            LlmCurationDecision(item_id=int(c["item_id"]), decision="digest", why="signal", summary="s")
+            for c in candidates
+        ]
+
+    monkeypatch.setattr("tracker.runner.llm_curate_topic_items", fake_curate)
+
+    settings = Settings(
+        llm_base_url="http://llm.local",
+        llm_model="dummy",
+        llm_curation_enabled=True,
+        llm_curation_max_candidates=10,
+        llm_curation_input_dedupe_enabled=True,
+    )
+
+    result = asyncio.run(run_digest(session=db_session, settings=settings, hours=2, push=False, now=window_end))
+    md = result.per_topic[0].markdown
+
+    assert seen_titles == ["In Window"]
+    assert "In Window" in md
+    assert "Future Window" not in md
+
+    rows = list(db_session.scalars(select(ItemTopic).order_by(ItemTopic.item_id)))
+    assert [r.decision for r in rows] == ["digest", "candidate"]
+
+
+def test_llm_curate_topic_items_zero_caps_mean_unlimited(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"decisions":[{"item_id":1,"decision":"digest","why":"a","summary":"s1"},{"item_id":2,"decision":"digest","why":"b","summary":"s2"},{"item_id":3,"decision":"alert","why":"c","summary":"s3"}]}'
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        async def post(self, url, headers=None, json=None):  # noqa: ANN001
+            captured["payload"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("tracker.llm.httpx.AsyncClient", FakeClient)
+
+    settings = Settings(llm_base_url="http://llm", llm_model="gpt-5.2")
+    topic = Topic(name="T", query="ai", digest_cron="0 9 * * *")
+
+    decisions = asyncio.run(
+        llm_curate_topic_items(
+            settings=settings,
+            topic=topic,
+            policy_prompt="",
+            candidates=[
+                {"item_id": 1, "title": "A", "url": "https://example.com/a", "snippet": "a"},
+                {"item_id": 2, "title": "B", "url": "https://example.com/b", "snippet": "b"},
+                {"item_id": 3, "title": "C", "url": "https://example.com/c", "snippet": "c"},
+            ],
+            max_digest=0,
+            max_alert=0,
+        )
+    )
+    assert [d.decision for d in decisions or []] == ["digest", "digest", "alert"]
+
+
+def test_run_digest_llm_first_drains_full_backlog_in_batches(db_session, monkeypatch):
+    repo = Repo(db_session)
+    topic = repo.add_topic(name="T", query="agent")
+    repo.upsert_topic_policy(topic_id=topic.id, llm_curation_enabled=True, llm_curation_prompt="pick all relevant items")
+    source = repo.add_source(type="rss", url="https://example.com/feed")
+    repo.upsert_source_score(source_id=source.id, score=90, origin="manual")
+
+    now = dt.datetime.utcnow()
+    total_items = 57
+    for i in range(total_items):
+        item = Item(
+            source_id=source.id,
+            url=f"https://example.com/{i}",
+            canonical_url=f"https://example.com/{i}",
+            title=f"Signal {i}",
+            content_text="signal " * 30,
+            content_hash="",
+            simhash64=i,
+            created_at=now - dt.timedelta(minutes=i),
+        )
+        db_session.add(item)
+        db_session.flush()
+        db_session.add(ItemTopic(item_id=item.id, topic_id=topic.id, decision="candidate", reason="", created_at=item.created_at))
+    db_session.commit()
+
+    seen_batch_sizes: list[int] = []
+
+    async def fake_curate(  # type: ignore[no-untyped-def]
+        *, repo=None, settings, topic, policy_prompt, candidates, recent_sent=None, max_digest, max_alert, usage_cb=None
+    ):
+        seen_batch_sizes.append(len(candidates))
+        return [
+            LlmCurationDecision(item_id=int(c["item_id"]), decision="digest", why="signal", summary="s")
+            for c in candidates
+        ]
+
+    monkeypatch.setattr("tracker.runner.llm_curate_topic_items", fake_curate)
+
+    settings = Settings(
+        llm_base_url="http://llm.local",
+        llm_model="dummy",
+        llm_curation_enabled=True,
+        llm_curation_max_candidates=0,
+        llm_curation_max_digest=0,
+        llm_curation_max_alert=0,
+        llm_curation_triage_enabled=False,
+        llm_curation_input_dedupe_enabled=False,
+        llm_curation_prompt_batch_size=25,
+    )
+
+    result = asyncio.run(run_digest(session=db_session, settings=settings, hours=24, push=False))
+    assert len(seen_batch_sizes) == 3
+    assert seen_batch_sizes == [25, 25, 7]
+    md = result.per_topic[0].markdown
+    assert "Signal 0" in md
+    assert f"Signal {total_items - 1}" in md
+    rows = list(db_session.scalars(select(ItemTopic).order_by(ItemTopic.item_id)))
+    assert sum(1 for r in rows if r.decision == "digest") == total_items
 
 
 def test_llm_curation_digest_fails_open_with_fallback_digest_on_error(db_session, monkeypatch):
@@ -234,6 +420,7 @@ def test_llm_curation_digest_dedupes_near_duplicate_candidates(db_session, monke
         llm_model="dummy",
         llm_curation_enabled=True,
         llm_curation_max_candidates=10,
+        llm_curation_input_dedupe_enabled=True,
     )
 
     result = asyncio.run(run_digest(session=db_session, settings=settings, hours=24, push=False))
@@ -309,6 +496,7 @@ def test_llm_curation_digest_dedupes_against_recent_history(db_session, monkeypa
         llm_model="dummy",
         llm_curation_enabled=True,
         llm_curation_max_candidates=10,
+        llm_curation_input_dedupe_enabled=True,
         llm_curation_history_dedupe_days=7,
     )
 
@@ -371,6 +559,7 @@ def test_llm_curation_digest_story_dedupes_by_notable_links(db_session, monkeypa
         llm_model="dummy",
         llm_curation_enabled=True,
         llm_curation_max_candidates=10,
+        llm_curation_input_dedupe_enabled=True,
     )
 
     result = asyncio.run(run_digest(session=db_session, settings=settings, hours=24, push=False))
@@ -474,7 +663,7 @@ def test_llm_curation_tick_does_not_slice_when_triage_fails(db_session, monkeypa
     assert seen.get("n") == 5
 
 
-def test_llm_curation_tick_drains_uncurated_backlog(db_session, monkeypatch):
+def test_llm_curation_tick_does_not_drain_uncurated_backlog_by_default(db_session, monkeypatch):
     repo = Repo(db_session)
     topic = repo.add_topic(name="T", query="gpu")
     repo.upsert_topic_policy(topic_id=topic.id, llm_curation_enabled=True, llm_curation_prompt="pick urgent only")
@@ -510,10 +699,12 @@ def test_llm_curation_tick_drains_uncurated_backlog(db_session, monkeypatch):
     async def fake_fetch_entries_for_source(*, source, timeout_seconds: int = 20, **kwargs):  # noqa: ARG001
         return []
 
+    called = {"curate": 0}
+
     async def fake_curate(  # type: ignore[no-untyped-def]
         *, repo=None, settings, topic, policy_prompt, candidates, recent_sent=None, max_digest, max_alert, usage_cb=None
     ):
-        # Promote the backlog item as an alert.
+        called["curate"] += 1
         return [LlmCurationDecision(item_id=int(item.id), decision="alert", why="urgent", summary="s")]
 
     monkeypatch.setattr("tracker.runner.fetch_entries_for_source", fake_fetch_entries_for_source)
@@ -526,6 +717,64 @@ def test_llm_curation_tick_drains_uncurated_backlog(db_session, monkeypatch):
     )
 
     result = asyncio.run(run_tick(session=db_session, settings=settings, push=False))
+    assert result.total_created == 0
+
+    it_row = repo.get_item_topic(item_id=item.id, topic_id=topic.id)
+    assert it_row is not None
+    assert it_row.decision == "candidate"
+    assert called["curate"] == 0
+
+
+def test_llm_curation_tick_drains_uncurated_backlog_when_manually_enabled(db_session, monkeypatch):
+    repo = Repo(db_session)
+    topic = repo.add_topic(name="T", query="gpu")
+    repo.upsert_topic_policy(topic_id=topic.id, llm_curation_enabled=True, llm_curation_prompt="pick urgent only")
+    source = repo.add_source(type="hn_search", url="https://example.com/hn?q=x")
+    repo.upsert_source_score(source_id=source.id, score=90, origin="manual")
+    repo.bind_topic_source(topic=topic, source=source)
+
+    now = dt.datetime.utcnow()
+    item = Item(
+        source_id=source.id,
+        url="https://example.com/backfill",
+        canonical_url="https://example.com/backfill",
+        title="Introducing GPT-5.3-Codex-Spark",
+        content_text="",
+        content_hash="",
+        simhash64=0,
+        created_at=now - dt.timedelta(days=2),
+    )
+    db_session.add(item)
+    db_session.flush()
+    db_session.add(
+        ItemTopic(
+            item_id=item.id,
+            topic_id=topic.id,
+            decision="candidate",
+            reason="backfill: filtered by include_keywords (prefilter disabled)",
+            created_at=item.created_at,
+        )
+    )
+    db_session.commit()
+
+    async def fake_fetch_entries_for_source(*, source, timeout_seconds: int = 20, **kwargs):  # noqa: ARG001
+        return []
+
+    async def fake_curate(  # type: ignore[no-untyped-def]
+        *, repo=None, settings, topic, policy_prompt, candidates, recent_sent=None, max_digest, max_alert, usage_cb=None
+    ):
+        return [LlmCurationDecision(item_id=int(item.id), decision="alert", why="urgent", summary="s")]
+
+    monkeypatch.setattr("tracker.runner.fetch_entries_for_source", fake_fetch_entries_for_source)
+    monkeypatch.setattr("tracker.runner.llm_curate_topic_items", fake_curate)
+
+    settings = Settings(
+        llm_base_url="http://llm.local",
+        llm_model="dummy",
+        llm_curation_enabled=True,
+    )
+
+    result = asyncio.run(run_tick(session=db_session, settings=settings, push=False, drain_backlog=True))
     assert result.total_created == 0
 
     it_row = repo.get_item_topic(item_id=item.id, topic_id=topic.id)
@@ -602,7 +851,7 @@ def test_llm_curation_tick_drains_backlog_even_when_new_pool_is_full(db_session,
         llm_curation_max_candidates=2,
     )
 
-    result = asyncio.run(run_tick(session=db_session, settings=settings, push=False))
+    result = asyncio.run(run_tick(session=db_session, settings=settings, push=False, drain_backlog=True))
     assert result.total_created == 3
 
     it_row = repo.get_item_topic(item_id=backlog_item.id, topic_id=topic.id)

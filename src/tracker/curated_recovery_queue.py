@@ -225,6 +225,23 @@ def complete_curated_recovery_job(*, repo: Repo, job: CuratedRecoveryJob) -> boo
     return True
 
 
+def complete_curated_recovery_job_for_window(
+    *,
+    repo: Repo,
+    window_end_utc: str,
+    hours: int,
+    push: bool,
+) -> bool:
+    job = CuratedRecoveryJob(
+        window_end_utc=_normalize_window_end(window_end_utc),
+        hours=_normalize_hours(hours),
+        push=bool(push),
+        pending_topic_ids=[],
+        created_at=_iso_utc(),
+    )
+    return complete_curated_recovery_job(repo=repo, job=job)
+
+
 def record_curated_recovery_attempt(
     *,
     repo: Repo,

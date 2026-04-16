@@ -5,8 +5,8 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from tracker.api import create_app
-from tracker.llm import LlmTopicProposal
-from tracker.llm import LlmTopicSourceHints
+from tracker.bridge_contract import BridgeTopicProposeResponse
+from tracker.bridge_contract import BridgeTopicProposeSourceHints
 from tracker.settings import Settings
 
 
@@ -30,15 +30,15 @@ def test_topic_propose_returns_proposal(tmp_path, monkeypatch):
     )
     client = TestClient(create_app(settings))
 
-    async def fake_propose(*, settings, topic_name: str, brief: str, usage_cb=None):  # type: ignore[no-untyped-def]
-        assert topic_name
-        assert brief
-        return LlmTopicProposal(
+    async def fake_propose(*, session, settings, payload):  # type: ignore[no-untyped-def]
+        assert payload.name == ""
+        assert payload.brief == "track x"
+        return BridgeTopicProposeResponse(
             topic_name="My Topic",
-            query_keywords="a,b,c",
+            query="a,b,c",
             alert_keywords="zero-day,CVE",
             ai_prompt="pick only signals",
-            source_hints=LlmTopicSourceHints(
+            source_hints=BridgeTopicProposeSourceHints(
                 add_hn=True,
                 add_searxng=True,
                 add_discourse=True,
@@ -48,7 +48,7 @@ def test_topic_propose_returns_proposal(tmp_path, monkeypatch):
             ),
         )
 
-    monkeypatch.setattr("tracker.api.llm_propose_topic_setup", fake_propose)
+    monkeypatch.setattr("tracker.api.bridge_topic_propose", fake_propose)
 
     r = client.post("/topics/propose?token=secret", json={"name": "", "brief": "track x"})
     assert r.status_code == 200

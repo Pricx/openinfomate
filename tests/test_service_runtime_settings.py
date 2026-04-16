@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,7 +11,11 @@ from tracker.config_agent_core import ConfigAgentPlanResult
 from tracker.db import session_factory
 from tracker.models import Base
 from tracker.repo import Repo
-from tracker.service import _run_telegram_config_agent_worker_job, _run_telegram_connect_poll_job
+from tracker.service import (
+    _run_telegram_config_agent_worker_job,
+    _run_telegram_connect_poll_job,
+    _telegram_connect_long_poll_loop,
+)
 from tracker.settings import Settings
 
 
@@ -37,7 +42,7 @@ async def test_telegram_connect_poll_job_uses_runtime_env_token(tmp_path, monkey
 
     seen: dict[str, str] = {}
 
-    async def fake_telegram_poll(*, repo, settings):  # noqa: ANN001
+    async def fake_telegram_poll(*, repo, settings, make_session=None):  # noqa: ANN001, ARG001
         seen["token"] = str(settings.telegram_bot_token or "")
         seen["chat_id"] = str(settings.telegram_chat_id or "")
         return {"ok": True}
@@ -48,6 +53,103 @@ async def test_telegram_connect_poll_job_uses_runtime_env_token(tmp_path, monkey
     await _run_telegram_connect_poll_job(make_session, settings)
 
     assert seen["token"] == "ENVTEST"
+
+
+@pytest.mark.asyncio
+async def test_telegram_connect_poll_job_runs_for_external_bind_forwarding_without_local_state(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "tg-poll-forward.db"
+    env_path = Path(tmp_path) / ".env"
+    env_path.write_text(
+        '\n'.join(
+            [
+                'TRACKER_TELEGRAM_BOT_TOKEN="ENVTEST"',
+                'TRACKER_TELEGRAM_CONNECT_POLL_SECONDS="3"',
+                'TRACKER_TELEGRAM_EXTERNAL_BIND_BASE_URL="http://127.0.0.1:9988"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    settings = Settings(db_url=f"sqlite:///{db_path}", env_path=str(env_path), telegram_bot_token="")
+    engine, make_session = session_factory(settings)
+    Base.metadata.create_all(engine)
+
+    seen: dict[str, str] = {}
+
+    async def fake_telegram_poll(*, repo, settings, make_session=None):  # noqa: ANN001, ARG001
+        seen["token"] = str(settings.telegram_bot_token or "")
+        seen["external_bind_base_url"] = str(settings.telegram_external_bind_base_url or "")
+        return {"ok": True}
+
+    monkeypatch.setattr("tracker.service.job_lock_async", _no_job_lock)
+    monkeypatch.setattr("tracker.telegram_connect.telegram_poll", fake_telegram_poll)
+
+    await _run_telegram_connect_poll_job(make_session, settings)
+
+    assert seen["token"] == "ENVTEST"
+    assert seen["external_bind_base_url"] == "http://127.0.0.1:9988"
+
+
+@pytest.mark.asyncio
+async def test_telegram_connect_poll_job_propagates_poll_errors_for_long_poll_backoff(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "tg-poll-errors.db"
+    env_path = Path(tmp_path) / ".env"
+    env_path.write_text(
+        'TRACKER_TELEGRAM_BOT_TOKEN="ENVTEST"\nTRACKER_TELEGRAM_CONNECT_POLL_SECONDS="3"\n',
+        encoding="utf-8",
+    )
+    settings = Settings(db_url=f"sqlite:///{db_path}", env_path=str(env_path), telegram_bot_token="")
+    engine, make_session = session_factory(settings)
+    Base.metadata.create_all(engine)
+
+    with make_session() as session:
+        Repo(session).set_app_config("telegram_chat_id", "123")
+
+    async def fake_telegram_poll(*, repo, settings, make_session=None):  # noqa: ANN001, ARG001
+        raise RuntimeError("poll boom")
+
+    monkeypatch.setattr("tracker.service.job_lock_async", _no_job_lock)
+    monkeypatch.setattr("tracker.telegram_connect.telegram_poll", fake_telegram_poll)
+
+    with pytest.raises(RuntimeError, match="poll boom"):
+        await _run_telegram_connect_poll_job(make_session, settings)
+
+
+@pytest.mark.asyncio
+async def test_telegram_connect_long_poll_loop_runs_for_external_bind_forwarding_without_local_state(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "tg-long-poll-forward.db"
+    env_path = Path(tmp_path) / ".env"
+    env_path.write_text(
+        '\n'.join(
+            [
+                'TRACKER_TELEGRAM_BOT_TOKEN="ENVTEST"',
+                'TRACKER_TELEGRAM_CONNECT_POLL_SECONDS="3"',
+                'TRACKER_TELEGRAM_EXTERNAL_BIND_BASE_URL="http://127.0.0.1:9988"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    settings = Settings(db_url=f"sqlite:///{db_path}", env_path=str(env_path), telegram_bot_token="")
+    engine, make_session = session_factory(settings)
+    Base.metadata.create_all(engine)
+
+    seen: dict[str, str] = {}
+
+    async def fake_run(make_session_arg, settings_arg):  # noqa: ANN001
+        seen["external_bind_base_url"] = str(settings_arg.telegram_external_bind_base_url or "")
+        raise asyncio.CancelledError
+
+    async def fake_sleep(_seconds: float):  # noqa: ANN001
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("tracker.service._run_telegram_connect_poll_job", fake_run)
+    monkeypatch.setattr("tracker.service.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _telegram_connect_long_poll_loop(make_session, settings)
+
+    assert seen["external_bind_base_url"] == "http://127.0.0.1:9988"
 
 
 @pytest.mark.asyncio

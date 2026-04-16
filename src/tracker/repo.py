@@ -30,10 +30,20 @@ from tracker.models import (
     TelegramMessage,
     TelegramTask,
     Topic,
+    TopicGatePolicy,
     TopicPolicy,
     TopicSource,
 )
 from tracker.normalize import canonicalize_url
+from tracker.topic_gate_config import (
+    TOPIC_GATE_DEFAULTS_APP_CONFIG_KEY,
+    TopicGateConfig,
+    dump_topic_gate_config,
+    merge_topic_gate_configs,
+    normalize_topic_gate_config,
+    patch_topic_gate_config,
+    topic_gate_inherits_map,
+)
 
 
 def _normalize_topic_name(name: str) -> str:
@@ -152,6 +162,92 @@ class Repo:
 
     def list_topic_policies(self) -> list[TopicPolicy]:
         return list(self.session.scalars(select(TopicPolicy).order_by(TopicPolicy.topic_id)))
+
+    def get_topic_gate_defaults(self) -> TopicGateConfig:
+        raw = self.get_app_config(TOPIC_GATE_DEFAULTS_APP_CONFIG_KEY) or ""
+        return normalize_topic_gate_config(raw)
+
+    def set_topic_gate_defaults(self, config: TopicGateConfig | dict[str, object]) -> TopicGateConfig:
+        clean = normalize_topic_gate_config(config)
+        if clean.is_empty():
+            self.delete_app_config(TOPIC_GATE_DEFAULTS_APP_CONFIG_KEY)
+            return clean
+        self.set_app_config(TOPIC_GATE_DEFAULTS_APP_CONFIG_KEY, dump_topic_gate_config(clean))
+        return clean
+
+    def patch_topic_gate_defaults(self, patch: dict[str, object]) -> TopicGateConfig:
+        current = self.get_topic_gate_defaults()
+        merged = patch_topic_gate_config(base=current, patch=patch)
+        return self.set_topic_gate_defaults(merged)
+
+    def get_topic_gate_policy(self, *, topic_id: int) -> TopicGatePolicy | None:
+        return self.session.scalar(select(TopicGatePolicy).where(TopicGatePolicy.topic_id == topic_id))
+
+    def _topic_gate_config_from_row(self, row: TopicGatePolicy | None) -> TopicGateConfig:
+        if not row:
+            return TopicGateConfig()
+        return normalize_topic_gate_config(
+            {
+                "candidate_min_score": row.initial_min_score,
+                "candidate_convergence": row.candidate_convergence_mode,
+                "push_min_score": row.push_min_score,
+                "max_digest_items": row.push_max_digest_items,
+                "max_alert_items": row.push_max_alert_items,
+                "push_dedupe_strength": row.push_dedupe_strength,
+            }
+        )
+
+    def get_topic_gate_override(self, *, topic_id: int) -> TopicGateConfig:
+        return self._topic_gate_config_from_row(self.get_topic_gate_policy(topic_id=topic_id))
+
+    def get_effective_topic_gate_config(self, *, topic_id: int) -> TopicGateConfig:
+        defaults = self.get_topic_gate_defaults()
+        override = self.get_topic_gate_override(topic_id=topic_id)
+        return merge_topic_gate_configs(defaults=defaults, override=override)
+
+    def describe_topic_gate(self, *, topic_id: int) -> dict[str, dict[str, object | None]]:
+        defaults = self.get_topic_gate_defaults()
+        override = self.get_topic_gate_override(topic_id=topic_id)
+        effective = merge_topic_gate_configs(defaults=defaults, override=override)
+        return {
+            "defaults": defaults.to_dict(),
+            "override": override.to_dict(),
+            "effective": effective.to_dict(),
+            "inherits": topic_gate_inherits_map(override=override),
+        }
+
+    def upsert_topic_gate_policy(self, *, topic_id: int, config: TopicGateConfig | dict[str, object]) -> TopicGatePolicy:
+        clean = normalize_topic_gate_config(config)
+        row = self.get_topic_gate_policy(topic_id=topic_id)
+        if not row:
+            row = TopicGatePolicy(topic_id=topic_id)
+            self.session.add(row)
+            self.session.flush()
+        row.initial_min_score = clean.candidate_min_score
+        row.candidate_convergence_mode = clean.candidate_convergence
+        row.push_min_score = clean.push_min_score
+        row.push_max_digest_items = clean.max_digest_items
+        row.push_max_alert_items = clean.max_alert_items
+        row.push_dedupe_strength = clean.push_dedupe_strength
+        self.session.commit()
+        return row
+
+    def patch_topic_gate_policy(self, *, topic_id: int, patch: dict[str, object]) -> TopicGateConfig:
+        current = self.get_topic_gate_override(topic_id=topic_id)
+        merged = patch_topic_gate_config(base=current, patch=patch)
+        if merged.is_empty():
+            self.delete_topic_gate_policy(topic_id=topic_id)
+            return merged
+        self.upsert_topic_gate_policy(topic_id=topic_id, config=merged)
+        return merged
+
+    def delete_topic_gate_policy(self, *, topic_id: int) -> bool:
+        row = self.get_topic_gate_policy(topic_id=topic_id)
+        if not row:
+            return False
+        self.session.delete(row)
+        self.session.commit()
+        return True
 
     def upsert_topic_policy(
         self,
@@ -537,7 +633,7 @@ class Repo:
         return it
 
     def list_item_topics_for_digest(
-        self, *, topic: Topic, since: dt.datetime
+        self, *, topic: Topic, since: dt.datetime, until: dt.datetime | None = None
     ) -> list[tuple[ItemTopic, Item]]:
         stmt = (
             select(ItemTopic, Item)
@@ -551,6 +647,8 @@ class Repo:
             )
             .order_by(Item.created_at.desc())
         )
+        if until is not None:
+            stmt = stmt.where(func.coalesce(Item.published_at, Item.created_at) < until)
         return list(self.session.execute(stmt).all())
 
     def list_item_topics_for_curation(
@@ -558,6 +656,7 @@ class Repo:
         *,
         topic: Topic,
         since: dt.datetime,
+        until: dt.datetime | None = None,
         limit: int = 50,
         decisions: list[str] | None = None,
     ) -> list[tuple[ItemTopic, Item]]:
@@ -584,6 +683,8 @@ class Repo:
             .order_by(func.coalesce(Item.published_at, Item.created_at).desc(), ItemTopic.id.desc())
             .limit(limit)
         )
+        if until is not None:
+            stmt = stmt.where(func.coalesce(Item.published_at, Item.created_at) < until)
         return list(self.session.execute(stmt).all())
 
     def list_uncurated_item_topics_for_topic(
@@ -591,6 +692,7 @@ class Repo:
         *,
         topic: Topic,
         since: dt.datetime,
+        until: dt.datetime | None = None,
         limit: int = 50,
         exclude_item_ids: set[int] | None = None,
         order: str = "desc",
@@ -624,6 +726,9 @@ class Repo:
             )
             .limit(limit)
         )
+
+        if until is not None:
+            stmt = stmt.where(func.coalesce(Item.published_at, Item.created_at) < until)
 
         if exclude_ids:
             stmt = stmt.where(ItemTopic.item_id.notin_(sorted(exclude_ids)))
@@ -872,6 +977,35 @@ class Repo:
         )
         return list(self.session.execute(stmt).all())
 
+    def list_item_topics_for_sources_window(
+        self,
+        *,
+        source_ids: list[int],
+        since: dt.datetime,
+        until: dt.datetime,
+        decisions: list[str] | None = None,
+    ) -> list[tuple[ItemTopic, Item]]:
+        ids = sorted({int(sid) for sid in (source_ids or []) if int(sid) > 0})
+        if not ids:
+            return []
+        decs = [str(d or "").strip() for d in (decisions or ["digest", "alert"]) if str(d or "").strip()]
+        if not decs:
+            decs = ["digest", "alert"]
+        stmt = (
+            select(ItemTopic, Item)
+            .join(Item, Item.id == ItemTopic.item_id)
+            .where(
+                and_(
+                    Item.source_id.in_(ids),
+                    ItemTopic.decision.in_(decs),
+                    func.coalesce(Item.published_at, Item.created_at) >= since,
+                    func.coalesce(Item.published_at, Item.created_at) < until,
+                )
+            )
+            .order_by(func.coalesce(Item.published_at, Item.created_at).desc(), ItemTopic.id.desc())
+        )
+        return list(self.session.execute(stmt).all())
+
     def count_item_topics_for_digest_window(
         self, *, topic: Topic, since: dt.datetime, until: dt.datetime
     ) -> tuple[int, int]:
@@ -900,6 +1034,7 @@ class Repo:
         topic: Topic | None = None,
         decisions: list[str] | None = None,
         since: dt.datetime | None = None,
+        until: dt.datetime | None = None,
         limit: int = 100,
     ) -> list[tuple[ItemTopic, Item, Topic, Source]]:
         """
@@ -921,6 +1056,8 @@ class Repo:
             conds.append(ItemTopic.decision.in_(decisions))
         if since is not None:
             conds.append(func.coalesce(Item.published_at, Item.created_at) >= since)
+        if until is not None:
+            conds.append(func.coalesce(Item.published_at, Item.created_at) < until)
         if conds:
             stmt = stmt.where(and_(*conds))
 
@@ -1190,7 +1327,8 @@ class Repo:
 
     def mark_push_failed(self, push: PushLog, *, error: str) -> None:
         push.status = "failed"
-        push.error = (error or "")[:4000]
+        detail = (error or "").strip() or "unknown push error"
+        push.error = detail[:4000]
         self.session.commit()
 
     def list_pushes(

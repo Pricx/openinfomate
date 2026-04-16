@@ -11,6 +11,11 @@ from tracker.settings import Settings
 logger = logging.getLogger(__name__)
 
 
+def _push_error_text(exc: BaseException) -> str:
+    detail = str(exc or "").strip()
+    return detail or repr(exc)
+
+
 def _classify_telegram_push_key(key: str) -> tuple[str, int | None]:
     raw = (key or "").strip()
     kind = ""
@@ -124,7 +129,7 @@ async def push_dingtalk_markdown(
         repo.mark_push_sent(push)
         return True
     except Exception as exc:
-        repo.mark_push_failed(push, error=str(exc))
+        repo.mark_push_failed(push, error=_push_error_text(exc))
         raise
 
 
@@ -166,7 +171,7 @@ def push_email_text(
         repo.mark_push_sent(push)
         return True
     except Exception as exc:
-        repo.mark_push_failed(push, error=str(exc))
+        repo.mark_push_failed(push, error=_push_error_text(exc))
         raise
 
 
@@ -196,7 +201,7 @@ async def push_webhook_json(
         repo.mark_push_sent(push)
         return True
     except Exception as exc:
-        repo.mark_push_failed(push, error=str(exc))
+        repo.mark_push_failed(push, error=_push_error_text(exc))
         raise
 
 
@@ -337,10 +342,10 @@ async def push_telegram_text(
                     chat_id,
                     map_exc,
                 )
-        repo.mark_push_failed(push, error=str(exc))
+        repo.mark_push_failed(push, error=_push_error_text(exc))
         raise
     except Exception as exc:
-        repo.mark_push_failed(push, error=str(exc))
+        repo.mark_push_failed(push, error=_push_error_text(exc))
         raise
 
 
@@ -466,10 +471,10 @@ async def push_telegram_text_card(
                     chat_id,
                     map_exc,
                 )
-        repo.mark_push_failed(push, error=str(exc))
+        repo.mark_push_failed(push, error=_push_error_text(exc))
         raise
     except Exception as exc:
-        repo.mark_push_failed(push, error=str(exc))
+        repo.mark_push_failed(push, error=_push_error_text(exc))
         raise
 
 
@@ -617,8 +622,8 @@ async def push_telegram_report_reader(
                     chat_id,
                     map_exc,
                 )
-        repo.mark_push_failed(push, error=str(exc))
+        repo.mark_push_failed(push, error=_push_error_text(exc))
         raise
     except Exception as exc:
-        repo.mark_push_failed(push, error=str(exc))
+        repo.mark_push_failed(push, error=_push_error_text(exc))
         raise

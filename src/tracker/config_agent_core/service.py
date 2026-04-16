@@ -20,6 +20,7 @@ from tracker.config_agent import (
     validate_ai_setup_plan,
 )
 from tracker.dynamic_config import _ENV_ONLY_FIELDS, apply_env_block_updates, effective_settings, env_key_for_field
+from tracker.config_agent_core.dialog_service import maybe_answer_config_agent_dialog_request
 from tracker.integrations.config_settings_mcp import (
     MCP_PROFILE_SET_OP,
     MCP_SETTING_CLEAR_OP,
@@ -27,17 +28,25 @@ from tracker.integrations.config_settings_mcp import (
     build_settings_mcp_catalog,
     is_allowed_remote_setting_field,
 )
+from tracker.integrations.topic_gate_mcp import (
+    MCP_TOPIC_GATE_PATCH_OP,
+    TOPIC_GATE_AGENT_FIELDS,
+    topic_gate_field_label,
+    topic_gate_state_text,
+)
 from tracker.llm import llm_plan_config_agent, llm_propose_profile_setup
 from tracker.llm_usage import make_llm_usage_recorder
 from tracker.profile_input import normalize_profile_text
 from tracker.repo import Repo
 from tracker.settings import Settings
+from tracker.topic_gate_config import normalize_topic_gate_config
 
 _TRACKING_ALLOWED_OPS: set[str] = set(getattr(TrackingAllowedOp, "__args__", ()))  # type: ignore[attr-defined]
 _CONFIG_AGENT_ALLOWED_OPS: set[str] = _TRACKING_ALLOWED_OPS | {
     MCP_SETTING_SET_OP,
     MCP_SETTING_CLEAR_OP,
     MCP_PROFILE_SET_OP,
+    MCP_TOPIC_GATE_PATCH_OP,
 }
 
 
@@ -125,7 +134,18 @@ def _settings_state_text(*, repo: Repo, settings: Settings) -> str:
         field = str(row.get("field") or "")
         current = str(row.get("current_value") or "").strip() or "<unset>"
         lines.append(f"- {field}: {current}")
-    return _join_nonempty(lines)
+    return _join_nonempty(["\n".join(lines).strip(), topic_gate_state_text(repo=repo)], sep="\n\n")
+
+
+def _topic_gate_patch_from_action(action: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+    raw_fields = [
+        str(field or "").strip()
+        for field in (action.get("fields") or [])
+        if str(field or "").strip() in TOPIC_GATE_AGENT_FIELDS
+    ]
+    fields = raw_fields or [field for field in TOPIC_GATE_AGENT_FIELDS if field in action]
+    patch = {field: action.get(field) for field in fields}
+    return fields, patch
 
 
 def export_config_agent_snapshot(*, session: Session, settings: Settings) -> dict[str, Any]:
@@ -150,7 +170,135 @@ def export_config_agent_snapshot(*, session: Session, settings: Settings) -> dic
             }
             for row in settings_catalog
         },
+        "topic_gates": {
+            "defaults": repo.get_topic_gate_defaults().to_dict(),
+            "topics": {
+                str(topic.name): repo.describe_topic_gate(topic_id=int(topic.id))
+                for topic in repo.list_topics()
+            },
+        },
     }
+
+
+def _contains_cjk(text: str) -> bool:
+    for ch in str(text or ""):
+        code = ord(ch)
+        if 0x4E00 <= code <= 0x9FFF:
+            return True
+    return False
+
+
+def _tracking_actions_have_effect(*, session: Session, actions: list[dict[str, Any]]) -> bool:
+    if not actions:
+        return False
+    before = export_tracking_snapshot(session=session)
+    after = apply_plan_to_snapshot(snapshot=before, plan={"actions": actions})
+    keys = ("topics", "topic_policies", "sources", "bindings")
+    before_view = {key: before.get(key) for key in keys}
+    after_view = {key: after.get(key) for key in keys}
+    return after_view != before_view
+
+
+def _setting_actions_have_effect(*, repo: Repo, settings: Settings, actions: list[dict[str, Any]]) -> bool:
+    if not actions:
+        return False
+    eff = effective_settings(repo=repo, settings=settings)
+    env_path = Path(str(getattr(settings, "env_path", "") or ".env"))
+    settings_view = build_settings_view(repo=repo, settings=eff, env_path=env_path)
+    view_map = settings_view.get("views") if isinstance(settings_view, dict) else {}
+    if not isinstance(view_map, dict):
+        view_map = {}
+
+    for action in actions:
+        field = _norm_text(action.get("field"))
+        if not field:
+            return True
+        meta = view_map.get(field) if isinstance(view_map, dict) else None
+        current_value = ""
+        secret = False
+        if isinstance(meta, dict):
+            current_value = _norm_text(meta.get("current_value"))
+            secret = bool(meta.get("secret") or field in _ENV_ONLY_FIELDS)
+        if str(action.get("op") or "") == MCP_SETTING_CLEAR_OP:
+            if current_value:
+                return True
+            if secret:
+                return True
+            continue
+        if secret:
+            return True
+        if _norm_text(action.get("value")) != current_value:
+            return True
+    return False
+
+
+def _noop_reply_for_plan(*, plan: dict[str, Any], lang: str = "en") -> str:
+    ops = {
+        _norm_text(a.get("op"))
+        for a in (plan.get("actions") or [])
+        if isinstance(a, dict) and _norm_text(a.get("op"))
+    }
+    is_zh = str(lang or "").strip().lower().startswith("zh")
+    tracking_like = ops <= _TRACKING_ALLOWED_OPS and bool(ops)
+    settings_like = ops <= {MCP_SETTING_SET_OP, MCP_SETTING_CLEAR_OP} and bool(ops)
+    topic_gate_like = ops <= {MCP_TOPIC_GATE_PATCH_OP} and bool(ops)
+    profile_like = ops <= {MCP_PROFILE_SET_OP} and bool(ops)
+
+    if tracking_like:
+        return (
+            "这项来源/绑定已经存在于当前配置中，所以这次没有新的变更需要应用。"
+            if is_zh
+            else "This source/binding is already present in the current configuration, so there is no new change to apply."
+        )
+    if settings_like:
+        return (
+            "这些设置已经是当前值，所以这次没有新的变更需要应用。"
+            if is_zh
+            else "These settings are already at the current values, so there is no new change to apply."
+        )
+    if topic_gate_like:
+        return (
+            "这些 Topic Gate 已经是当前状态，所以这次没有新的变更需要应用。"
+            if is_zh
+            else "These topic gates already match the current state, so there is no new change to apply."
+        )
+    if profile_like:
+        return (
+            "当前画像已经与这次请求一致，所以这次没有新的变更需要应用。"
+            if is_zh
+            else "The current profile already matches this request, so there is no new change to apply."
+        )
+    return (
+        "当前配置里没有检测到新的差异，所以这次无需应用。"
+        if is_zh
+        else "No new configuration diff was detected, so there is nothing to apply."
+    )
+
+
+def _plan_has_material_changes(*, repo: Repo, settings: Settings, session: Session, plan: dict[str, Any]) -> bool:
+    actions = [a for a in (plan.get("actions") or []) if isinstance(a, dict)]
+    if not actions:
+        return False
+
+    profile_actions = [a for a in actions if str(a.get("op") or "") == MCP_PROFILE_SET_OP]
+    if profile_actions:
+        return True
+
+    topic_gate_actions = [a for a in actions if str(a.get("op") or "") == MCP_TOPIC_GATE_PATCH_OP]
+    if topic_gate_actions:
+        return True
+
+    setting_actions = [
+        a for a in actions if str(a.get("op") or "") in {MCP_SETTING_SET_OP, MCP_SETTING_CLEAR_OP}
+    ]
+    if _setting_actions_have_effect(repo=repo, settings=settings, actions=setting_actions):
+        return True
+
+    tracking_actions = [a for a in actions if str(a.get("op") or "") in _TRACKING_ALLOWED_OPS]
+    if _tracking_actions_have_effect(session=session, actions=tracking_actions):
+        return True
+
+    return False
 
 
 def validate_config_agent_plan(obj: object) -> tuple[dict[str, Any], list[str]]:
@@ -211,6 +359,40 @@ def validate_config_agent_plan(obj: object) -> tuple[dict[str, Any], list[str]]:
             actions.append({"op": op, "profile_text": profile_text, "topic_name": topic_name})
             continue
 
+        if op == MCP_TOPIC_GATE_PATCH_OP:
+            scope = _norm_text(
+                raw.get("scope") or ("topic" if _norm_text(raw.get("topic_name") or raw.get("topic")) else "defaults")
+            ).lower()
+            if scope not in {"defaults", "topic"}:
+                raise ValueError(f"action[{idx}] invalid scope: {scope!r}")
+            topic_name = _norm_text(raw.get("topic_name") or raw.get("topic"))
+            if scope == "topic" and not topic_name:
+                raise ValueError(f"action[{idx}] missing topic_name")
+            reset_all = bool(raw.get("reset_all"))
+            raw_patch: dict[str, Any] = {}
+            present_fields: list[str] = []
+            for field in TOPIC_GATE_AGENT_FIELDS:
+                if field not in raw:
+                    continue
+                raw_patch[field] = raw.get(field)
+                present_fields.append(field)
+            if not present_fields and not reset_all:
+                raise ValueError(f"action[{idx}] missing topic gate fields")
+            action: dict[str, Any] = {
+                "op": op,
+                "scope": scope,
+                "reset_all": reset_all,
+                "fields": present_fields,
+            }
+            if topic_name:
+                action["topic_name"] = topic_name
+            if present_fields:
+                clean = normalize_topic_gate_config(raw_patch)
+                for field in present_fields:
+                    action[field] = getattr(clean, field)
+            actions.append(action)
+            continue
+
     questions = obj.get("questions") if isinstance(obj.get("questions"), list) else []
     assistant_reply = _norm_text(obj.get("assistant_reply") or obj.get("reply"))
     summary = _norm_text(obj.get("summary"))
@@ -237,6 +419,37 @@ def _render_tracking_preview(*, session: Session, plan: dict[str, Any]) -> list[
     if lines and lines[0].startswith("# "):
         lines = lines[1:]
     return lines or ["## Tracking", "- (no tracking changes)"]
+
+
+def _render_topic_gate_preview(*, plan: dict[str, Any], lang: str = "en") -> list[str]:
+    gate_actions = [a for a in (plan.get("actions") or []) if str(a.get("op") or "") == MCP_TOPIC_GATE_PATCH_OP]
+    if not gate_actions:
+        return ["## Topic Gates", "- (no topic gate changes)"]
+    is_zh = str(lang or "").strip().lower().startswith("zh")
+    lines = ["## Topic Gates"]
+    for action in gate_actions[:40]:
+        scope = _norm_text(action.get("scope") or "defaults").lower()
+        topic_name = _norm_text(action.get("topic_name"))
+        reset_all = bool(action.get("reset_all"))
+        fields, patch = _topic_gate_patch_from_action(action)
+        if scope == "topic":
+            lines.append(f"- `{topic_name or 'Profile'}`")
+        else:
+            lines.append("- Global defaults")
+        if reset_all:
+            lines.append(
+                "  - 先清空当前范围内已有 Topic Gate，再应用下面这些字段。"
+                if is_zh
+                else "  - Clear the current scope first, then apply the fields below."
+            )
+        if not fields:
+            lines.append("  - 清空所有字段" if is_zh else "  - Clear all fields")
+            continue
+        for field in fields:
+            value = patch.get(field)
+            value_text = "<unset>" if value is None or str(value).strip() == "" else str(value).strip()
+            lines.append(f"  - {topic_gate_field_label(field, lang=lang)} -> {value_text}")
+    return lines
 
 
 def build_config_agent_preview_markdown(*, repo: Repo, settings: Settings, session: Session, plan: dict[str, Any]) -> str:
@@ -286,6 +499,8 @@ def build_config_agent_preview_markdown(*, repo: Repo, settings: Settings, sessi
             lines.append(f"- `{field}` ({label}) -> {value}")
 
     lines.extend([""])
+    lines.extend(_render_topic_gate_preview(plan=plan, lang=getattr(eff, "output_language", "en") or "en"))
+    lines.extend([""])
     lines.extend(_render_tracking_preview(session=session, plan=plan))
     return _join_nonempty(lines)
 
@@ -314,6 +529,25 @@ async def plan_config_agent_request(
     except Exception:
         usage_cb = None
 
+    dialog_result = await maybe_answer_config_agent_dialog_request(
+        repo=repo,
+        settings=eff,
+        user_prompt=prompt,
+        conversation_history_text=_norm_text(conversation_history_text),
+        page_context_text=_norm_text(page_context_text),
+        usage_cb=usage_cb,
+    )
+    if dialog_result is not None:
+        plan, more_warnings = validate_config_agent_plan(dialog_result.plan)
+        warnings = list(dialog_result.warnings or [])
+        warnings.extend(list(more_warnings or []))
+        return ConfigAgentPlanResult(
+            run_id=0,
+            plan=plan,
+            warnings=warnings,
+            preview_markdown="",
+        )
+
     tracking_before = export_tracking_snapshot(session=repo.session)
     planned = await llm_plan_config_agent(
         repo=repo,
@@ -331,6 +565,19 @@ async def plan_config_agent_request(
 
     plan, warnings = validate_config_agent_plan(planned)
     preview_markdown = build_config_agent_preview_markdown(repo=repo, settings=eff, session=repo.session, plan=plan)
+    if list(plan.get("actions") or []) and not _plan_has_material_changes(repo=repo, settings=eff, session=repo.session, plan=plan):
+        lang = "zh" if _contains_cjk(prompt) or str(getattr(eff, "output_language", "") or "").strip().lower().startswith("zh") else "en"
+        no_op_reply = _noop_reply_for_plan(plan=plan, lang=lang)
+        assistant_reply = _norm_text(plan.get("assistant_reply"))
+        summary = _norm_text(plan.get("summary"))
+        questions = [str(q or "").strip() for q in (plan.get("questions") or []) if str(q or "").strip()]
+        plan = {
+            "assistant_reply": _join_nonempty([assistant_reply, no_op_reply], sep="\n\n") if assistant_reply else no_op_reply,
+            "summary": summary,
+            "questions": questions,
+            "actions": [],
+        }
+        preview_markdown = ""
 
     run_id = 0
     if list(plan.get("actions") or []):
@@ -420,6 +667,29 @@ async def _apply_profile_action(*, repo: Repo, settings: Settings, action: dict[
     return [f"profile updated: {topic_name}"]
 
 
+def _apply_topic_gate_action(*, repo: Repo, action: dict[str, Any]) -> str:
+    scope = _norm_text(action.get("scope") or "defaults").lower()
+    reset_all = bool(action.get("reset_all"))
+    fields, patch = _topic_gate_patch_from_action(action)
+
+    if scope == "defaults":
+        if reset_all:
+            repo.set_topic_gate_defaults({})
+        if fields:
+            repo.patch_topic_gate_defaults(patch)
+        return "topic gates updated: defaults"
+
+    topic_name = _norm_text(action.get("topic_name"))
+    topic = repo.get_topic_by_name(topic_name)
+    if not topic:
+        raise ValueError(f"topic not found for topic gate patch: {topic_name}")
+    if reset_all:
+        repo.delete_topic_gate_policy(topic_id=int(topic.id))
+    if fields:
+        repo.patch_topic_gate_policy(topic_id=int(topic.id), patch=patch)
+    return f"topic gates updated: {topic_name}"
+
+
 async def apply_config_agent_plan(
     *,
     session: Session,
@@ -437,6 +707,7 @@ async def apply_config_agent_plan(
     profile_actions = [a for a in (clean_plan.get("actions") or []) if str(a.get("op") or "") == MCP_PROFILE_SET_OP]
     setting_actions = [a for a in (clean_plan.get("actions") or []) if str(a.get("op") or "") in {MCP_SETTING_SET_OP, MCP_SETTING_CLEAR_OP}]
     tracking_actions = [a for a in (clean_plan.get("actions") or []) if str(a.get("op") or "") in _TRACKING_ALLOWED_OPS]
+    topic_gate_actions = [a for a in (clean_plan.get("actions") or []) if str(a.get("op") or "") == MCP_TOPIC_GATE_PATCH_OP]
 
     for action in profile_actions:
         notes.extend(await _apply_profile_action(repo=repo, settings=settings, action=action))
@@ -466,6 +737,9 @@ async def apply_config_agent_plan(
 
     if tracking_actions:
         notes.extend(apply_plan_to_db(session=session, plan={"actions": tracking_actions}))
+
+    for action in topic_gate_actions:
+        notes.append(_apply_topic_gate_action(repo=repo, action=action))
 
     if run_id and int(run_id or 0) > 0:
         repo.update_config_agent_run(

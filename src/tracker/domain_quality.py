@@ -9,6 +9,10 @@ from tracker.settings import Settings
 
 Tier = str  # "low" | "medium" | "high" | "unknown"
 
+_BUILTIN_HIGH_PATTERNS: tuple[str, ...] = (
+    "arxiv.org",
+)
+
 
 def _tier_rank(tier: Tier) -> int:
     t = (tier or "").strip().lower()
@@ -27,6 +31,19 @@ def normalize_min_tier(raw: str | None, *, default: str = "medium") -> str:
     if v in {"low", "medium", "high"}:
         return v
     return (default or "medium").strip().lower() if (default or "").strip().lower() in {"low", "medium", "high"} else "medium"
+
+
+def _merge_patterns(*groups: list[str] | tuple[str, ...]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for raw in group:
+            value = str(raw or "").strip().lower()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+    return out
 
 
 @dataclass(frozen=True)
@@ -67,7 +84,10 @@ class DomainQualityPolicy:
         if t == "high":
             return 5
         if t == "low":
-            return -25
+            # Soft down-rank only: low-tier domains should be reviewed more strictly,
+            # but not turn into de-facto hard blocks once a source already has a
+            # decent operator/LLM score.
+            return -10
         return 0
 
     def score_adjustment_for_url(self, url: str) -> int:
@@ -76,7 +96,10 @@ class DomainQualityPolicy:
     def extra_min_score_for_tier(self, tier: Tier) -> int:
         t = (tier or "").strip().lower()
         if t == "low":
-            return 15
+            # Keep low-tier domains as "soft" gates (not hard blocks), but require
+            # meaningfully higher source quality scores before they appear in
+            # pushed/curated outputs.
+            return 20
         return 0
 
     def min_score_threshold_for_url(self, *, base_min_score: int, url: str) -> int:
@@ -87,7 +110,10 @@ class DomainQualityPolicy:
 def build_domain_quality_policy(*, settings: Settings) -> DomainQualityPolicy:
     low = parse_domains_csv(getattr(settings, "domain_quality_low_domains", "") or "")
     medium = parse_domains_csv(getattr(settings, "domain_quality_medium_domains", "") or "")
-    high = parse_domains_csv(getattr(settings, "domain_quality_high_domains", "") or "")
+    high = _merge_patterns(
+        parse_domains_csv(getattr(settings, "domain_quality_high_domains", "") or ""),
+        _BUILTIN_HIGH_PATTERNS,
+    )
 
     min_push = normalize_min_tier(getattr(settings, "domain_quality_min_tier_for_push", "medium") or "medium")
 

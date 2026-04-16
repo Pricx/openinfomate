@@ -9,7 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from tracker.models import Base, Topic
-from tracker.service import _sync_digest_jobs
+from tracker.service import _sync_collect_jobs, _sync_digest_jobs
 from tracker.settings import Settings
 
 
@@ -72,3 +72,27 @@ def test_sync_digest_jobs_uses_configured_timezone(monkeypatch):
     asyncio.run(_sync_digest_jobs(scheduler, make_session, settings, digest_cron_map, digest_sem))
     assert tz_seen and isinstance(tz_seen[0], ZoneInfo)
     assert getattr(tz_seen[0], "key", None) == "Asia/Shanghai"
+
+
+def test_sync_collect_jobs_merges_same_cron_rules():
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+
+    def make_session():
+        return Session(engine)
+
+    scheduler = AsyncIOScheduler(timezone=dt.timezone.utc)
+    settings = Settings(
+        collect_message_rules_json=(
+            '[{"id":"arxiv","name":"arXiv","cron":"0 19 * * *","lookback_hours":24,"source_ids":[123]},'
+            '{"id":"papers","name":"Papers","cron":"0 19 * * *","lookback_hours":24,"source_ids":[124]}]'
+        )
+    )
+    collect_cron_map: dict[str, str] = {}
+    digest_sem = asyncio.Semaphore(1)
+
+    asyncio.run(_sync_collect_jobs(scheduler, make_session, settings, collect_cron_map, digest_sem))
+
+    collect_jobs = [job for job in scheduler.get_jobs() if str(getattr(job, "id", "")).startswith("collect:")]
+    assert len(collect_jobs) == 1
+    assert str(collect_jobs[0].id).startswith("collect:batch-")

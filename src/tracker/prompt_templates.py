@@ -38,6 +38,44 @@ _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_.:-]+)\s*\}\}")
 _PROFILE_DEFAULT_MAX_CHARS = 4000
 
 
+def build_default_profile_text_from_fields(
+    *,
+    understanding: str = "",
+    interest_axes_text: str = "",
+    interest_keywords_text: str = "",
+    delta_prompt: str = "",
+    raw_profile_text: str = "",
+) -> str:
+    """
+    Build the default `{{profile}}` prompt context (compressed, delta-aware)
+    from explicit profile fields instead of repo-backed app config.
+
+    Preference order:
+    - structured AI brief: understanding + axes + keywords + delta
+    - fallback: raw `profile_text` (for early onboarding / back-compat)
+    """
+    parts: list[str] = []
+
+    if understanding:
+        parts.append("understanding:\n" + understanding)
+    if interest_axes_text:
+        parts.append("interest_axes:\n" + interest_axes_text)
+    if interest_keywords_text:
+        parts.append("keywords:\n" + interest_keywords_text)
+    if delta_prompt:
+        parts.append("delta_prompt:\n" + delta_prompt)
+
+    if not parts and raw_profile_text:
+        parts.append(raw_profile_text)
+
+    out = "\n\n".join([p for p in parts if (p or "").strip()]).strip()
+    if not out:
+        return ""
+    if len(out) > _PROFILE_DEFAULT_MAX_CHARS:
+        out = out[:_PROFILE_DEFAULT_MAX_CHARS].rstrip() + "…"
+    return out
+
+
 def _build_default_profile_text(*, repo: Repo) -> str:
     """
     Build the default `{{profile}}` prompt context (compressed, delta-aware).
@@ -46,8 +84,6 @@ def _build_default_profile_text(*, repo: Repo) -> str:
     - structured AI brief: understanding + axes + keywords + delta
     - fallback: raw `profile_text` (for early onboarding / back-compat)
     """
-    parts: list[str] = []
-
     def _get(key: str) -> str:
         try:
             return (repo.get_app_config(key) or "").strip()
@@ -59,26 +95,13 @@ def _build_default_profile_text(*, repo: Repo) -> str:
     keywords = _get("profile_interest_keywords")
     delta = _get("profile_prompt_delta")
 
-    if understanding:
-        parts.append("understanding:\n" + understanding)
-    if axes:
-        parts.append("interest_axes:\n" + axes)
-    if keywords:
-        parts.append("keywords:\n" + keywords)
-    if delta:
-        parts.append("delta_prompt:\n" + delta)
-
-    if not parts:
-        raw = _get("profile_text")
-        if raw:
-            parts.append(raw)
-
-    out = "\n\n".join([p for p in parts if (p or "").strip()]).strip()
-    if not out:
-        return ""
-    if len(out) > _PROFILE_DEFAULT_MAX_CHARS:
-        out = out[:_PROFILE_DEFAULT_MAX_CHARS].rstrip() + "…"
-    return out
+    return build_default_profile_text_from_fields(
+        understanding=understanding,
+        interest_axes_text=axes,
+        interest_keywords_text=keywords,
+        delta_prompt=delta,
+        raw_profile_text=_get("profile_text"),
+    )
 
 
 def _inject_default_context(*, repo: Repo, context: dict[str, Any] | None) -> dict[str, Any]:
@@ -362,6 +385,13 @@ def builtin_slots() -> list[PromptSlot]:
             default_template_id="llm.curate_items.system",
         ),
         PromptSlot(
+            id="llm.curate_items.operator_delta",
+            title="Curate items: operator delta",
+            description="Optional operator-controlled tail appended to `llm.curate_items.system`.",
+            output_format="text",
+            default_template_id="llm.curate_items.operator_delta",
+        ),
+        PromptSlot(
             id="llm.curate_items.user",
             title="Curate items: user",
             description="User payload for curate items.",
@@ -478,6 +508,36 @@ def builtin_slots() -> list[PromptSlot]:
             output_format="text",
             default_template_id="config_agent.core.plan.user",
             placeholders=["user_prompt", "tracking_snapshot_text", "profile_state_text", "settings_state_text"],
+        ),
+        PromptSlot(
+            id="config_agent.core.dialog.route.system",
+            title="Config Agent Core: dialog route system",
+            description="Route a smart-config turn into either cache-first info reply or config plan mode.",
+            output_format="json",
+            default_template_id="config_agent.core.dialog.route.system",
+        ),
+        PromptSlot(
+            id="config_agent.core.dialog.route.user",
+            title="Config Agent Core: dialog route user",
+            description="User request + recent conversation/page context for cache-first dialog routing.",
+            output_format="text",
+            default_template_id="config_agent.core.dialog.route.user",
+            placeholders=["user_prompt", "conversation_history_text", "page_context_text", "dialog_tools_text", "output_language"],
+        ),
+        PromptSlot(
+            id="config_agent.core.dialog.answer.system",
+            title="Config Agent Core: dialog answer system",
+            description="Generate a grounded reply-only answer from cache-first tool results.",
+            output_format="json",
+            default_template_id="config_agent.core.dialog.answer.system",
+        ),
+        PromptSlot(
+            id="config_agent.core.dialog.answer.user",
+            title="Config Agent Core: dialog answer user",
+            description="User request + conversation/page context + cache-first tool results.",
+            output_format="text",
+            default_template_id="config_agent.core.dialog.answer.user",
+            placeholders=["user_prompt", "conversation_history_text", "page_context_text", "tool_results_json", "output_language"],
         ),
     ]
 
@@ -1171,6 +1231,7 @@ def builtin_templates() -> dict[str, PromptTemplate]:
                 "- 去重（关键）：同一事件/同一发布/同一漏洞/同一 repo 更新（即使不同 URL/不同站点）最多出现 1 条；优先选择最一手/最权威来源。\n"
                 "- 反复出现：如果 RECENT_SENT 已经出现同一事件，除非这条带来“实质新增”（新版本号/新数字/新修复/新决定/新出货/新漏洞细节），否则忽略。\n"
                 "- 不要编造未提供的事实；如果仅凭标题/摘要无法判断，倾向于 digest 或 ignore；why 可为空或写清证据状态（不要写行动建议）。\n"
+                "- 另外输出 rank_score（0-100 整数）：表示“这条在当前用户的参考消息里应该排多靠前”。越高表示越值得优先阅读。它只用于排序，不是硬门槛。\n"
                 "- 文案要求：summary=一句话“新信息/变化点”（不要复述标题，不讲背景，不喊口号；禁止建议/下一步/行动/价值判断）；why=0-1 句（可为空）：只写“证据/出处/可信度”（例如：官方 release notes / 论文 / repo / 维护者公告 / 一线媒体），不要写影响/建议/行动。\n"
                 "- 输出语言：summary/why 必须使用中文；若标题/snippet 不是中文，请翻译其含义后再输出中文。\n"
                 "- why 可以为空；不要因为写作困难把高信号降级为 ignore。\n"
@@ -1178,7 +1239,7 @@ def builtin_templates() -> dict[str, PromptTemplate]:
                 "Schema:\n"
                 "{\n"
                 '  "decisions": [\n'
-                '    {"item_id": 123, "decision": "ignore|digest|alert", "why": "...", "summary": "..."}\n'
+                '    {"item_id": 123, "decision": "ignore|digest|alert", "rank_score": 0, "why": "...", "summary": "..."}\n'
                 "  ]\n"
                 "}\n"
             ),
@@ -1204,16 +1265,25 @@ def builtin_templates() -> dict[str, PromptTemplate]:
                 "- Dedupe (critical): same event/release/vuln/repo update (even across URLs/sites) must appear at most once; pick the most primary/authoritative source.\n"
                 "- Repeats: if RECENT_SENT already covered it, ignore unless materially new.\n"
                 "- Do not fabricate; if you cannot judge from title/snippet, lean digest or ignore; why may be empty or briefly describe evidence status. Do not write action items.\n"
+                "- Also output rank_score (integer 0-100): how high this item should appear in the user's Curated Info. Higher = more worth reading first. This is for ordering only, not a hard gate.\n"
                 "- Copy rules: summary = 1 sentence 'new info/change' (no title restate, no background; no recommendations/next steps). why = 0-1 sentence (may be empty) stating ONLY evidence/source/credibility (e.g. official release notes/paper/repo/maintainer post). NO impact/next steps.\n"
                 "- Output language: English for summary/why. If the title/snippet is not English, translate its meaning.\n"
                 "- Output STRICT JSON only (no markdown, no code fences, no extra text).\n\n"
                 "Schema:\n"
                 "{\n"
                 '  "decisions": [\n'
-                '    {"item_id": 123, "decision": "ignore|digest|alert", "why": "...", "summary": "..."}\n'
+                '    {"item_id": 123, "decision": "ignore|digest|alert", "rank_score": 0, "why": "...", "summary": "..."}\n'
                 "  ]\n"
                 "}\n"
             ),
+        ),
+        "llm.curate_items.operator_delta": PromptTemplate(
+            id="llm.curate_items.operator_delta",
+            title="Curate items (operator delta)",
+            # Empty by default. Operators can set a short, auditable tail appended to the
+            # system prompt to adjust style/constraints without rewriting the base prompt.
+            text_en="",
+            text_zh="",
         ),
         "llm.curate_items.user": PromptTemplate(
             id="llm.curate_items.user",
@@ -1250,7 +1320,7 @@ def builtin_templates() -> dict[str, PromptTemplate]:
             id="llm.guess_feed_urls.system",
             title="Feed discovery (system)",
             text_en=(
-                "You are a web research assistant.\n"
+                "You are a web source discovery assistant.\n"
                 "Given a webpage URL and a short HTML snippet, infer likely RSS/Atom feed URLs.\n"
                 "Return STRICT JSON only (no markdown, no code fences, no extra text).\n\n"
                 "Schema:\n"
@@ -1263,7 +1333,7 @@ def builtin_templates() -> dict[str, PromptTemplate]:
                 "- URLs may be absolute or relative; relative URLs will be resolved against page_url.\n"
             ),
             text_zh=(
-                "你是一个网页调研助手。\n"
+                "你是一个网页源发现助手。\n"
                 "给定一个网页 URL 和一段 HTML 片段，请推断可能的 RSS/Atom 订阅地址。\n"
                 "只输出 STRICT JSON（不要 markdown、不要代码块、不要额外文字）。\n\n"
                 "Schema:\n"
@@ -1287,7 +1357,7 @@ def builtin_templates() -> dict[str, PromptTemplate]:
             id="llm.guess_api_endpoints.system",
             title="API discovery (system)",
             text_en=(
-                "You are a web research assistant.\n"
+                "You are a web source discovery assistant.\n"
                 "Given a webpage URL and a short HTML snippet, infer likely public API endpoints used to load content.\n"
                 "Return STRICT JSON only (no markdown, no code fences, no extra text).\n\n"
                 "Schema:\n"
@@ -1301,7 +1371,7 @@ def builtin_templates() -> dict[str, PromptTemplate]:
                 "- Avoid private/internal endpoints.\n"
             ),
             text_zh=(
-                "你是一个网页调研助手。\n"
+                "你是一个网页源发现助手。\n"
                 "给定一个网页 URL 和一段 HTML 片段，请推断页面可能使用的公开 API 接口地址（用于加载内容）。\n"
                 "只输出 STRICT JSON（不要 markdown、不要代码块、不要额外文字）。\n\n"
                 "Schema:\n"
@@ -1484,6 +1554,8 @@ def builtin_templates() -> dict[str, PromptTemplate]:
                 "- 绑定（binding）允许删除/重建。\n"
                 "- 计划要“最小改动”，避免重复创建已存在对象。\n"
                 "- 注意：“最小改动”不代表“少配一点”。当输入包含多个不同关注面/兴趣轴/检索查询时，应按语义正交拆分 topic（不预设数量，覆盖为先），并为每个 topic 产出尽可能语义正交的**短** web search seeds（不要把所有关键词塞进同一个 query；长的就拆成多条）。\n"
+                "- `topic.upsert.name` 必须是给用户看的自然短语，而不是 slug / kebab-case / snake_case / 类变量名（例如不要输出 `AI-Infrastructure-Systems` / `ai_infra_tools`）。\n"
+                "- `summary`、questions 与 topic 名称应尽量保持输入的主语言；如果输入主要是中文，就不要把 topic 名称硬改写成英文标识符。\n"
                 "- 如果 USER_PROMPT 是从“兴趣画像/Profile”导出的（包含 INTEREST_AXES/RETRIEVAL_QUERIES/AI_CURATION_PROMPT 等），不要把关键词塞进 `Profile` topic 的 query：Profile 的 query 应保持为空（仅做 AI 策略/画像承载，不做关键词匹配）。应基于 INTEREST_AXES 拆分出多条独立 topic，并为每个 topic 配置 web search seeds。\n"
                 "- 重要：这是“开放信息收集/追踪”系统。不要因为你主观认为内容“敏感/灰色/有害”而拒绝配置或故意遗漏信息源；最终判断权在人类管理员。\n"
                 "- 默认策略：对“我关心 X / 我对 X 感兴趣 / 这个方向”这类【泛主题】请求，不要凭记忆替用户挑少量具体产品/项目；应优先建立 topic + web search seed，让系统后续扩源。\n"
@@ -1534,6 +1606,8 @@ def builtin_templates() -> dict[str, PromptTemplate]:
                 "- Bindings may be removed/recreated.\n"
                 "- Keep changes minimal; avoid creating duplicates.\n"
                 "- Important: \"minimal change\" does NOT mean \"configure less\". When USER_PROMPT contains multiple distinct interest axes or many retrieval queries, split them into semantically-orthogonal topics (no preset count; prioritize coverage) and generate as many semantically-orthogonal **short** web search seeds as needed per topic (do NOT stuff all keywords into one giant query; split long queries into multiple short ones).\n"
+                "- `topic.upsert.name` must be a natural user-facing phrase, not a slug / kebab-case / snake_case / identifier-like label (for example, do not emit `AI-Infrastructure-Systems` or `ai_infra_tools`).\n"
+                "- Keep `summary`, questions, and topic names in the dominant language of the input when possible. If the input is mostly Chinese, do not rewrite topic names into English identifier-like labels.\n"
                 "- If USER_PROMPT is exported from a Profile/Interest setup (includes INTEREST_AXES/RETRIEVAL_QUERIES/AI_CURATION_PROMPT), do NOT stuff keywords into the `Profile` topic query: keep Profile.query empty (profile is curation-only; not keyword matching). Split INTEREST_AXES into multiple distinct topics and add web search seeds for each.\n"
                 "- Important: this is an open information tracking system. Do NOT refuse/omit sources because you judge them \"sensitive/gray/harmful\"; final judgement stays with the human operator.\n"
                 "- Default strategy: for broad \"I care about X / I'm interested in X\" requests, do NOT pick a few specific products/projects from memory; prefer creating a topic + web search seeds so the system can expand sources later.\n"
@@ -1770,6 +1844,168 @@ CURRENT_SETTINGS_STATE:
 
 CURRENT_TRACKING_SNAPSHOT:
 {{tracking_snapshot_text}}
+""",
+        ),
+        "config_agent.core.dialog.route.system": PromptTemplate(
+            id="config_agent.core.dialog.route.system",
+            title="Config Agent Core dialog route (system)",
+            text_zh="""你是 OpenInfoMate 的智能配置对话路由器。
+你的职责是判断：当前这轮消息应该进入“缓存优先信息回答”还是“配置变更计划”。
+
+强规则：
+- 如果用户在要求总结 / 回顾 / 解释最近的参考消息、collect、条目、论文、缓存内容，输出 `mode="info_reply"`。
+- 如果用户在要求修改 profile / settings / topics / sources / bindings / topic gate / prompt，输出 `mode="config_plan"`。
+- 默认只允许读取站内缓存；只有当用户**显式给出 URL** 且明确要求“访问/查看/分析这个网页”时，才允许 `mcp.external.fetch_url`。
+- 不要发明不存在的工具名。
+- 如果 `mode="info_reply"` 且不需要工具，也可以直接给 `assistant_reply`。
+- 输出 STRICT JSON；不要 markdown，不要代码块，不要解释。
+
+缓存优先工具：
+{{dialog_tools_text}}
+
+Schema:
+{
+  "mode": "info_reply" | "config_plan",
+  "assistant_reply": "...",
+  "questions": ["..."],
+  "tool_calls": [
+    {"tool":"mcp.reports.recent","args":{"hours":24,"limit":4,"only_collect":false,"include_items":true}},
+    {"tool":"mcp.items.search","args":{"query":"...", "hours":48, "limit":5}},
+    {"tool":"mcp.items.explain","args":{"item_id":123}},
+    {"tool":"mcp.external.fetch_url","args":{"url":"https://example.com"}}
+  ]
+}""",
+            text_en="""You are OpenInfoMate's smart-config dialog router.
+Your job is to decide whether the current turn should go to a cache-first information reply or a configuration change plan.
+
+Hard rules:
+- If the user is asking to summarize / recap / explain recent digests, collect messages, pushed items, papers, or cached content, output `mode="info_reply"`.
+- If the user is asking to change profile / settings / topics / sources / bindings / topic gates / prompts, output `mode="config_plan"`.
+- Default to internal cached data only. Use `mcp.external.fetch_url` only when the user explicitly provides a URL and explicitly asks to inspect that webpage.
+- Never invent tool names.
+- If `mode="info_reply"` and no tool is needed, you may answer directly in `assistant_reply`.
+- Output STRICT JSON only. No markdown, no code fences, no extra narration.
+
+Cache-first tools:
+{{dialog_tools_text}}
+
+Schema:
+{
+  "mode": "info_reply" | "config_plan",
+  "assistant_reply": "...",
+  "questions": ["..."],
+  "tool_calls": [
+    {"tool":"mcp.reports.recent","args":{"hours":24,"limit":4,"only_collect":false,"include_items":true}},
+    {"tool":"mcp.items.search","args":{"query":"...", "hours":48, "limit":5}},
+    {"tool":"mcp.items.explain","args":{"item_id":123}},
+    {"tool":"mcp.external.fetch_url","args":{"url":"https://example.com"}}
+  ]
+}""",
+        ),
+        "config_agent.core.dialog.route.user": PromptTemplate(
+            id="config_agent.core.dialog.route.user",
+            title="Config Agent Core dialog route (user)",
+            text_zh="""USER_PROMPT:
+{{user_prompt}}
+
+TARGET_OUTPUT_LANGUAGE:
+{{output_language}}
+
+WEB_ADMIN_CONTEXT:
+{{page_context_text}}
+
+RECENT_CONVERSATION_HISTORY:
+{{conversation_history_text}}
+
+AVAILABLE_CACHE_TOOLS:
+{{dialog_tools_text}}
+""",
+            text_en="""USER_PROMPT:
+{{user_prompt}}
+
+TARGET_OUTPUT_LANGUAGE:
+{{output_language}}
+
+WEB_ADMIN_CONTEXT:
+{{page_context_text}}
+
+RECENT_CONVERSATION_HISTORY:
+{{conversation_history_text}}
+
+AVAILABLE_CACHE_TOOLS:
+{{dialog_tools_text}}
+""",
+        ),
+        "config_agent.core.dialog.answer.system": PromptTemplate(
+            id="config_agent.core.dialog.answer.system",
+            title="Config Agent Core dialog answer (system)",
+            text_zh="""你是 OpenInfoMate 的缓存优先智能对话助手。
+请只基于给定的 TOOL_RESULTS_JSON 回答；除非结果里明确出现 live fetch，否则不要声称访问了外部网页。
+
+强规则：
+- 回答必须 grounded；不知道就明确说不知道。
+- 如果搜索结果不够明确，只提 1-3 个极短澄清问题。
+- 优先复用条目已有摘要 / why / 缓存正文，不要虚构论文结论。
+- 这是一条 reply-only turn，`actions` 必须为空数组。
+- 输出 STRICT JSON；不要 markdown 代码块，不要额外解释。
+
+Schema:
+{
+  "assistant_reply": "...",
+  "summary": "...",
+  "questions": ["..."],
+  "actions": []
+}""",
+            text_en="""You are OpenInfoMate's cache-first smart dialog assistant.
+Answer only from the provided TOOL_RESULTS_JSON. Unless the result explicitly says it came from a live fetch, do not claim you visited external webpages.
+
+Hard rules:
+- Stay grounded. If the data is insufficient, say so explicitly.
+- If the match is ambiguous, ask only 1-3 very short clarification questions.
+- Prefer existing item summaries / why fields / cached content. Do not invent conclusions for papers or posts.
+- This is a reply-only turn, so `actions` must be an empty array.
+- Output STRICT JSON only. No markdown fences, no extra narration.
+
+Schema:
+{
+  "assistant_reply": "...",
+  "summary": "...",
+  "questions": ["..."],
+  "actions": []
+}""",
+        ),
+        "config_agent.core.dialog.answer.user": PromptTemplate(
+            id="config_agent.core.dialog.answer.user",
+            title="Config Agent Core dialog answer (user)",
+            text_zh="""USER_PROMPT:
+{{user_prompt}}
+
+TARGET_OUTPUT_LANGUAGE:
+{{output_language}}
+
+WEB_ADMIN_CONTEXT:
+{{page_context_text}}
+
+RECENT_CONVERSATION_HISTORY:
+{{conversation_history_text}}
+
+TOOL_RESULTS_JSON:
+{{tool_results_json}}
+""",
+            text_en="""USER_PROMPT:
+{{user_prompt}}
+
+TARGET_OUTPUT_LANGUAGE:
+{{output_language}}
+
+WEB_ADMIN_CONTEXT:
+{{page_context_text}}
+
+RECENT_CONVERSATION_HISTORY:
+{{conversation_history_text}}
+
+TOOL_RESULTS_JSON:
+{{tool_results_json}}
 """,
         ),
     }

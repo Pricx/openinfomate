@@ -62,3 +62,16 @@ def test_push_attempt_can_resend_when_allow_sent_is_true(db_session):
     assert second is not None
     assert second.attempts == 2
     assert second.status == "pending"
+
+
+def test_mark_push_failed_persists_non_empty_detail(db_session):
+    repo = Repo(db_session)
+    push = repo.reserve_push_attempt(channel="telegram", idempotency_key="k4", max_attempts=3)
+    assert push is not None
+
+    repo.mark_push_failed(push, error="")
+
+    latest = repo.list_pushes(channel="telegram", idempotency_key="k4", limit=1)
+    assert latest
+    assert latest[0].status == "failed"
+    assert latest[0].error == "unknown push error"

@@ -187,24 +187,32 @@ def build_config_chat_bootstrap(
         ]
     else:
         intro = (
-            f"这里是 {section_title} 的智能配置窗。直接说你想改什么，我会生成可审阅的配置计划；确认后再应用。"
+            f"这里是 {section_title} 的智能配置窗。你既可以直接让我改配置，也可以让我基于已缓存的参考消息 / collect / 条目做总结与解释；涉及改配置时我会先给可审阅计划，再应用。"
             if zh
-            else f"This is the smart config window for {section_title}. Tell me what you want to change and I’ll draft a reviewable config plan before applying it."
+            else f"This is the smart config window for {section_title}. You can ask for configuration changes or cache-first summaries/explanations over recent digests, collect messages, and pushed items. When something needs config changes, I will draft a reviewable plan before applying it."
         )
         if section == "sources":
             starter_actions = [
                 _prompt("加来源" if zh else "Add sources", "加入 linux.do 的 RSS 与站内搜索，并自动绑定到最相关 topic；重复则复用" if zh else "Add linux.do RSS and site search, and bind them to the most relevant topic; reuse if duplicated"),
                 _prompt("清理低质量来源" if zh else "Disable weak sources", "禁用最近表现差且分数低的来源，但保留用户明确偏好的站点" if zh else "Disable low-scoring weak sources from recent runs, but keep explicitly preferred sites"),
+                _prompt("总结最近 24h 参考消息" if zh else "Summarize last 24h digests", "基于缓存数据，总结最近 24 小时的参考消息重点，并按重要性排序" if zh else "Using cached data only, summarize the last 24 hours of digest pushes and rank the most important points"),
             ]
         elif section == "bindings":
             starter_actions = [
                 _prompt("调整绑定" if zh else "Adjust bindings", "把新加的来源绑定到最相关 topic，并删除明显重复或失效的绑定" if zh else "Bind newly added sources to the most relevant topics and remove obviously duplicated or stale bindings"),
                 _prompt("只改过滤条件" if zh else "Tune filters", "收紧噪音大的绑定过滤条件，但不要违背 Profile 偏好" if zh else "Tighten noisy binding filters without violating the Profile preferences"),
+                _prompt("解释某条已推送内容" if zh else "Explain one pushed item", "基于缓存数据，解释最近一条我点名的已推送内容为什么重要" if zh else "Using cached data only, explain why one specific recently pushed item matters"),
+            ]
+        elif section == "topics":
+            starter_actions = [
+                _prompt("调消息量" if zh else "Tune volume", "把某个 topic 的参考消息收紧一点：先给我 Topic Gate 调整建议，确认后再应用" if zh else "Tighten one topic a bit: propose Topic Gate changes first, then apply after confirmation"),
+                _prompt("调质量" if zh else "Tune quality", "如果某个 topic 噪音偏多，请按 Topic Gate 帮我提高进入候选和进入推送的门槛" if zh else "If one topic is noisy, raise its initial-screening and push thresholds through Topic Gate"),
+                _prompt("总结 19:00 arXiv 专题" if zh else "Summarize 19:00 arXiv collect", "基于缓存数据，总结最近一条 19:00 arXiv 专题里最值得看的论文和核心观点" if zh else "Using cached data only, summarize the most worthwhile papers and core ideas from the latest 19:00 arXiv collect"),
             ]
         elif section == "config":
             starter_actions = [
                 _prompt("调调度" if zh else "Tune schedules", "把参考消息窗口改成 2 小时，并把相关调度调整到更适合高频追踪" if zh else "Change the curated-info window to 2 hours and tune the related schedules for higher-frequency tracking"),
-                _prompt("调阈值" if zh else "Tune thresholds", "把扩源最低分调成 60，并把最大来源数调成 800" if zh else "Set min source score to 60 and max sources to 800"),
+                _prompt("调阈值" if zh else "Tune thresholds", "如果消息太多或太杂，请先给我一份 Topic Gate + 调度的调整建议，确认后再应用" if zh else "If volume or quality is off, propose a Topic Gate + scheduling adjustment first, then apply after confirmation"),
             ]
         else:
             starter_actions = [
@@ -217,9 +225,9 @@ def build_config_chat_bootstrap(
 
     if install_complete:
         guide = (
-            "基础安装已完成；你现在可以像和一个配置助手聊天一样，直接让我改 profile、tracking、sources、bindings 和安全设置。"
+            "基础安装已完成；你现在既可以像和配置助手聊天一样直接改 profile / tracking / sources / bindings / 安全设置，也可以让我基于缓存下来的参考消息、collect 与条目做总结和解释。"
             if zh
-            else "Base installation is complete. You can now chat with me like a config assistant to change profile, tracking, sources, bindings, and safe settings."
+            else "Base installation is complete. You can now use this both as a config assistant and as a cache-first analyst for recent digests, collect messages, and pushed items."
         )
     else:
         guide = (
@@ -242,9 +250,9 @@ def build_config_chat_bootstrap(
         "launcher_label": "智能配置" if zh else "Smart Config",
         "panel_title": "智能配置助手" if zh else "Smart Config Assistant",
         "input_placeholder": (
-            "例如：加入xxx的rss，自动绑定到最相关topic"
+            "例如：减少某个 topic 的噪音；总结最近 24h 参考消息；解释某条已推送内容；先给方案再应用"
             if zh
-            else "For example: add xxx RSS and bind it to the most relevant topic"
+            else "For example: reduce noise for one topic; summarize the last 24h digests; explain one pushed item; propose first, then apply"
         ),
         "send_label": "发送" if zh else "Send",
         "apply_label": "应用" if zh else "Apply",

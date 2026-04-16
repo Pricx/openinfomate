@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from tracker.api import create_app
-from tracker.llm import LlmProfileProposal
+from tracker.bridge_contract import BridgeProfileProposeResponse
 from tracker.settings import Settings
 
 
@@ -29,16 +29,15 @@ def test_profile_propose_returns_proposal(tmp_path, monkeypatch):
     )
     client = TestClient(create_app(settings))
 
-    async def fake_propose(*, settings, profile_text: str, usage_cb=None):  # type: ignore[no-untyped-def]
-        assert profile_text
-        assert profile_text.startswith("BOOKMARKS")
-        assert "<html" not in profile_text.lower()
-        return LlmProfileProposal(
+    async def fake_propose(*, session, settings, payload):  # type: ignore[no-untyped-def]
+        assert payload.text
+        return BridgeProfileProposeResponse(
+            normalized_profile_text="BOOKMARKS\n- https://example.com",
             understanding="You care about LLM agents and recsys; prefer high-signal briefs.",
             ai_prompt="pick only signals",
         )
 
-    monkeypatch.setattr("tracker.api.llm_propose_profile_setup", fake_propose)
+    monkeypatch.setattr("tracker.api.bridge_profile_propose", fake_propose)
 
     r = client.post(
         "/profile/propose?token=secret",

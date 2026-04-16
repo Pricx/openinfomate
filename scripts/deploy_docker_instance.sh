@@ -10,6 +10,7 @@ set -eu
 #   ./scripts/deploy_docker_instance.sh --port 8901
 #   ./scripts/deploy_docker_instance.sh --base-port 8899 --project-prefix openinfomate
 #   ./scripts/deploy_docker_instance.sh --host   # opt-in host networking override (needs docker-compose.host.yml)
+#   ./scripts/deploy_docker_instance.sh --import-db /path/to/tracker.db   # import an existing SQLite db into /data
 
 MODE="ghcr"
 HOST_MODE="false"
@@ -18,6 +19,7 @@ PORT=""
 SEARX_PORT=""
 PROJECT_PREFIX="openinfomate"
 INSTANCE=""
+IMPORT_DB=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -28,8 +30,9 @@ while [ $# -gt 0 ]; do
     --searx-port) SEARX_PORT="${2:-}"; shift 2 ;;
     --project-prefix) PROJECT_PREFIX="${2:-}"; shift 2 ;;
     --instance) INSTANCE="${2:-}"; shift 2 ;;
+    --import-db) IMPORT_DB="${2:-}"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 [--port N] [--base-port N] [--project-prefix NAME] [--instance NAME] [--host]"
+      echo "Usage: $0 [--port N] [--base-port N] [--project-prefix NAME] [--instance NAME] [--import-db PATH] [--host]"
       exit 0
       ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
@@ -109,6 +112,9 @@ echo "[deploy] api_port=${OPENINFOMATE_API_PORT}"
 if [ -n "${SEARX_PORT}" ]; then
   echo "[deploy] searxng_port=${OPENINFOMATE_SEARXNG_PORT}"
 fi
+if [ -n "${IMPORT_DB}" ]; then
+  echo "[deploy] import_db=${IMPORT_DB}"
+fi
 echo "[deploy] mode=${MODE} host_mode=${HOST_MODE}"
 
 files="-f ${compose_file}"
@@ -122,6 +128,36 @@ fi
 
 # shellcheck disable=SC2086
 docker compose ${files} pull
+
+# Optional: import an existing SQLite DB into the instance data volume before starting.
+#
+# Note: This imports:
+# - tracker.db
+# - tracker.db-wal / tracker.db-shm (if present alongside the db path)
+#
+# For best results, stop the old instance first and create a consistent `.backup` db file.
+if [ -n "${IMPORT_DB}" ]; then
+  if [ ! -f "${IMPORT_DB}" ]; then
+    echo "Missing --import-db file: ${IMPORT_DB}" >&2
+    exit 1
+  fi
+  # Ensure the containers/volumes exist so `docker compose cp` can write into /data.
+  # shellcheck disable=SC2086
+  docker compose ${files} create
+
+  # shellcheck disable=SC2086
+  docker compose ${files} cp "${IMPORT_DB}" api:/data/tracker.db
+
+  if [ -f "${IMPORT_DB}-wal" ]; then
+    # shellcheck disable=SC2086
+    docker compose ${files} cp "${IMPORT_DB}-wal" api:/data/tracker.db-wal
+  fi
+  if [ -f "${IMPORT_DB}-shm" ]; then
+    # shellcheck disable=SC2086
+    docker compose ${files} cp "${IMPORT_DB}-shm" api:/data/tracker.db-shm
+  fi
+fi
+
 # shellcheck disable=SC2086
 docker compose ${files} up -d --force-recreate
 # shellcheck disable=SC2086
